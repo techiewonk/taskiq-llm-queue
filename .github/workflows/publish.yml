@@ -10,16 +10,22 @@ on:
     types: [published]
   workflow_dispatch:
 
+# Never publish a tree that fails lint, types or tests.
+
 permissions:
   contents: read
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv build
+      - run: uv build --no-sources
       - run: uvx twine check --strict dist/*
       - uses: actions/upload-artifact@v4
         with:

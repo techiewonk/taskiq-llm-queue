@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:  # reused by publish.yml so a release always runs the full checks
 
 permissions:
   contents: read
@@ -15,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -26,6 +27,17 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
+      - run: uv run pytest tests/unit -q
+
+  lowest:
+    # Oldest versions the ranges in pyproject allow: catches floors that are wrong in practice.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --all-extras --resolution lowest-direct
       - run: uv run pytest tests/unit -q
 
   integration:
