@@ -1,0 +1,13 @@
+# Scenario harness base (tools/scenarios): fast, healthy, generous limits. Each scenario patches
+# what it needs through the admin API; the harness reloads this file before every scenario.
+seed: 42
+strict_models: false
+defaults: {latency_ms: {p50: 30, p95: 80}, error_rate_5xx: 0.0}
+models:
+  "openai.gpt-oss-120b-1:0@ap-south-1": {max_concurrency: 300, latency_ms: {p50: 60, p95: 150}}
+  "apac.openai.gpt-oss-120b-1:0":       {max_concurrency: 300, latency_ms: {p50: 60, p95: 150}}
+  "openai.gpt-oss-20b-1:0@ap-south-1":  {max_concurrency: 300, latency_ms: {p50: 40, p95: 100}}
+  "amazon.titan-embed-text-v2:0@ap-south-1": {max_concurrency: 500, latency_ms: {p50: 10, p95: 30}, dims: 256}
+  "cohere.embed-english-v3@ap-south-1":      {max_concurrency: 300, latency_ms: {p50: 15, p95: 40}, dims: 256}
+  "llama-3.1-70b": {max_concurrency: 100, latency_ms: {p50: 30, p95: 80}}
+phases: []

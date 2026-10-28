@@ -1,0 +1,11 @@
+# S35 "10K burst": realistic latency (~200-800 ms) and a light 2 % throttle on every target.
+seed: 42
+strict_models: false
+defaults: {latency_ms: {p50: 400, p95: 800}, throttle_rate: 0.02}
+models:
+  "openai.gpt-oss-120b-1:0@ap-south-1": {max_concurrency: 400, latency_ms: {p50: 450, p95: 800}, throttle_rate: 0.02}
+  "apac.openai.gpt-oss-120b-1:0":       {max_concurrency: 400, latency_ms: {p50: 450, p95: 800}, throttle_rate: 0.02}
+  "openai.gpt-oss-20b-1:0@ap-south-1":  {max_concurrency: 400, latency_ms: {p50: 300, p95: 650}, throttle_rate: 0.02}
+  "amazon.titan-embed-text-v2:0@ap-south-1": {max_concurrency: 600, latency_ms: {p50: 200, p95: 400}, throttle_rate: 0.02, dims: 256}
+  "cohere.embed-english-v3@ap-south-1":      {max_concurrency: 300, latency_ms: {p50: 200, p95: 400}, throttle_rate: 0.02, dims: 256}
+phases: []

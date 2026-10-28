@@ -47,3 +47,42 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  # ---------------------------------------------------------------- scenario harness (profile scn)
+  # An isolated stack for `python -m tools.scenarios`: chaos scenarios stop/kill these services,
+  # never the shared ones above. Start: docker compose -f docker/compose.yaml --profile scn up -d --wait
+  valkey-scn:
+    image: valkey/valkey:8.1-alpine
+    profiles: ["scn"]
+    command: ["valkey-server", "--port", "16379", "--requirepass", "localdev", "--save", "", "--appendonly", "no"]
+    ports: ["16379:16379"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "16379", "-a", "localdev", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  sqs-scn:
+    # No pre-declared queues: the harness creates its own (with DLQs). host "*" keeps queue URLs
+    # valid from the host (localhost:19324) and from containers (sqs-scn:19324).
+    image: softwaremill/elasticmq-native:1.7.1
+    profiles: ["scn"]
+    volumes: ["../tools/scenarios/docker/elasticmq-scn.conf:/opt/elasticmq.conf:ro"]
+    ports: ["19324:19324"]
+
+  worker-scn:
+    # Scenario worker built from the package (rolling-deploy / docker stop chaos). The harness
+    # runs workers as local processes by default; `--scale worker-scn=3` for container workers.
+    build: {context: .., dockerfile: tools/scenarios/docker/worker.Dockerfile}
+    profiles: ["scn-docker"]
+    environment:
+      SCN_REDIS_HOST: valkey-scn
+      SCN_REDIS_PORT: "16379"
+      SCN_SQS_URL: http://sqs-scn:19324
+      SCN_FAKELLM_URL: ${SCN_FAKELLM_URL:-http://host.docker.internal:18080}
+      SCN_PREFIX: ${SCN_PREFIX:-llmq:scn}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ap-south-1
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    stop_grace_period: 60s

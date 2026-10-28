@@ -34,22 +34,45 @@ TASKS: dict[str, list[list[str]]] = {
         ],
     ],
 }
+# Scenario harness (docs/TESTING.md section 3); these tasks take extra arguments.
+SCN = [sys.executable, "-m", "tools.scenarios"]
+TASKS["up-scn"] = [[*COMPOSE, "--profile", "scn", "up", "-d", "--wait", "valkey-scn", "sqs-scn"]]
+TASKS["down-scn"] = [[*COMPOSE, "--profile", "scn", "stop", "valkey-scn", "sqs-scn"]]
+TASKS["scenarios"] = TASKS["up-scn"] + [[*SCN, "run"]]
+TASKS["scenario"] = TASKS["scenarios"]
+TASKS["load"] = TASKS["up-scn"] + [[*SCN, "load"]]
+TASKS["chaos"] = [[*SCN, "chaos"]]
+TASKS["test-scenarios"] = TASKS["up-scn"] + [[*PY, "pytest", "tests/scenarios", "-m", "scenario"]]
+# Tasks whose last command receives the remaining command-line arguments.
+ARG_TASKS = frozenset({"scenarios", "scenario", "load", "chaos", "test-scenarios"})
 TASKS["test"] = TASKS["test-unit"] + TASKS["test-int"]
 TASKS["check"] = TASKS["lint"] + TASKS["typecheck"] + TASKS["test-unit"]
 
 
 def main(argv: list[str]) -> int:
-    """Run the named tasks in order; print usage and return 2 for an unknown task."""
+    """Run the named tasks in order; print usage and return 2 for an unknown task.
+
+    A task in `ARG_TASKS` must come first and takes every following argument, e.g.
+    `llmq_dev.py scenarios S01 S35 --report out.json`.
+    """
+    if argv and argv[0] in ARG_TASKS:
+        cmds = [list(c) for c in TASKS[argv[0]]]
+        cmds[-1] += argv[1:]
+        return _run(cmds)
     unknown = [name for name in argv if name not in TASKS]
     if not argv or unknown:
         print(f"usage: llmq_dev.py <{'|'.join(sorted(TASKS))}> ...  unknown: {unknown}")
         return 2
-    for name in argv:
-        for cmd in TASKS[name]:
-            print(f"$ {' '.join(cmd)}", flush=True)
-            code = subprocess.call(cmd, cwd=ROOT)
-            if code:
-                return code
+    return _run([cmd for name in argv for cmd in TASKS[name]])
+
+
+def _run(cmds: list[list[str]]) -> int:
+    """Run commands in order from the package root; stop at the first failure."""
+    for cmd in cmds:
+        print(f"$ {' '.join(cmd)}", flush=True)
+        code = subprocess.call(cmd, cwd=ROOT)
+        if code:
+            return code
     return 0
 
 
