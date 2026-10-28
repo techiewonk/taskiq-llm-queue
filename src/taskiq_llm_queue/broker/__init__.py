@@ -36,6 +36,12 @@ from taskiq_llm_queue.broker.errors import (
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.broker.filters import MessageFilter, envelope_supported
 from taskiq_llm_queue.broker.queue import Batching, Heartbeat, SQSQueue
+from taskiq_llm_queue.broker.s3_offload import (
+    OFFLOAD_LABEL,
+    OffloadedPayloadMissingError,
+    S3OffloadError,
+    S3OffloadMiddleware,
+)
 from taskiq_llm_queue.broker.scheduler import SlotScheduler
 
 __all__ = [
@@ -44,6 +50,7 @@ __all__ = [
     "EXPIRY_ATTRIBUTE",
     "EXPIRY_LABEL",
     "GROUP_ID_LABEL",
+    "OFFLOAD_LABEL",
     "QUEUE_LABEL",
     "SKIP_BATCHING_LABEL",
     "SQS_MESSAGE_ID_LABEL",
@@ -60,7 +67,10 @@ __all__ = [
     "InvalidLabelError",
     "MessageFilter",
     "MessageTooLargeError",
+    "OffloadedPayloadMissingError",
     "ReceiveBudget",
+    "S3OffloadError",
+    "S3OffloadMiddleware",
     "SQSQueue",
     "SQSSendError",
     "SlotScheduler",

@@ -12,12 +12,14 @@ from taskiq_llm_queue.results.dispatcher import (
     ResultDispatcher,
     publish_done,
 )
+from taskiq_llm_queue.results.s3_backend import S3ResultBackend
 
 __all__ = [
     "DEFAULT_INTERVALS_MS",
     "DEFAULT_TAKE_BATCH",
     "LLMQResultBackend",
     "ResultDispatcher",
+    "S3ResultBackend",
     "decode_reply",
     "publish_done",
 ]
