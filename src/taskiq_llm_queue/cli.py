@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import contextlib
 import getpass
-import json
 import sys
 import time
 import uuid
@@ -19,6 +18,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import orjson
 import redis.asyncio
 from pydantic import BaseModel
 from redis.exceptions import RedisError
@@ -105,7 +105,7 @@ def _actor(args: argparse.Namespace) -> str:
 
 
 def _print_json(value: Any) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True))
+    print(orjson.dumps(value, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode())
 
 
 def _dump(model: BaseModel) -> Any:
@@ -195,7 +195,7 @@ async def _fallback(
     if args.model.partition("@")[0] not in config.models:
         if args.cmd == "test":
             raise ConfigError(f"{args.model!r} is not in LLMQ_MODELS; cannot resolve targets")
-        print(json.dumps([_dump(s) for s in live.chains.get(args.model, ())]))
+        print(orjson.dumps([_dump(s) for s in live.chains.get(args.model, ())]).decode())
         return 0
     steps = resolve_fallback(config, args.model, policy="chain", live=live)
     if args.cmd == "get":
@@ -284,7 +284,7 @@ def job_message(
 async def _job_send(args: argparse.Namespace, config: QueueConfig) -> int:
     from aiobotocore.session import get_session  # SQS client only for this command
 
-    payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
+    payload = orjson.loads(args.payload_file.read_bytes())
     queue: str = args.queue
     queue_name = queue.rstrip("/").rsplit("/", 1)[-1]
     if not isinstance(payload, dict):
@@ -305,7 +305,7 @@ async def _job_send(args: argparse.Namespace, config: QueueConfig) -> int:
             url = queue
         else:
             url = (await sqs.get_queue_url(QueueName=queue))["QueueUrl"]
-        sent = await sqs.send_message(QueueUrl=url, MessageBody=json.dumps(message))
+        sent = await sqs.send_message(QueueUrl=url, MessageBody=orjson.dumps(message).decode())
     _print_json({"task_id": message["task_id"], "message_id": sent["MessageId"], "queue": url})
     return 0
 

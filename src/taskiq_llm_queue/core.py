@@ -8,13 +8,14 @@ back as `LLMReply(ok=False, error=...)`, so taskiq never logs them as task failu
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+import orjson
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
@@ -147,7 +148,7 @@ async def load_params(envelope: Envelope, deps: CoreDeps) -> dict[str, Any] | No
     raw = await deps.redis.get(envelope.params_ref)
     if raw is None:
         return None
-    value = json.loads(raw)
+    value = orjson.loads(raw)
     return value if isinstance(value, dict) else None
 
 

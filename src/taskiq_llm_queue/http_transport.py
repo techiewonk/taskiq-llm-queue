@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import array
 import base64
-import json
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import orjson
 
 from taskiq_llm_queue.errors import (
     ConfigError,
@@ -119,7 +119,7 @@ class QueuedHTTPTransport(httpx.AsyncBaseTransport, httpx.BaseTransport):
         else:
             raise _RequestRejected(404, f"route {path} is not supported by the queue", "route")
         try:
-            body = json.loads(raw or b"{}")
+            body = orjson.loads(raw or b"{}")
         except ValueError as exc:
             raise _RequestRejected(400, f"request body is not JSON: {exc}", "body") from exc
         if not isinstance(body, dict):

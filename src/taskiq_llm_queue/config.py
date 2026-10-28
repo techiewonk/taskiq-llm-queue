@@ -6,13 +6,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal
 
+import orjson
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from taskiq_llm_queue.errors import ConfigError
@@ -259,8 +259,8 @@ class QueueConfig(BaseModel):
             value = get(name)
             if value:
                 try:
-                    raw[key] = json.loads(value)
-                except json.JSONDecodeError as exc:
+                    raw[key] = orjson.loads(value)
+                except orjson.JSONDecodeError as exc:
                     errors.append(f"{ENV_PREFIX}{name}: invalid JSON ({exc})")
         _lanes_from_env(get, raw, errors)
         _tuning_from_env(get, raw, errors)
@@ -346,8 +346,8 @@ def _tuning_from_env(get: _Getter, raw: dict[str, object], errors: list[str]) ->
                 errors.append(f"{ENV_PREFIX}{name}: {exc}")
         if field == "limiter" and (initial := get("AC_INITIAL")):
             try:
-                values["initial"] = json.loads(initial)
-            except json.JSONDecodeError as exc:
+                values["initial"] = orjson.loads(initial)
+            except orjson.JSONDecodeError as exc:
                 errors.append(f"{ENV_PREFIX}AC_INITIAL: invalid JSON ({exc})")
         if values:
             raw[field] = values

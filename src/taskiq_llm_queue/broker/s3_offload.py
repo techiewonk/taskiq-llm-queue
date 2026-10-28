@@ -8,10 +8,10 @@ only ever sees small messages. Adapted from taskiq-sqs `S3OffloadMiddleware` (MI
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
+import orjson
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
 from botocore.exceptions import ClientError
@@ -281,9 +281,7 @@ class S3OffloadMiddleware(TaskiqMiddleware):
 def encode_payload(args: list[Any], kwargs: dict[str, Any]) -> bytes:
     """JSON bytes of `{"args", "kwargs"}`; raises `S3OffloadError` for non-JSON values."""
     try:
-        return json.dumps(
-            {"args": args, "kwargs": kwargs}, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        return orjson.dumps({"args": args, "kwargs": kwargs})
     except (TypeError, ValueError) as exc:
         raise S3OffloadError(f"task arguments are not JSON-serializable: {exc}") from exc
 
@@ -291,7 +289,7 @@ def encode_payload(args: list[Any], kwargs: dict[str, Any]) -> bytes:
 def decode_payload(body: bytes) -> tuple[list[Any], dict[str, Any]]:
     """Inverse of `encode_payload`; raises `S3OffloadError` for anything else."""
     try:
-        data = json.loads(body)
+        data = orjson.loads(body)
     except ValueError as exc:
         raise S3OffloadError("offloaded payload is not valid JSON") from exc
     if (

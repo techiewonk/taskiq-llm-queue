@@ -7,10 +7,10 @@ worker releases the message instead of dropping it.
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any, Literal
 
+import orjson
 import xxhash
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -92,7 +92,7 @@ def parse_envelope(data: bytes | str | dict[str, Any]) -> Envelope:
 
     Raises `UnsupportedEnvelopeError` for a newer version and `ValueError` for malformed input.
     """
-    raw = json.loads(data) if isinstance(data, bytes | str) else data
+    raw = orjson.loads(data) if isinstance(data, bytes | str) else data
     if not isinstance(raw, dict):
         raise ValueError("envelope is not a JSON object")
     version = raw.get("v")

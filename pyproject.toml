@@ -30,6 +30,8 @@ dependencies = [
     "pydantic>=2.5,<3",
     # Stable hashing for sticky canary routing and hashed ids in task labels.
     "xxhash>=3",
+    # JSON on every hot path (envelopes, params, provider bodies): Rust, ~3-10x stdlib json.
+    "orjson>=3.10,<4",
 ]
 
 [project.scripts]
@@ -41,6 +43,8 @@ langchain-aws = ["langchain-aws>=0.2.24,<0.3", "langchain-core>=0.3.68,<0.4"]
 langchain-openai = ["langchain-openai>=0.3.26,<0.4", "langchain-core>=0.3.68,<0.4"]
 s3 = []  # S3 offload / result backend use aiobotocore (core); kept as a marker extra
 metrics = ["prometheus-client>=0.20"]
+# C RESP parser; redis-py picks it up automatically when installed.
+speedups = ["hiredis>=3"]
 
 [project.urls]
 Documentation = "https://github.com/techiewonk/taskiq-llm-queue#readme"

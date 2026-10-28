@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 from collections.abc import Iterable, Mapping
 from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any
+
+import orjson
 
 from taskiq_llm_queue.errors import ConfigError, ErrorInfo
 from taskiq_llm_queue.providers.classify import classify_bedrock
@@ -110,7 +111,7 @@ class BedrockProvider:
         if op == "invoke_model":
             body = request.get("body")
             if isinstance(body, Mapping | list):
-                request["body"] = json.dumps(body)
+                request["body"] = orjson.dumps(body)
             request.setdefault("contentType", "application/json")
             request.setdefault("accept", "application/json")
             client = await self._client(target)
@@ -173,5 +174,5 @@ def decode_invoke_body(response: Mapping[str, Any]) -> Any:
     """
     data = base64.b64decode(response["body_b64"])
     if "json" in str(response.get("contentType", "")).lower():
-        return json.loads(data)
+        return orjson.loads(data)
     return data

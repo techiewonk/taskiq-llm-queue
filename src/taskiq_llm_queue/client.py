@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import json
 import logging
 import threading
 import time
@@ -19,6 +18,7 @@ from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
+import orjson
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.connection import Connection, SSLConnection
 from redis.exceptions import RedisError
@@ -702,7 +702,7 @@ class LLMQueue:
         if size <= self.config.inline_max_bytes:
             return envelope
         key = self.keys.params(envelope.request_id)
-        await state.redis.set(key, json.dumps(envelope.params), ex=self.config.state_ttl_secs)
+        await state.redis.set(key, orjson.dumps(envelope.params), ex=self.config.state_ttl_secs)
         return envelope.model_copy(update={"params": None, "params_ref": key})
 
     def _report_redis(self, exc: BaseException) -> None:
@@ -918,7 +918,7 @@ def _vectors(op: Op, reply: LLMReply) -> list[list[float]]:
     """Vectors from one embed reply: Bedrock InvokeModel body or OpenAI embeddings `data`."""
     response = reply.response or {}
     if op == "invoke_model":
-        return parse_embeddings(json.loads(decode_invoke(response)["body"]))
+        return parse_embeddings(orjson.loads(decode_invoke(response)["body"]))
     data = sorted(response.get("data", []), key=lambda item: item.get("index", 0))
     return [list(item["embedding"]) for item in data]
 

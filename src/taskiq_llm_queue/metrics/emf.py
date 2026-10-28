@@ -7,12 +7,13 @@ CloudWatch extracts the metrics, so no in-cluster Prometheus is needed. Labels o
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import TextIO
+
+import orjson
 
 from taskiq_llm_queue.metrics_names import LABELS
 
@@ -83,7 +84,7 @@ class EmfMetrics:
             **dims,
             name: value,
         }
-        return json.dumps(doc, separators=(",", ":"))
+        return orjson.dumps(doc).decode()
 
     def _emit(self, name: str, value: float, unit: str, labels: Mapping[str, str] | None) -> None:
         try:
