@@ -274,3 +274,15 @@ async def test_denied_target_url_rejected_at_call(fake: FakeLLM) -> None:
         )
     assert fake.calls == {}
     await provider.aclose()
+
+
+def test_from_config_takes_the_configured_timeouts() -> None:
+    """Bug S39: Bedrock's 300 s botocore read timeout was fixed; it now comes from config."""
+    from taskiq_llm_queue import QueueConfig
+
+    config = QueueConfig(provider_read_timeout_secs=12.5, provider_connect_timeout_secs=1.5)
+    provider = BedrockProvider.from_config(config)
+    assert provider._config_kwargs["read_timeout"] == 12.5
+    assert provider._config_kwargs["connect_timeout"] == 1.5
+    override = BedrockProvider.from_config(config, read_timeout_secs=3.0)
+    assert override._config_kwargs["read_timeout"] == 3.0

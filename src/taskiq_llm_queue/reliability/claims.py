@@ -116,7 +116,11 @@ class RedisClaimStore:
         return ClaimDecision(_lua.as_text(decision))
 
     async def heartbeat_owned(self, request_ids: Sequence[str], *, worker: str) -> list[str]:
-        """Refresh heartbeat and TTL of tasks this worker runs; return the ids it lost (DS6)."""
+        """Refresh heartbeat and TTL of tasks this worker runs; return the ids it lost (DS6).
+
+        Lost means another worker owns the claim now or the record is gone; a claim this worker
+        already completed or released is skipped, not lost (its task is just finishing).
+        """
         if not request_ids:
             return []
         s = self.settings

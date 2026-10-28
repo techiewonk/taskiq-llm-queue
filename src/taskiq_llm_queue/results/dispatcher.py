@@ -38,6 +38,14 @@ _PUBSUB_RETRY_SECS = 1.0
 _COMPACT_MIN_ENTRIES = 64
 
 
+class ResultsUnavailable(QueueUnavailable):
+    """Result reads have failed for `abandon_after_secs`: the waiter should serve itself.
+
+    Raised to waiting callers so a queued call can run `direct` (local cap) instead of waiting
+    to its deadline while Valkey is gone (S21).
+    """
+
+
 @dataclass(eq=False, slots=True)
 class _Waiter:
     """One caller waiting for one task id; `seq` tells a stale heap entry from a live one.
@@ -58,6 +66,9 @@ class ResultDispatcher:
     Used by the queued clients after they kiq a task. `clock` and `sleep` are injectable so
     tests can run timeouts without real waiting. Pub/sub wake-up is on when both `redis` and
     `channel` are given; results are still found by polling if a message is lost.
+    `on_error` hears every failed read (poll or pub/sub) and `on_recovered` the first good poll
+    after one, so a send-only pod notices a Valkey outage (S21) without a call of its own. With
+    `abandon_after_secs`, waiters get `ResultsUnavailable` once reads have failed that long.
     """
 
     def __init__(
@@ -69,9 +80,16 @@ class ResultDispatcher:
         intervals_ms: Mapping[Lane, int] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        on_error: Callable[[BaseException], object] | None = None,
+        on_recovered: Callable[[], object] | None = None,
+        abandon_after_secs: float | None = None,
     ) -> None:
         """Keep collaborators only; nothing starts until `start` or the first `wait`."""
         self._store = store
+        self._on_error = on_error
+        self._on_recovered = on_recovered
+        self._abandon_after_secs = abandon_after_secs
+        self._failing_since: float | None = None  # first failed read of the current outage
         self._redis = redis
         self._channel = channel
         self._intervals = {**DEFAULT_INTERVALS_MS, **(intervals_ms or {})}
@@ -228,11 +246,38 @@ class ResultDispatcher:
             logger.warning(
                 "result_poll_failed", pending=len(task_ids), error_type=type(exc).__name__
             )
+            self._report_error(exc)
+            since = self._failing_since
+            limit = self._abandon_after_secs
+            if since is not None and limit is not None and self._clock() - since >= limit:
+                self._fail_all(ResultsUnavailable(f"result reads failing for {limit:g}s"))
             return
+        self._read_ok()
         for task_id, reply in replies.items():
             waiter = self._waiters.get(task_id)
             if waiter is not None and self._discard(task_id, waiter) and not waiter.future.done():
                 waiter.future.set_result(reply)
+
+    def _read_ok(self) -> None:
+        """A read worked: end the current outage (reported once, on the transition)."""
+        if self._failing_since is not None:
+            self._failing_since = None
+            self._notify(self._on_recovered)
+
+    def _report_error(self, exc: BaseException) -> None:
+        if self._failing_since is None:
+            self._failing_since = self._clock()
+        self._notify(self._on_error, exc)
+
+    @staticmethod
+    def _notify(callback: Callable[..., object] | None, *args: object) -> None:
+        """Run a health callback; it must never break the poll loop or the listener."""
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            logger.exception("result_health_callback_failed")
 
     def _hint(self, data: object) -> None:
         """Note an announced task id and wake the loop; an unreadable message wakes a sweep."""
@@ -293,6 +338,7 @@ class ResultDispatcher:
             pubsub = redis.pubsub()
             try:
                 await pubsub.subscribe(channel)
+                self._read_ok()
                 while True:
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                     if message is not None and self._waiters:
@@ -301,6 +347,7 @@ class ResultDispatcher:
                 raise
             except Exception as exc:  # reconnect; polling keeps working meanwhile
                 logger.warning("result_channel_failed", error_type=type(exc).__name__)
+                self._report_error(exc)
                 await self._sleep(_PUBSUB_RETRY_SECS)
             finally:
                 with contextlib.suppress(Exception):

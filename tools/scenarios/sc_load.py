@@ -208,12 +208,11 @@ async def burst(
     ctx.expect(ok_ratio >= min_ok_ratio, f"ok ratio {ok_ratio:.4f} < {min_ok_ratio}: {s['errors']}")
 
 
-LIMITER_COLLAPSE = (
-    "AIMD limiter over-reacts to sporadic throttles: each 429 (at most 1/s per target) cuts the "
-    "limit x0.7 and pauses the target 2 s (closing every pod's receive gate), while growth is +1 "
-    "per 20 busy successes, so a 2 % random throttle pins limits at 3-5 and throughput near "
-    "20 req/s; rt calls then fail no_capacity after the 2 s acquire wait or time out. "
-    "Exactly-once, DLQ and leak checks pass; only the all-ok criterion fails"
+STORM_FLOOR = (
+    "a 30 % random throttle storm is clustered loss by any measure, so the limiter cuts once per "
+    "window and holds low limits: measured 17 req/s, ok 59.7 % (was 16.3 req/s, ok 17.5 %) with "
+    "timeouts dominating; random loss that does not fall when concurrency falls needs a "
+    "different signal than AIMD (e.g. Retry-After). Exactly-once, DLQ and leak checks pass"
 )
 
 
@@ -221,7 +220,6 @@ LIMITER_COLLAPSE = (
     "S35",
     "10K burst: 1 sender, 3 workers, realistic latency, light throttle",
     tags=("slow",),
-    xfail=LIMITER_COLLAPSE,
 )
 async def s35(ctx: Ctx) -> None:
     """10,000 requests (60 % rt, 30 % bg, 10 % bulk embed); exactly one reply each."""
@@ -234,7 +232,7 @@ async def s35(ctx: Ctx) -> None:
     "10K burst under a 30 % throttle storm, one worker killed mid-run",
     tags=("slow",),
     chaos=True,
-    xfail=LIMITER_COLLAPSE,
+    xfail=STORM_FLOOR,
 )
 async def s35b(ctx: Ctx) -> None:
     """Same mix with throttle_rate 0.3 everywhere; w2 is hard-killed 10 s in."""

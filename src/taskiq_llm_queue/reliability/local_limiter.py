@@ -20,8 +20,9 @@ from taskiq_llm_queue.reliability.limiter import PauseGate
 class LocalLimiter:
     """`Limiter` with a fixed per-pod cap per (model, target), lane share and throttle pause.
 
-    No learning: the cap is set by the caller from `local_cap`. A throttle only pauses the
-    model target for `pause_secs`, closing its gate.
+    No learning: the cap is set by the caller from `local_cap`. A throttle storm (at least
+    `min_throttles` throttles making up `pause_ratio` of a `window_secs` window) pauses the model
+    target for `pause_secs`, closing its gate; a lone throttle does not (S35).
     """
 
     def __init__(
@@ -32,6 +33,9 @@ class LocalLimiter:
         pause_secs: float = 2.0,
         lease_ttl_secs: float = 240.0,
         poll_secs: float = 0.05,
+        min_throttles: int = 2,
+        pause_ratio: float = 0.5,
+        window_secs: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         sync_sleep: Callable[[float], None] = time.sleep,
@@ -44,12 +48,16 @@ class LocalLimiter:
         self._pause_secs = pause_secs
         self._lease_ttl = lease_ttl_secs
         self._poll = poll_secs
+        self._min_throttles = min_throttles
+        self._pause_ratio = pause_ratio
+        self._window = window_secs
         self._clock = clock
         self._sleep = sleep
         self._sync_sleep = sync_sleep
         self._lock = threading.Lock()
         self._held: dict[tuple[str, str], set[str]] = {}
         self._gates: dict[tuple[str, str], PauseGate] = {}
+        self._outcomes: dict[tuple[str, str], list[float]] = {}  # [window start, ok, throttled]
 
     def inflight(self, model: str, target: str) -> int:
         """Slots currently held for a model target in this pod."""
@@ -110,11 +118,22 @@ class LocalLimiter:
         return lease
 
     def release_sync(self, lease: Lease, *, throttled: bool) -> None:
-        """Return the slot; a throttle pauses the model target for `pause_secs`."""
+        """Return the slot; a throttle storm pauses the model target for `pause_secs`."""
+        key = (lease.model, lease.target)
+        now = self._clock()
         with self._lock:
-            self._held.get((lease.model, lease.target), set()).discard(lease.token)
-        if throttled:
-            self.gate(lease.model, lease.target).close_for(self._pause_secs)
+            self._held.get(key, set()).discard(lease.token)
+            counts = self._outcomes.setdefault(key, [now, 0.0, 0.0])
+            if now - counts[0] >= self._window:
+                counts[:] = [now, 0.0, 0.0]
+            counts[2 if throttled else 1] += 1
+            storm = (
+                throttled
+                and counts[2] >= self._min_throttles
+                and counts[2] >= self._pause_ratio * (counts[1] + counts[2])
+            )
+        if storm:
+            self.gate(*key).close_for(self._pause_secs)
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
         """Async form of `release_sync` (the `Limiter` protocol)."""

@@ -23,8 +23,9 @@ from redis.exceptions import RedisError
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
-from taskiq_llm_queue.errors import ErrorInfo, ErrorKind, QueueUnavailable
+from taskiq_llm_queue.errors import ConfigError, ErrorInfo, ErrorKind, QueueUnavailable
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
+from taskiq_llm_queue.providers.classify import is_target_error
 from taskiq_llm_queue.reliability import _lua
 from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
@@ -59,6 +60,10 @@ _IDLE_RETRY_SECS = 1.0
 _MIN_REQUEUE_SECS = 10
 _MAX_REQUEUE_SECS = 900
 _CACHE_ENTRIES = 1024
+# S48: a model this worker's config lacks is released this long (+ up to 50 % jitter) for a pod
+# that knows it, until the delivery budget (below `maxReceiveCount` 10, DS5) or deadline is spent.
+UNKNOWN_MODEL_RELEASE_SECS = 10
+UNKNOWN_MODEL_MAX_DELIVERIES = 8
 
 
 class InfraError(QueueUnavailable):
@@ -164,7 +169,8 @@ class JobResult:
 
     `decision` other than RUN means the worker must not call the provider: DEFER releases the
     message with the heartbeat window, the ACK_* decisions ack it. `requeue_secs` set means no
-    capacity: release the message with that delay (DS4); the claim was already released.
+    capacity (DS4) or a model this pod lacks (S48): release the message with that delay; no
+    claim is held.
     """
 
     decision: ClaimDecision
@@ -239,14 +245,30 @@ async def execute_job(
     claim: bool = True,
     store: bool = True,
     on_run: Callable[[], None] | None = None,
+    deliveries: int = 1,
 ) -> JobResult:
     """Run one envelope end to end (§6.1, §8): claim → call with retry/fallback → result.
 
     With `claim`, the Lua claim decides first (DS1-DS3) and the record is completed (best
     effort) after the result is stored (DS8). `on_run` is called once the claim says RUN. A
     Valkey failure raises `InfraError`; a `CancelledError` propagates with nothing written.
+    A model this config lacks is handed back unclaimed (`requeue_secs`) while `deliveries`
+    (the SQS receive count) and the deadline allow, then answered `model_not_configured`.
     """
     claims = deps.claims if claim else None
+    known = _model_known(envelope, deps)
+    if not known and claims is not None and store:
+        delay = _unknown_model_delay(envelope, deps, deliveries)
+        logger.warning(
+            "model_not_configured",
+            request_id=envelope.request_id,
+            model=envelope.model,
+            worker=deps.worker,
+            deliveries=deliveries,
+            released_secs=delay,
+        )
+        if delay is not None:  # unclaimed: a pod configured for the model takes it
+            return JobResult(ClaimDecision.RUN, requeue_secs=delay)
     if claims is not None:
         try:
             decision = await claims.claim(
@@ -268,6 +290,9 @@ async def execute_job(
         if cached is not None:  # DS8: an earlier delivery ran it but could not store the reply
             logger.info("cached_reply_reused", request_id=envelope.request_id)
             reply = cached
+        elif not known:
+            message = f"model {envelope.model!r} is not configured on worker {deps.worker!r}"
+            reply = error_reply(envelope, "model_not_configured", message, retryable=False)
         elif (params := await load_params(envelope, deps)) is None:
             reply = error_reply(envelope, "params_missing", "params_ref not found", retryable=False)
         else:
@@ -319,6 +344,24 @@ async def execute_job(
             envelope,
         )
     return JobResult(ClaimDecision.RUN, reply)
+
+
+def _model_known(envelope: Envelope, deps: CoreDeps) -> bool:
+    """True when this worker's config has the envelope's `alias[@target]`."""
+    try:
+        deps.config.resolve(envelope.model)
+    except ConfigError:
+        return False
+    return True
+
+
+def _unknown_model_delay(envelope: Envelope, deps: CoreDeps, deliveries: int) -> int | None:
+    """Release delay for a model this pod lacks; None once the budget or deadline is spent."""
+    remaining = envelope.deadline_at - deps.clock()
+    if deliveries >= UNKNOWN_MODEL_MAX_DELIVERIES or remaining <= 2 * UNKNOWN_MODEL_RELEASE_SECS:
+        return None
+    # Jitter: a fixed delay in step with this pod's receive loop let it win every redelivery.
+    return UNKNOWN_MODEL_RELEASE_SECS + deps.rng.randint(0, UNKNOWN_MODEL_RELEASE_SECS // 2)
 
 
 async def _finish(
@@ -584,6 +627,8 @@ async def run_call(
     When no step could run: `requeue` raises `_Requeue` (bg/bulk), an all-open breaker waits
     and tries again within the deadline. Raises `_Stopped`; a Valkey error propagates.
     `fresh_claim` skips the cancel check before the first slot (the claim just made it).
+    An attempt is capped at `attempt_timeout_secs`; a hung target moves on to the next step,
+    as does a fatal error about the target itself (`is_target_error`, e.g. model not in region).
     """
     config = deps.config
     steps = resolve_fallback(
@@ -626,9 +671,12 @@ async def run_call(
                 progress.attempts += 1
                 deps.leases.add(lease)
                 info: ErrorInfo | None = None
-                # Deadline cap: no extra task, unlike wait_for, and `expired()` tells it apart
-                # from a provider's own timeout.
-                cap = asyncio.timeout(max(0.1, envelope.deadline_at - deps.clock()))
+                target_error = False
+                # One cap for the attempt timeout and the deadline: no extra task, unlike
+                # wait_for, and `expired()` tells it apart from a provider's own timeout.
+                remaining = envelope.deadline_at - deps.clock()
+                by_deadline = config.attempt_timeout_secs >= remaining
+                cap = asyncio.timeout(max(0.1, min(config.attempt_timeout_secs, remaining)))
                 t0 = time.monotonic()
                 try:
                     async with cap:
@@ -636,8 +684,14 @@ async def run_call(
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    info = _classify(provider, exc)
-                    last, last_message = info, _attempt_message(exc, info)
+                    if cap.expired() and not by_deadline:  # S39: a hung target, not the call
+                        info = ErrorInfo(ErrorKind.RETRYABLE, "attempt_timeout")
+                        last_message = f"attempt timed out after {config.attempt_timeout_secs}s"
+                    else:
+                        info = _classify(provider, exc)
+                        target_error = is_target_error(exc, info)
+                        last_message = _attempt_message(exc, info)
+                    last = info
                 finally:
                     deps.leases.discard(lease)
                     await _release(
@@ -664,6 +718,16 @@ async def run_call(
                     return LLMReply(
                         request_id=envelope.request_id, ok=True, response=response, meta=meta
                     )
+                if target_error:  # S38: model/profile not served here; the next step may be
+                    logger.warning(
+                        "target_unavailable",
+                        request_id=envelope.request_id,
+                        model=step.alias,
+                        target=step.target,
+                        error=last_message,
+                    )
+                    await _record(deps, step, ok=None)
+                    break
                 if info.kind is ErrorKind.FATAL:
                     return error_reply(
                         envelope,
@@ -682,8 +746,11 @@ async def run_call(
                     await _record(deps, step, ok=False)
                 else:  # a throttle belongs to the limiter: frees a half-open probe, no count
                     await _record(deps, step, ok=None)
-                if cap.expired():  # the call's deadline cut it off: expired, not a provider error
-                    raise _Stopped(ClaimState.EXPIRED)
+                if cap.expired():
+                    if by_deadline:  # the call's deadline cut it off: expired, not a provider error
+                        raise _Stopped(ClaimState.EXPIRED)
+                    if index + 1 < len(steps):  # a hung target: the next one, not the same again
+                        break
                 if attempt + 1 < config.retry_attempts:
                     delay = backoff_secs(
                         attempt, config.retry_base_secs, deps.rng, info.retry_after_secs
@@ -703,7 +770,7 @@ async def run_call(
             envelope,
             last.code or last.kind.value,
             last_message,
-            retryable=True,
+            retryable=last.kind is not ErrorKind.FATAL,  # every target refused the model
             kind=last.kind.value,
             retry_after_secs=last.retry_after_secs,
             meta=CallMeta(attempts=progress.attempts, worker=deps.worker),

@@ -121,6 +121,11 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `redis_socket_timeout_secs` / `connect_timeout` / `health_check_interval` | 5 / 2 / 30 | Connection errors retried 3× with backoff |
 | `id_hash_salt` (`LLMQ_ID_HASH_SALT`) | library constant | **Set your own in production**; keys the BLAKE2b hash of session/user ids |
 | `timeout_secs` per lane | rt 90, bg 300, bulk 900 | |
+| `attempt_timeout_secs` | 180 | One provider attempt; a hung target moves to the next fallback step |
+| `provider_read_timeout_secs` / `provider_connect_timeout_secs` | 300 / 10 | Bedrock botocore and OpenAI httpx timeouts |
+| `sqs_send_timeout_secs` | 5 | Send bound (also ≤ half the remaining budget); on expiry the call runs direct |
+| `valkey_wait_failover_secs` | 10 | Result reads failing this long make waiting callers run direct |
+| `redis_max_connections` | 32 | Raised automatically to worker slots + 16 |
 
 Redis keys are cluster-safe (hash-tagged per request and per model+target), so cluster-mode Valkey (e.g. ElastiCache Serverless) works.
 

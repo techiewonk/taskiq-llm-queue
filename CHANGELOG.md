@@ -6,6 +6,21 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+### Fixed (found by the scenario harness, `tools/scenarios`)
+- Limiter collapse under sporadic throttles: cuts only on clustered throttles (≥2 and ≥5 % in a 1 s window), at most one cut per window, pause only when half the window throttles, growth scales with the limit. 10K burst with 2 % throttles: 22.5 → 76.1 req/s, 6,721 → 10,000 ok (S35).
+- Limit overshoot: growth slows near the last cut point; settles at 57–63 instead of swinging 44–64 (S07).
+- Spurious claim takeovers under load: the heartbeat treated the worker's own just-finished claim as lost and cancelled the result publish (S35c, S27: 19 and 4 losses → 0). A real claim loss now ends the task quietly with a warning, no ERROR traceback.
+- Valkey pools are sized to worker slots + 16; a failed lease release is retried on the next limiter call instead of holding the slot for 240 s.
+- SQS down: the send is bounded by `sqs_send_timeout_secs` and half the remaining budget, then the call runs direct; first call served in 5.7 s instead of timing out (S20).
+- Valkey down on a send-only pod: result-read errors now trip failover; waiting callers run direct; cancels are replayed on recovery (S21).
+- Target-specific errors (ResourceNotFound, AccessDenied, model not in region, 404) move to the next fallback target instead of ending the call (S38).
+- Per-attempt timeout `attempt_timeout_secs`; configurable provider read/connect timeouts (S39).
+- A worker missing a model alias releases the message unclaimed (jittered delay) instead of acking an `internal_error`; it answers `model_not_configured` only near the delivery budget or deadline (S48).
+
+### Added
+- Scenario harness: 54 scenarios (work, retry, pause, cancel, purge, region change, timeouts, chaos, scale, 10K burst) on an isolated compose profile; `make scenarios`, `make load`, `make chaos`.
+- Settings: `attempt_timeout_secs`, `provider_read_timeout_secs`, `provider_connect_timeout_secs`, `sqs_send_timeout_secs`, `valkey_wait_failover_secs`, limiter window settings.
+
 ## [0.1.0a1] - 2026-10-29
 
 First pre-release. Everything listed below is new.
@@ -61,3 +76,5 @@ First pre-release. Everything listed below is new.
 - A reply that can't be stored is cached per pod; a redelivery to a different pod calls the provider again.
 - Exhausted jobs reach a dead-letter queue only if their queue has one configured.
 - Cluster-mode Valkey is covered by key-slot tests, not yet by a real cluster run.
+- A 30 % random throttle storm (S35b) still holds limits low: a throttle-counting limiter can't tell it from overload; using Retry-After as a signal is planned.
+- A call queued during a Valkey outage longer than `valkey_wait_failover_secs` can run twice if a worker takes it before its cancel flag is replayed.

@@ -273,3 +273,24 @@ async def test_heartbeat_batches_per_slot(valkey: redis.asyncio.Redis, keys: Key
     assert await store.claim("hb-4", deadline_at=later(), worker="b") is ClaimDecision.RUN
     lost = await store.heartbeat_owned(ids, worker="a")
     assert lost == ["hb-4", "hb-5"]  # another owner, and no record at all
+
+
+async def test_heartbeat_does_not_report_own_finished_claims_as_lost(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug: spurious `claims_lost` under load with no kills (S35c 19, S27, S34, S07).
+
+    A beat landing between a task's own complete/release CAS and its leaving the running set
+    reported the claim lost and cancelled the task mid result-publish; only a takeover counts.
+    """
+    store = make(valkey, keys)
+    for rid in ("done", "cancelled", "released", "taken"):
+        assert await store.claim(rid, deadline_at=later(), worker="a") is ClaimDecision.RUN
+    await store.complete("done", ClaimState.DONE, worker="a")
+    await store.complete("cancelled", ClaimState.CANCELLED, worker="a")
+    await store.release("released", worker="a")
+    await store.release("taken", worker="a")
+    assert await store.claim("taken", deadline_at=later(), worker="b") is ClaimDecision.RUN
+    lost = await store.heartbeat_owned(["done", "cancelled", "released", "taken"], worker="a")
+    assert lost == ["taken"]
+    assert await store.state("done") is ClaimState.DONE, "a skipped record is not rewritten"

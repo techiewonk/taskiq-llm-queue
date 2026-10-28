@@ -102,12 +102,13 @@ async def s15(ctx: Ctx) -> None:
     "SQS down -> direct, then back to sqs",
     chaos=True,
     aws_safe="no",
-    xfail="the send to an unreachable SQS is retried (adaptive SQS retries) for ~50 s, longer "
-    "than the call budget, before failover; the DS17 direct run then starts past the deadline, "
-    "so the first caller gets LLMQueueTimeout instead of a direct answer",
 )
 async def s20(ctx: Ctx) -> None:
-    """SQS stopped: calls switch to direct after one send failure; back to sqs after recovery."""
+    """SQS stopped: the first call fails over to direct within its budget, later ones go direct.
+
+    Back to sqs once SQS returns and the failover window closes. The send is bounded by
+    `sqs_send_timeout_secs` (it hung ~50-70 s on a dead pooled connection before).
+    """
     cfg = ctx.config(sqs_failover_secs=15.0)
     await ctx.workers(1, cfg)
     q = await ctx.queue(cfg)
@@ -123,6 +124,7 @@ async def s20(ctx: Ctx) -> None:
         f"not served direct while SQS down: {[r.error for r in during]}",
     )
     await stack.start_service(ctx.settings.sqs_service)
+    await ctx.ensure_queues()  # ElasticMQ keeps queues in memory; real SQS keeps them
     t1 = time.monotonic()
     back = None
     i = 10
@@ -142,12 +144,13 @@ async def s20(ctx: Ctx) -> None:
     "Valkey down -> direct with local cap, no crash",
     chaos=True,
     aws_safe="no",
-    xfail="a send-mode pod never detects Valkey down (the result dispatcher's read errors do not "
-    "reach FailoverState), so calls keep going to SQS, workers cannot claim them and every caller "
-    "waits to its deadline (LLMQueueTimeout) instead of running direct under the local cap",
 )
 async def s21(ctx: Ctx) -> None:
-    """Valkey stopped: calls still answered (direct, local cap); normal again after it returns."""
+    """Valkey stopped: calls still answered (direct, local cap); normal again after it returns.
+
+    The send-only pod learns of the outage from its result dispatcher; calls already queued
+    run direct after `valkey_wait_failover_secs` instead of waiting to their deadline.
+    """
     await ctx.workers(1)
     q = await ctx.queue()
     ctx.expect((await one(ctx, q, 0)).ok, "baseline failed")
@@ -198,11 +201,7 @@ async def s47(ctx: Ctx) -> None:
 
 
 @scenario(
-    "S48",
-    "Remove: queue purge, alias removed from worker config, kill switch",
-    xfail="a worker whose config lacks the alias acks the message with an internal_error reply "
-    "(ConfigError inside run_call) instead of releasing it until config is restored",
-    aws_safe="no",
+    "S48", "Remove: queue purge, alias removed from worker config, kill switch", aws_safe="no"
 )
 async def s48(ctx: Ctx) -> None:
     """Cohere removed from the worker's config while its messages are queued.

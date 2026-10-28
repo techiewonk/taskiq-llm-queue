@@ -31,10 +31,20 @@ from taskiq_llm_queue import (
     QueueConfig,
     Target,
 )
-from taskiq_llm_queue.broker.broker import SQS_MESSAGE_ID_LABEL, SQS_RECEIPT_HANDLE_LABEL
+from taskiq_llm_queue.broker.broker import (
+    SQS_MESSAGE_ID_LABEL,
+    SQS_RECEIPT_HANDLE_LABEL,
+    SQS_RECEIVE_COUNT_LABEL,
+)
 from taskiq_llm_queue.broker.errors import ErrorFamily, InvalidLabelError, SQSSendError
 from taskiq_llm_queue.client import LLMQueue, _deterministic_send_error, _SyncLimiter
-from taskiq_llm_queue.core import CoreDeps, InfraError, JobResult
+from taskiq_llm_queue.core import (
+    UNKNOWN_MODEL_MAX_DELIVERIES,
+    UNKNOWN_MODEL_RELEASE_SECS,
+    CoreDeps,
+    InfraError,
+    JobResult,
+)
 from taskiq_llm_queue.errors import QueueUnavailable
 from taskiq_llm_queue.failover import FailoverSettings, FailoverState
 from taskiq_llm_queue.lifecycle import ClaimGroup, PodHeartbeat, PodRegistry
@@ -221,6 +231,30 @@ async def test_valkey_error_on_claim_releases_message(rig: Rig) -> None:
     assert rig.provider.calls == 0
 
 
+async def test_unknown_model_is_released_not_acked(rig: Rig) -> None:
+    """Bug S48: a worker whose config lacks the alias acked the message with internal_error;
+    it now releases it (delayed, unclaimed) so a correctly configured pod can run it."""
+    await run_llm(rig, raw_envelope(model="cohere", lane="bg", deadline_at=time.time() + 90))
+    ((handle, secs),) = rig.broker.releases
+    assert handle == "rh-1"
+    assert UNKNOWN_MODEL_RELEASE_SECS <= secs <= 1.5 * UNKNOWN_MODEL_RELEASE_SECS
+    assert rig.claims.log == []
+    assert rig.runtime.deps.results is not None
+    assert cast(Results, rig.runtime.deps.results).replies == {}
+
+
+async def test_unknown_model_answers_after_the_delivery_budget(rig: Rig) -> None:
+    """Bug S48: the SQS receive count reaches `execute_job`; at the budget the caller gets
+    `model_not_configured` instead of the message cycling into the DLQ."""
+    labels = {**LABELS, SQS_RECEIVE_COUNT_LABEL: str(UNKNOWN_MODEL_MAX_DELIVERIES)}
+    raw = raw_envelope(model="cohere", lane="bg", deadline_at=time.time() + 90)
+    await rig.runtime.run_llm(raw, labels, cast(Any, rig.broker))
+    assert rig.broker.releases == []
+    reply = cast(Results, rig.runtime.deps.results).replies["r-1"]
+    assert reply.error is not None
+    assert reply.error["type"] == "model_not_configured"
+
+
 async def test_task_registered_only_after_claim_runs(rig: Rig) -> None:
     """Bug #8: a delivery is tracked as running only once its claim says RUN, so the claim
     heartbeat can't report it lost (and cancel it) while the claim is still being decided."""
@@ -253,10 +287,34 @@ async def test_lost_claim_releases_message_instead_of_acking(rig: Rig) -> None:
     task = asyncio.create_task(run_llm(rig, raw_envelope()))
     await started.wait()
     rig.runtime.stop_running(CLAIM_LOST, ["r-1"])
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    await task  # ends quietly: no CancelledError, so taskiq logs no ERROR traceback
     assert rig.broker.releases == [("rh-1", 20)]
     assert not any(e.startswith("release") for e in rig.claims.log)  # not our claim any more
+    assert cast(Results, rig.runtime.deps.results).replies == {}  # no result published
+
+
+async def test_claim_loss_ends_quietly_but_shutdown_still_cancels(rig: Rig) -> None:
+    """Bug: a genuine claim loss re-raised CancelledError, so taskiq printed an ERROR
+    traceback. It now ends quietly, but a drain cancel or one on top of it still raises."""
+    started = asyncio.Event()
+
+    async def block() -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    rig.provider.hook = block
+    for stop in ("drain", "claim_lost_then_shutdown"):
+        started.clear()
+        task = asyncio.create_task(run_llm(rig, raw_envelope()))
+        await started.wait()
+        if stop == "drain":
+            rig.runtime.stop_running("drain", ["r-1"])
+        else:
+            rig.runtime.stop_running(CLAIM_LOST, ["r-1"])
+            task.cancel()  # pod shutdown arrives while the claim loss is being handled
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled(), stop
 
 
 async def test_two_deliveries_of_one_request_keep_their_own_entries(rig: Rig) -> None:

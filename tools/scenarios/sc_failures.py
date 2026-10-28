@@ -232,13 +232,7 @@ async def s45(ctx: Ctx) -> None:
     await ctx.final_checks()
 
 
-@scenario(
-    "S38",
-    "Model not available in region -> profile",
-    xfail="core.run_call returns on any FATAL error without trying the next fallback step, so "
-    "a per-region ResourceNotFound/Validation never reaches the APAC profile",
-    aws_safe="no",
-)
+@scenario("S38", "Model not available in region -> profile", aws_safe="no")
 async def s38(ctx: Ctx) -> None:
     """Region answers ResourceNotFound: not retried there, served by the APAC profile."""
     await ctx.workers(1)
@@ -257,16 +251,10 @@ async def s38(ctx: Ctx) -> None:
     ctx.expect(r.ok and r.meta.served_target == "apac", f"not served by apac: {r.error!r}")
 
 
-@scenario(
-    "S39",
-    "Provider hang -> per-attempt timeout -> next target",
-    xfail="no per-attempt timeout: run_call waits on one attempt until the call deadline "
-    "(asyncio.wait_for(deadline - now)); Bedrock read_timeout is 300 s and not configurable",
-    aws_safe="no",
-)
+@scenario("S39", "Provider hang -> per-attempt timeout -> next target", aws_safe="no")
 async def s39(ctx: Ctx) -> None:
-    """Region hangs 60 s; call budget 15 s: attempt aborted, served by apac within the deadline."""
-    await ctx.workers(1)
+    """Region hangs 60 s; call budget 15 s, attempt cap 5 s: served by apac within the deadline."""
+    await ctx.workers(1, ctx.config(attempt_timeout_secs=5))
     q = await ctx.queue()
     rid = ctx.rid(1)
     await ctx.fake.script(rid, ["hang:60"], model="openai.gpt-oss-120b-1:0@")

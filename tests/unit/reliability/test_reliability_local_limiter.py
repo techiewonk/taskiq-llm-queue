@@ -135,14 +135,34 @@ async def test_local_limiter_waits_until_timeout() -> None:
 
 
 async def test_local_limiter_throttle_pauses() -> None:
+    """A throttle storm (2 of 2 calls in the window) pauses the model target."""
     lim, clock = make_local(3)
-    lease = await lim.acquire("m", "t", Lane.RT, 0)
-    assert lease is not None
-    await lim.release(lease, throttled=True)
+    for _ in range(2):
+        lease = await lim.acquire("m", "t", Lane.RT, 0)
+        assert lease is not None
+        await lim.release(lease, throttled=True)
     assert not lim.gate("m", "t").is_open()
     assert await lim.acquire("m", "t", Lane.RT, 0) is None
     assert await lim.acquire("m", "t", Lane.RT, 3.0) is not None
     assert clock.now >= 102.0
+
+
+async def test_local_limiter_lone_throttle_does_not_pause() -> None:
+    """Bug LIMITER_COLLAPSE (S35): every 429 closed the gate 2 s; noise must not pause it.
+
+    One throttle among successes, or two throttles in different windows, leave the gate open.
+    """
+    lim, clock = make_local(3)
+    for throttled in (False, False, True, False, False):
+        lease = await lim.acquire("m", "t", Lane.RT, 0)
+        assert lease is not None
+        await lim.release(lease, throttled=throttled)
+    assert lim.gate("m", "t").is_open()
+    clock.now += 1.5
+    lease = await lim.acquire("m", "t", Lane.RT, 0)
+    assert lease is not None
+    await lim.release(lease, throttled=True)
+    assert lim.gate("m", "t").is_open(), "the earlier throttle is in a past window"
 
 
 def test_local_limiter_sync_from_threads() -> None:

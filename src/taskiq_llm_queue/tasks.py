@@ -23,6 +23,7 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import (
     SQS_MESSAGE_ID_LABEL,
     SQS_RECEIPT_HANDLE_LABEL,
+    SQS_RECEIVE_COUNT_LABEL,
 )
 from taskiq_llm_queue.core import InfraError, execute_job
 from taskiq_llm_queue.envelope import (
@@ -188,11 +189,13 @@ class WorkerRuntime:
             owned.append(self.register(rid, broker, labels))
 
         try:
-            result = await execute_job(envelope, self.deps, on_run=on_run)
+            result = await execute_job(
+                envelope, self.deps, on_run=on_run, deliveries=_receive_count(labels)
+            )
             if result.decision is ClaimDecision.DEFER:
                 await _release(broker, labels, self.defer_secs)  # DS2: never delete
-            elif result.requeue_secs is not None:
-                await _release(broker, labels, result.requeue_secs)  # DS4: no capacity
+            elif result.requeue_secs is not None:  # DS4 no capacity; S48 model not configured
+                await _release(broker, labels, result.requeue_secs)
         except InfraError as exc:
             await self._infra_release(rid, exc, broker, labels, owned=bool(owned))
         except QueueUnavailable:  # DS8: reply cached on this pod, claim left running
@@ -203,6 +206,8 @@ class WorkerRuntime:
         except asyncio.CancelledError:
             entry = owned[0] if owned else None
             await asyncio.shield(self._after_cancel(rid, entry, broker, labels))
+            if _claim_loss_only(entry):
+                return
             raise
         except Exception as exc:  # a bug: release (maxReceiveCount bounds it) rather than ack
             logger.exception(
@@ -324,6 +329,8 @@ class WorkerRuntime:
             await function(dict(raw.get("payload") or {}))
         except asyncio.CancelledError:
             await asyncio.shield(self._after_cancel(job_id, entry, broker, labels))
+            if _claim_loss_only(entry):
+                return
             raise
         except Exception:
             logger.exception("job_failed", job=name, request_id=job_id)
@@ -382,6 +389,26 @@ class WorkerRuntime:
 def _label(labels: Mapping[str, Any], name: str) -> str | None:
     value = labels.get(name)
     return None if value is None else str(value)
+
+
+def _claim_loss_only(entry: _Running | None) -> bool:
+    """True when the only cancel was our claim-loss stop: end quietly, not with a traceback.
+
+    The message is already released (a later taskiq ack is a no-op) and nothing is stored.
+    Shutdown or any other pending cancel keeps the count above 0, so it is re-raised.
+    """
+    if entry is None or entry.stop_reason != CLAIM_LOST:
+        return False
+    task = asyncio.current_task()
+    return task is not None and task.uncancel() == 0
+
+
+def _receive_count(labels: Mapping[str, Any]) -> int:
+    """SQS `ApproximateReceiveCount` of this delivery (1 when absent or unparsable)."""
+    try:
+        return max(1, int(labels.get(SQS_RECEIVE_COUNT_LABEL) or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 async def _release(broker: HybridSQSBroker, labels: Mapping[str, Any], secs: int) -> None:

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+_MAX_ORPHANS = 4096  # past this, leases left by failed calls just expire (lease_ttl_secs)
+
 
 @dataclass(frozen=True, slots=True)
 class LimiterSettings:
@@ -39,6 +41,7 @@ class LimiterSettings:
     `initial` maps a model alias to its start limit (a stored learned limit always wins).
     DS12: growth needs `inflight >= utilisation x allowed` and stops at 2x the peak inflight,
     which decays with `peak_halflife_secs`; `ramp_cap` is an extra hard cap on ramp doubling.
+    Cuts need clustered throttles (`loss_tolerance` of a `window_secs` window, see `_lua`).
     """
 
     initial: Mapping[str, int] | None = None
@@ -56,6 +59,14 @@ class LimiterSettings:
     poll_secs: float = 0.05
     max_poll_secs: float = 0.25
     peak_halflife_secs: float = 300.0
+    # S35: a lone 429 among many successes is noise, not a capacity signal.
+    loss_tolerance: float = 0.05
+    min_throttles: int = 2
+    pause_ratio: float = 0.5
+    window_secs: float = 1.0
+    # S07: hold the limit near `settle_ratio x` the last cut point and probe above it slowly.
+    settle_ratio: float = 0.9
+    probe_secs: float = 5.0
 
     def __post_init__(self) -> None:
         """Reject impossible settings at construction (boot time), never on a call path."""
@@ -69,6 +80,12 @@ class LimiterSettings:
             raise ValueError("utilisation must be in (0, 1]")
         if self.poll_secs <= 0 or self.max_poll_secs < self.poll_secs:
             raise ValueError("need 0 < poll_secs <= max_poll_secs")
+        if not 0 <= self.loss_tolerance <= 1 or not 0 <= self.pause_ratio <= 1:
+            raise ValueError("loss_tolerance and pause_ratio must be in [0, 1]")
+        if self.min_throttles < 1 or self.window_secs <= 0 or self.probe_secs < 0:
+            raise ValueError("need min_throttles >= 1, window_secs > 0 and probe_secs >= 0")
+        if not 0 < self.settle_ratio <= 1:
+            raise ValueError("settle_ratio must be in (0, 1]")
 
     def retry_delay(self, attempt: int, paused_secs: float, rng: random.Random) -> float:
         """Sleep before the next acquire try: the pause remaining, else jittered backoff.
@@ -183,6 +200,13 @@ def _release_args(
         settings.utilisation,
         settings.peak_halflife_secs,
         share,
+        settings.loss_tolerance,
+        settings.min_throttles,
+        settings.pause_ratio,
+        settings.window_secs,
+        settings.settle_ratio,
+        settings.probe_secs,
+        settings.lease_ttl_secs,
     ]
 
 
@@ -224,6 +248,7 @@ class AdaptiveLimiter:
         self._renew = client.register_script(_lua.LEASE_RENEW)
         self._gates: dict[tuple[str, str], PauseGate] = {}
         self._shares: dict[str, float] = {}  # lease token -> lane share, for DS12 at release
+        self._orphans: set[tuple[str, str, str]] = set()  # (model, target, token) to drop
         self._rng = random.Random()
         self.last_limits: dict[tuple[str, str], int] = {}
 
@@ -236,9 +261,20 @@ class AdaptiveLimiter:
         self.gate(model, target).close_for(paused_secs)
 
     async def _attempt(self, model: str, target: str, lane: Lane) -> tuple[Lease | None, float]:
+        if self._orphans:
+            await self._drop_orphans()
         token = uuid.uuid4().hex
         args = _acquire_args(self.settings, model, lane, token)
-        granted, _inflight, limit, extra = await self._acquire(self._key_pair(model, target), args)
+        try:
+            granted, _inflight, limit, extra = await self._acquire(
+                self._key_pair(model, target), args
+            )
+        except BaseException:
+            # The script may have run and only the reply been lost (timeout, cancel): a lease
+            # nobody holds would block a slot for `lease_ttl_secs`, so drop the token later.
+            if len(self._orphans) < _MAX_ORPHANS:
+                self._orphans.add((model, target, token))
+            raise
         if int(granted):
             self._note(model, target, int(limit), 0.0)
             self._shares[token] = self.settings.share_for(lane)
@@ -279,13 +315,42 @@ class AdaptiveLimiter:
             attempt += 1
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
-        """Return the slot and grow or shrink the limit, in one Lua call."""
+        """Return the slot and grow or shrink the limit, in one Lua call.
+
+        If Valkey fails the error is raised and the lease is remembered; the next acquire or
+        release on this pod drops it, so it does not hold a slot for `lease_ttl_secs`.
+        """
         share = self._shares.pop(lease.token, 1.0)
-        limit, _removed, paused = await self._release(
-            self._key_pair(lease.model, lease.target),
-            _release_args(self.settings, lease, throttled, share),
-        )
+        try:
+            limit, _removed, paused = await self._release(
+                self._key_pair(lease.model, lease.target),
+                _release_args(self.settings, lease, throttled, share),
+            )
+        except BaseException:
+            if len(self._orphans) < _MAX_ORPHANS:
+                self._orphans.add((lease.model, lease.target, lease.token))
+            raise
         self._note(lease.model, lease.target, int(limit), float(_lua.as_text(paused)))
+        if self._orphans:
+            await self._drop_orphans()
+
+    async def _drop_orphans(self) -> None:
+        """Remove leases whose release (or acquire reply) failed; kept for a later try on error.
+
+        Bug 4 (S35 pool exhaustion): a failed release left its lease live for 240 s.
+        """
+        orphans = list(self._orphans)
+        try:
+            async with self._client.pipeline(transaction=False) as pipe:
+                for model, target, token in orphans:
+                    pipe.zrem(self._keys.leases(model, target), token)
+                await pipe.execute()
+        except RedisError as exc:
+            logger.warning(
+                "limiter_orphans_kept", leases=len(orphans), error_type=type(exc).__name__
+            )
+            return
+        self._orphans.difference_update(orphans)
 
     async def renew(self, leases: Iterable[Lease]) -> list[Lease]:
         """Extend still-held leases by `lease_ttl_secs` (called by the heartbeat, DS11)."""

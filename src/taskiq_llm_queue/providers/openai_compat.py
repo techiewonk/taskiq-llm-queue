@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.envelope import Op
 
 DEFAULT_TIMEOUT_SECS = 300.0  # unverified; long completions on slow self-hosted servers
+DEFAULT_CONNECT_TIMEOUT_SECS = 10.0
 
 
 class OpenAICompatProvider:
@@ -39,18 +40,21 @@ class OpenAICompatProvider:
         api_keys: Mapping[str | None, str | None] | None = None,
         denied_hosts: Iterable[str] = (),
         timeout_secs: float = DEFAULT_TIMEOUT_SECS,
+        connect_timeout_secs: float = DEFAULT_CONNECT_TIMEOUT_SECS,
         client_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         """Keep settings only; the openai SDK is imported on the first call.
 
         `api_keys` maps a base URL (None = the default URL) to its key; a missing key lets
-        the SDK fall back to `OPENAI_API_KEY`.
+        the SDK fall back to `OPENAI_API_KEY`. `timeout_secs` is the httpx read (and write /
+        pool) timeout, `connect_timeout_secs` its connect timeout.
         """
         self._denied_hosts = tuple(denied_hosts)
         check_url(base_url, self._denied_hosts)
         self._base_url = base_url
         self._api_keys = dict(api_keys or {})
         self._timeout_secs = timeout_secs
+        self._connect_timeout_secs = connect_timeout_secs
         self._client_kwargs = dict(client_kwargs or {})
         self._clients: dict[str | None, AsyncOpenAI] = {}
 
@@ -84,6 +88,8 @@ class OpenAICompatProvider:
             api_keys[url] = env.get(name)
         if errors:
             raise ConfigError("; ".join(errors))
+        kwargs.setdefault("timeout_secs", config.provider_read_timeout_secs)
+        kwargs.setdefault("connect_timeout_secs", config.provider_connect_timeout_secs)
         return cls(api_keys=api_keys, denied_hosts=config.denied_hosts, **kwargs)
 
     async def call(self, op: Op, params: Mapping[str, Any], target: Target) -> dict[str, Any]:
@@ -119,6 +125,7 @@ class OpenAICompatProvider:
         base_url = target_url or self._base_url
         check_url(base_url, self._denied_hosts)
         try:
+            import httpx
             from openai import AsyncOpenAI
         except ImportError as exc:
             raise ConfigError(
@@ -128,7 +135,7 @@ class OpenAICompatProvider:
             api_key=self._api_keys.get(target_url),
             base_url=base_url,
             max_retries=0,
-            timeout=self._timeout_secs,
+            timeout=httpx.Timeout(self._timeout_secs, connect=self._connect_timeout_secs),
             **self._client_kwargs,
         )
         self._clients[target_url] = client

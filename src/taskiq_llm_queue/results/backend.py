@@ -87,13 +87,13 @@ class LLMQResultBackend(AsyncResultBackend[Any]):
         Without `redis`, the client comes from `config.create_redis` (URL, credentials, TLS,
         retries) and is owned, so the last `shutdown` closes it.
         """
-        from taskiq_llm_queue.config import create_redis
+        from taskiq_llm_queue.config import create_redis, redis_pool_size
         from taskiq_llm_queue.keys import KeySpace
 
         backend = cls(
             KeySpace(config.key_prefix),
             redis=redis or create_redis(config),
-            max_connections=config.redis_max_connections,
+            max_connections=redis_pool_size(config),
             result_ttl_secs=config.result_ttl_secs,
         )
         backend._owns_client = redis is None

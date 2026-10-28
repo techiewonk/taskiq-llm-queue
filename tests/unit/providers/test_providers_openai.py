@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from email.utils import formatdate
 
+import httpx
 import openai
 import pytest
 from providers_fake import FakeLLM, openai_error
@@ -198,3 +199,16 @@ def test_from_config_reads_keys_and_reports_every_problem() -> None:
         config.model_copy(update={"models": {"a": config.models["a"]}}), environ={"KEY_A": "secret"}
     )
     assert ok._api_keys == {"http://h1/v1": "secret"}
+
+
+async def test_from_config_takes_the_configured_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug S39: the httpx read/connect timeouts of OpenAI-compatible clients come from config."""
+    config = QueueConfig(provider_read_timeout_secs=12.5, provider_connect_timeout_secs=1.5)
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    provider = OpenAICompatProvider.from_config(config)
+    try:
+        timeout = provider._client("http://h/v1").timeout
+        assert isinstance(timeout, httpx.Timeout)
+        assert (timeout.read, timeout.connect) == (12.5, 1.5)
+    finally:
+        await provider.aclose()

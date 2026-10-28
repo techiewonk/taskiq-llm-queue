@@ -624,3 +624,173 @@ def test_attempt_message_does_not_repeat_the_code() -> None:
     other = ErrorInfo(ErrorKind.RETRYABLE, "timeout")
     assert _attempt_message(TimeoutError(), other) == "TimeoutError: timeout"
     assert _attempt_message(ValueError(), ErrorInfo(ErrorKind.FATAL)) == "ValueError: fatal"
+
+
+# ---------------------------------------------------------------- S38: target-specific errors
+
+
+async def test_target_error_falls_through_to_next_target(world: World) -> None:
+    """Bug S38: ResourceNotFound in one region ended the call; now the APAC profile serves it.
+
+    The region is called once (no retry there) and the breaker sees a neutral outcome.
+    """
+    missing = FakeError(ErrorKind.FATAL, "ResourceNotFoundException")
+    world.provider.script["primary"] = [missing]
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert (reply.meta.served_target, reply.meta.attempts) == ("apac", 2)
+    assert [c[1] for c in world.provider.calls] == ["primary", "apac"]
+    assert world.breaker.records == [("primary", None), ("apac", True)]
+    assert world.sleeps == []
+    assert world.limiter.held == 0
+
+
+@pytest.mark.parametrize("code", ["ResourceNotFoundException", "AccessDeniedException"])
+async def test_target_error_on_every_target_is_fatal(world: World, code: str) -> None:
+    """Bug S38: when every target refuses the model the reply is fatal, not retryable."""
+    world.provider.script["primary"] = [FakeError(ErrorKind.FATAL, code)]
+    world.provider.script["apac"] = [FakeError(ErrorKind.FATAL, code)]
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert (reply.error["type"], reply.error["retryable"], reply.error["kind"]) == (
+        code,
+        False,
+        "fatal",
+    )
+    assert len(world.provider.calls) == 2
+
+
+async def test_request_fatal_error_still_ends_the_call(world: World) -> None:
+    """Bug S38 guard: a bad payload (ValidationException) never tries another target."""
+    world.provider.script["primary"] = [FakeError(ErrorKind.FATAL, "ValidationException")]
+    reply = (await execute_job(envelope(fallback="chain"), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert reply.error["retryable"] is False
+    assert [c[1] for c in world.provider.calls] == ["primary"]
+
+
+# ---------------------------------------------------------------- S39: per-attempt timeout
+
+
+class HangOn(FakeProvider):
+    """Hangs on the targets in `hang` (until cancelled); answers at once elsewhere."""
+
+    def __init__(self, *hang: str) -> None:
+        super().__init__()
+        self.hang = set(hang)
+
+    async def call(self, op: str, params: Mapping[str, Any], target: Target) -> dict[str, Any]:
+        key = target.region or target.profile_id or "?"
+        if key in self.hang:
+            self.calls.append((op, key, dict(params)))
+            await asyncio.sleep(60)
+        return await super().call(op, params, target)
+
+    def classify(self, exc: BaseException) -> ErrorInfo:
+        return ErrorInfo(ErrorKind.FATAL, type(exc).__name__)
+
+
+async def test_hung_target_times_out_and_next_target_serves(world: World) -> None:
+    """Bug S39: a hung region used the whole call budget; now the attempt is cut at
+    `attempt_timeout_secs` and the next target serves, well inside the deadline."""
+    provider = HangOn("primary")
+    world.deps.providers = lambda alias: provider
+    world.deps.config = config(attempt_timeout_secs=0.2)
+    t0 = time.monotonic()
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert time.monotonic() - t0 < 2
+    assert reply is not None
+    assert reply.ok
+    assert reply.meta.served_target == "apac"
+    assert [c[1] for c in provider.calls] == ["primary", "apac"]
+    assert world.breaker.records[0] == ("primary", False)  # a hang counts against the target
+    assert world.limiter.held == 0
+
+
+async def test_attempt_timeout_on_last_target_retries_then_is_retryable(world: World) -> None:
+    """Bug S39: on the last step a timed-out attempt is retried in place; the reply is a
+    retryable `attempt_timeout`, not a fatal error and not `deadline_exceeded`."""
+    provider = HangOn("primary", "apac")
+    world.deps.providers = lambda alias: provider
+    world.deps.config = config(attempt_timeout_secs=0.05)
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert (reply.error["type"], reply.error["retryable"]) == ("attempt_timeout", True)
+    assert [c[1] for c in provider.calls] == ["primary", "apac", "apac", "apac"]
+    assert world.claims.log[-1] == "complete:done"
+
+
+async def test_attempt_timeout_is_capped_by_the_deadline(world: World) -> None:
+    """Bug S39 guard: an attempt timeout longer than the time left still ends as expired."""
+    world.deps.providers = lambda alias: HangOn("primary")
+    world.deps.config = config(attempt_timeout_secs=60)
+    now = time.time()
+    reply = (await execute_job(envelope(enqueued_at=now, deadline_at=now + 0.2), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert reply.error["type"] == "deadline_exceeded"
+
+
+# ---------------------------------------------------------------- S48: model not configured
+
+
+async def test_unknown_model_is_released_unclaimed(world: World) -> None:
+    """Bug S48: a worker lacking the alias acked it with internal_error; now it hands the
+    message back (with a delay) without claiming, so a configured pod can run it."""
+    result = await execute_job(envelope(model="cohere"), world.deps)
+    assert result.reply is None
+    assert result.requeue_secs is not None
+    assert result.requeue_secs > 0
+    assert world.claims.log == []
+    assert world.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("deliveries", "secs_left"), [(8, 300.0), (1, 15.0)], ids=["budget", "deadline"]
+)
+async def test_unknown_model_answers_clearly_when_out_of_time(
+    world: World, deliveries: int, secs_left: float
+) -> None:
+    """Bug S48: once the delivery budget or the deadline is spent the caller gets a clear
+    `model_not_configured` error (claimed, stored once), never `internal_error`."""
+    env = envelope(model="cohere", deadline_at=time.time() + secs_left)
+    result = await execute_job(env, world.deps, deliveries=deliveries)
+    assert result.requeue_secs is None
+    assert result.reply is not None
+    assert result.reply.error is not None
+    assert (result.reply.error["type"], result.reply.error["retryable"]) == (
+        "model_not_configured",
+        False,
+    )
+    assert "cohere" in result.reply.error["message"]
+    assert world.claims.log == ["claim:pod-1", "put", "complete:done"]
+
+
+async def test_unknown_model_on_direct_path_answers_at_once(world: World) -> None:
+    """Bug S48: without a claim store (direct path) there is nobody to hand back to."""
+    result = await execute_job(envelope(model="cohere"), world.deps, claim=False, store=False)
+    assert result.reply is not None
+    assert result.reply.error is not None
+    assert result.reply.error["type"] == "model_not_configured"
+
+
+def test_attempt_and_provider_timeouts_read_from_env() -> None:
+    """Bug S39: the new timeouts are settable as `LLMQ_*_SECS` and keep sane defaults."""
+    cfg = QueueConfig.from_env(
+        {
+            "LLMQ_ATTEMPT_TIMEOUT_SECS": "20",
+            "LLMQ_PROVIDER_READ_TIMEOUT_SECS": "25",
+            "LLMQ_PROVIDER_CONNECT_TIMEOUT_SECS": "2",
+        }
+    )
+    assert (
+        cfg.attempt_timeout_secs,
+        cfg.provider_read_timeout_secs,
+        cfg.provider_connect_timeout_secs,
+    ) == (20.0, 25.0, 2.0)
+    default = QueueConfig()
+    assert default.attempt_timeout_secs < default.provider_read_timeout_secs

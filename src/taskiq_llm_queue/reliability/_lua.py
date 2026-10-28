@@ -113,13 +113,27 @@ return {1, inflight + 1, limit, tostring(expires)}
 )
 
 # KEYS: state hash, leases zset. ARGV: initial, min, max, token, throttled 0|1, ramp_window,
-# increase_every, decrease_factor, pause_secs, ramp_cap, utilisation, peak_halflife, share.
+# increase_every, decrease_factor, pause_secs, ramp_cap, utilisation, peak_halflife, share,
+# loss_tolerance, min_throttles, pause_ratio, window_secs, settle_ratio, probe_secs, lease_ttl.
 # Reply: {limit, removed 0|1, pause remaining}.
+#
+# Decrease (S35: a 2 % random 429 rate held limits at 3-5): outcomes are counted in a sliding
+# window of `window_secs`; a throttle cuts the limit only when the window holds >= min_throttles
+# throttles making up >= loss_tolerance of its outcomes, at most once per window, and only for a
+# call started after the last cut (one cut per round trip). The pause is kept for throttle
+# storms (ratio >= pause_ratio), not for every 429.
+# Growth: +1 per min(increase_every, limit / 2) busy successes. After a cut the limit it was cut
+# from is kept as `w_max`; from `settle_ratio x w_max` on, growth is one step per `probe_secs`
+# and only on a success at full use (S07: it saw-toothed 44-64 around a capacity of 50 with
+# ~50 leases in use); `w_max` is dropped once the limit passes `w_max / settle_ratio` without
+# a cut (capacity grew). A throttle met while probing,
+# `probe_secs` after the last cut, cuts back to the plateau (x settle_ratio), not x0.7.
 # DS12: a success counts toward growth only when inflight >= utilisation x the lane's allowed
 # slots; growth is capped at 2 x the peak inflight (decaying with `peak_halflife` seconds).
 LIMITER_RELEASE = (
     _NOW
     + """
+local score = tonumber(redis.call('ZSCORE', KEYS[2], ARGV[4]) or '')
 local removed = redis.call('ZREM', KEYS[2], ARGV[4])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 -- concurrency this attempt ran at: the others still in flight plus itself
@@ -127,16 +141,57 @@ local inflight = redis.call('ZCARD', KEYS[2]) + removed
 """
     + _LIMIT
     + """
-if ARGV[5] == '1' then
-  redis.call('HSET', KEYS[1], 'ramp', 0, 'ok_count', 0)
-  local last = tonumber(redis.call('HGET', KEYS[1], 'last_decrease') or '0') or 0
-  if now - last >= 1 then
-    limit = math.max(min_l, math.floor(limit * tonumber(ARGV[8])))
-    redis.call('HSET', KEYS[1], 'limit', limit, 'last_decrease', tostring(now))
+local throttled = ARGV[5] == '1'
+local window = tonumber(ARGV[17])
+local settle = tonumber(ARGV[18])
+local h = redis.call('HMGET', KEYS[1], 'win_start', 'win_ok', 'win_thr', 'prev_ok', 'prev_thr',
+  'last_decrease', 'w_max', 'last_increase')
+local win_start = tonumber(h[1] or '0') or 0
+local win_ok = tonumber(h[2] or '0') or 0
+local win_thr = tonumber(h[3] or '0') or 0
+local prev_ok = tonumber(h[4] or '0') or 0
+local prev_thr = tonumber(h[5] or '0') or 0
+local last_decrease = tonumber(h[6] or '0') or 0
+local w_max = tonumber(h[7] or '0') or 0
+local last_increase = tonumber(h[8] or '0') or 0
+if now - win_start >= window then
+  if now - win_start < 2 * window then
+    prev_ok, prev_thr = win_ok, win_thr
+  else
+    prev_ok, prev_thr = 0, 0
   end
-  local until_ts = math.max(paused, now + tonumber(ARGV[9]))
-  redis.call('HSET', KEYS[1], 'paused_until', tostring(until_ts))
-  return {limit, removed, tostring(until_ts - now)}
+  win_start, win_ok, win_thr = now, 0, 0
+end
+if throttled then win_thr = win_thr + 1 else win_ok = win_ok + 1 end
+redis.call('HSET', KEYS[1], 'win_start', tostring(win_start), 'win_ok', win_ok,
+  'win_thr', win_thr, 'prev_ok', prev_ok, 'prev_thr', prev_thr)
+local function remaining()
+  if paused > now then return tostring(paused - now) end
+  return '0'
+end
+if throttled then
+  local carry = math.max(0, 1 - (now - win_start) / window)
+  local e_thr = win_thr + prev_thr * carry
+  local ratio = e_thr / math.max(1, e_thr + win_ok + prev_ok * carry)
+  local started = now
+  if score then started = score - tonumber(ARGV[20]) end
+  if e_thr >= tonumber(ARGV[15]) and ratio >= tonumber(ARGV[14])
+      and now - last_decrease >= window and started >= last_decrease then
+    local factor = tonumber(ARGV[8])
+    if w_max > 0 and limit >= math.floor(settle * w_max)
+        and now - last_decrease >= tonumber(ARGV[19]) then
+      factor = settle  -- probing hit the known ceiling again: back to the plateau only
+    end
+    redis.call('HSET', KEYS[1], 'w_max', limit, 'ramp', 0, 'ok_count', 0,
+      'last_decrease', tostring(now))
+    limit = math.max(min_l, math.floor(limit * factor))
+    redis.call('HSET', KEYS[1], 'limit', limit)
+    if ratio >= tonumber(ARGV[16]) then
+      paused = math.max(paused, now + tonumber(ARGV[9]))
+      redis.call('HSET', KEYS[1], 'paused_until', tostring(paused))
+    end
+  end
+  return {limit, removed, remaining()}
 end
 local halflife = tonumber(ARGV[12] or '0') or 0
 local peak = tonumber(redis.call('HGET', KEYS[1], 'peak') or '0') or 0
@@ -150,6 +205,8 @@ local share = tonumber(ARGV[13] or '1') or 1
 local busy = inflight >= tonumber(ARGV[11]) * math.max(1, math.floor(limit * share))
 local peak_cap = math.max(min_l, math.floor(2 * peak))
 local ok = (tonumber(redis.call('HGET', KEYS[1], 'ok_count') or '0') or 0) + 1
+local need = math.max(1, math.min(tonumber(ARGV[7]), math.ceil(limit / 2)))
+local grow = false
 if not busy then
   ok = ok - 1
 elseif redis.call('HGET', KEYS[1], 'ramp') == '1' then
@@ -157,14 +214,23 @@ elseif redis.call('HGET', KEYS[1], 'ramp') == '1' then
     limit = math.max(limit, math.min(tonumber(ARGV[10]), peak_cap, limit * 2))
     ok = 0
   end
-elseif ok >= tonumber(ARGV[7]) then
+elseif w_max > 0 and limit >= w_max / settle then
+  redis.call('HSET', KEYS[1], 'w_max', 0)  -- passed the old ceiling without a cut
+  grow = ok >= need
+elseif w_max > 0 and limit >= math.floor(settle * w_max) then
+  -- probe only while the limit binds: every allowed slot in use, not 0.9 of them
+  local full = inflight >= math.max(1, math.floor(limit * share))
+  grow = full and ok >= need and now - last_increase >= tonumber(ARGV[19])
+else
+  grow = ok >= need
+end
+if grow then
   limit = math.max(limit, math.min(max_l, peak_cap, limit + 1))
   ok = 0
+  redis.call('HSET', KEYS[1], 'last_increase', tostring(now))
 end
 redis.call('HSET', KEYS[1], 'limit', limit, 'ok_count', ok)
-local remaining = 0
-if paused > now then remaining = paused - now end
-return {limit, removed, tostring(remaining)}
+return {limit, removed, remaining()}
 """
 )
 
@@ -311,7 +377,10 @@ return 'run'
 """
 )
 
-# KEYS: job hashes. ARGV: worker, state_ttl, exec_max. Reply: indexes (1-based) not owned.
+# KEYS: job hashes. ARGV: worker, state_ttl, exec_max. Reply: indexes (1-based) lost to
+# another worker, or whose record is gone. A record this worker already finished (done,
+# cancelled, expired) or released is not lost: the task is between its own CAS and leaving the
+# running set, and cancelling it there killed its result publish (S35c: 19 spurious losses).
 CLAIM_HEARTBEAT = (
     _NOW
     + """
@@ -323,7 +392,7 @@ for i, key in ipairs(KEYS) do
     redis.call('HSET', key, 'heartbeat_at', tostring(now))
     redis.call('EXPIRE', key,
       math.max(tonumber(ARGV[2]), math.ceil(deadline - now + tonumber(ARGV[3]))))
-  else
+  elseif not f[1] or (f[2] and f[2] ~= ARGV[1]) then
     table.insert(lost, i)
   end
 end

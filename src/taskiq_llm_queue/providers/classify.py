@@ -49,6 +49,32 @@ _FATAL_PREFIXES = (
     "invalid",
     "badrequest",
 )
+# Fatal families that name one target (model, profile, region, endpoint or the key for that
+# URL), not the request: the next target may serve it. Credentials errors are not here.
+_TARGET_FAMILIES = (
+    "resourcenotfound",
+    "accessdenied",
+    "permissiondenied",
+    "modelnotfound",
+    "notfound",
+    "endpointnotfound",
+    "unknownoperation",
+)
+# A validation / bad-request family counts as target-specific only when its message says so.
+_TARGET_MESSAGE = re.compile(
+    r"model identifier is invalid|invalid model identifier|on-demand throughput"
+    r"|inference profile|model_not_found|unknown model|no such model|end of (?:its )?life"
+    r"|not (?:available|supported|enabled|accessible) (?:in|for) (?:this|the|your) region"
+    r"|\b(?:model|endpoint)\b[^.]{0,80}?\b(?:not found|does not exist|doesn't exist"
+    r"|not available|unavailable|is not supported|isn't supported)",
+    re.IGNORECASE,
+)
+# Request-fatal however the code is spelled: a different target would refuse it the same way.
+_REQUEST_MESSAGE = re.compile(
+    r"too long|too large|too many (?:input )?tokens|context (?:length|window)"
+    r"|maximum (?:input|context|token)|malformed",
+    re.IGNORECASE,
+)
 # Built lazily from whichever modules are already imported; an SDK that was never imported
 # cannot have raised the exception being classified.
 _TRANSPORT_TYPES: dict[str, tuple[str, ...]] = {
@@ -149,6 +175,41 @@ def is_transport_error(exc: BaseException) -> bool:
         if types and isinstance(exc, types):
             return True
     return False
+
+
+def is_target_error(exc: BaseException, info: ErrorInfo) -> bool:
+    """True when a FATAL error is about the target, so `run_call` tries the next fallback step.
+
+    Model or profile not found / not in this region, access denied for the model, unknown
+    endpoint (404). Bad payloads, too-long input and credentials errors end the call.
+    """
+    if info.kind is not ErrorKind.FATAL:
+        return False
+    message = _error_message(exc)
+    if _REQUEST_MESSAGE.search(message):
+        return False
+    family = error_family(info.code)
+    if family.startswith(_TARGET_FAMILIES) or _error_status(exc) == 404:
+        return True
+    request_family = family.startswith(("validation", "badrequest", "invalid"))
+    return (request_family or _error_status(exc) == 400) and bool(_TARGET_MESSAGE.search(message))
+
+
+def _error_message(exc: BaseException) -> str:
+    """A botocore `Error.Message`, else the exception text (openai puts the body there)."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping) and isinstance(response.get("Error"), Mapping):
+        return str(response["Error"].get("Message") or "")
+    return str(exc)
+
+
+def _error_status(exc: BaseException) -> int | None:
+    """HTTP status of a botocore `ClientError` or an openai `APIStatusError`, if any."""
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and isinstance(response, Mapping):
+        status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return status if isinstance(status, int) else None
 
 
 def classify_bedrock(exc: BaseException) -> ErrorInfo:

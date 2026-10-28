@@ -10,6 +10,8 @@ import pytest
 import redis
 import redis.asyncio
 from redis.asyncio.client import Pipeline
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.keys import KeySpace
@@ -53,10 +55,12 @@ async def release_all(lim: AdaptiveLimiter, leases: list[Lease]) -> None:
         await lim.release(lease, throttled=False)
 
 
-async def throttle(lim: AdaptiveLimiter) -> None:
-    lease = await lim.try_acquire(M, T, Lane.RT)
-    assert lease is not None
-    await lim.release(lease, throttled=True)
+async def throttle(lim: AdaptiveLimiter, n: int = 2) -> None:
+    """`n` throttles in a row: two make a storm (min_throttles, ratio 1) that cuts and pauses."""
+    for _ in range(n):
+        lease = await lim.try_acquire(M, T, Lane.RT)
+        assert lease is not None
+        await lim.release(lease, throttled=True)
 
 
 async def limit_of(lim: AdaptiveLimiter) -> int | None:
@@ -247,7 +251,7 @@ async def test_throttle_ends_ramp_decreases_once_per_second(
     await throttle(lim)
     assert await limit_of(lim) == 7, "second throttle within 1 s must not shrink again"
     await asyncio.sleep(1.05)
-    await throttle(lim)
+    await throttle(lim, 1)  # the last window's throttles still weigh in: a storm, not noise
     assert await limit_of(lim) == 4  # floor(7 * 0.7)
     await asyncio.sleep(0.2)
     await succeed(lim, 6)
@@ -368,6 +372,9 @@ async def test_sync_limiter_shares_state(
     assert sync.acquire(M, T, Lane.RT, timeout_secs=0.05) is None
     assert sync.acquire(M, T, Lane.RT, timeout_secs=10, should_abort=lambda: True) is None
     sync.release(lease, throttled=True)
+    lease = sync.acquire(M, T, Lane.RT, timeout_secs=0)
+    assert lease is not None
+    sync.release(lease, throttled=True)
     assert (await lim.state(M, T)).paused_secs > 0
     await lim.release(held[0], throttled=False)
 
@@ -406,3 +413,184 @@ async def test_run_many_reloads_an_unknown_script(valkey: redis.asyncio.Redis) -
     known = valkey.register_script("return 'k'")
     await known([], [])
     assert await _lua.run_many(valkey, [(known, [], []), (script, [], ["x"])]) == [b"k", b"x"]
+
+
+async def test_sporadic_throttles_neither_cut_nor_pause(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug LIMITER_COLLAPSE (S35): every 429 cut x0.7 and paused 2 s, so 2 % noise pinned 3-5.
+
+    Two throttles among 60 successes in one window (3 % < loss_tolerance) change nothing.
+    """
+    lim = make(valkey, keys, initial={M: 10}, pause_secs=2.0)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 0})
+    for i in range(62):
+        lease = await lim.try_acquire(M, T, Lane.RT)
+        assert lease is not None
+        await lim.release(lease, throttled=i in (30, 61))
+    state = await lim.state(M, T)
+    assert state.limit == 10
+    assert state.paused_secs == 0
+    assert lim.gate(M, T).is_open()
+
+
+async def test_moderate_loss_cuts_without_pausing(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug LIMITER_COLLAPSE: only a throttle storm (>= pause_ratio) pauses every pod's gate.
+
+    A 1-in-4 throttle rate cuts the limit once (clustered) but leaves the target unpaused.
+    """
+    lim = make(valkey, keys, initial={M: 10}, pause_secs=2.0)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 0})
+    for i in range(8):
+        lease = await lim.try_acquire(M, T, Lane.RT)
+        assert lease is not None
+        await lim.release(lease, throttled=i % 4 == 3)
+    state = await lim.state(M, T)
+    assert state.limit == 7, "two throttles at 25 % of the window cut once"
+    assert state.paused_secs == 0
+
+
+async def test_one_cut_per_round_trip(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Bug LIMITER_COLLAPSE: throttles of calls sent before a cut must not cut again.
+
+    A call started before the cut and throttled after the window is ignored; a new one counts.
+    """
+    lim = make(valkey, keys, initial={M: 10})
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 0})
+    old = await lim.try_acquire(M, T, Lane.RT)
+    assert old is not None
+    await throttle(lim)
+    assert await limit_of(lim) == 7
+    await asyncio.sleep(1.05)
+    await lim.release(old, throttled=True)
+    assert await limit_of(lim) == 7, "sent under the old limit: no second cut"
+    await throttle(lim, 1)
+    assert await limit_of(lim) == 4
+
+
+async def test_growth_scales_with_the_limit(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Bug LIMITER_COLLAPSE: +1 per 20 busy successes left a cut limit of 4 stuck for minutes.
+
+    Growth is +1 per min(increase_every, limit / 2) busy successes: every 2 at limit 4.
+    """
+    lim = make(valkey, keys, initial={M: 4}, increase_every=20)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 4, "ramp": 0})
+    held = await take(lim, 3)
+    await succeed(lim, 2)  # inflight 4 of 4
+    assert await limit_of(lim) == 5
+    await release_all(lim, held)
+
+
+async def test_growth_settles_below_the_last_cut(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug S07: the limit saw-toothed 44-64 around a capacity of 50 instead of settling.
+
+    From settle_ratio x w_max (the limit last cut from) growth is one step per `probe_secs`;
+    below it growth is normal, and passing w_max / settle_ratio forgets w_max.
+    """
+    lim = make(valkey, keys, initial={M: 8}, increase_every=2, probe_secs=0.5, max_limit=100)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 8, "ramp": 0, "w_max": 10})
+    held = await take(lim, 7)
+    await succeed(lim, 2)  # below 9 = 0.9 x 10: normal growth
+    assert await limit_of(lim) == 9
+    held += await take(lim, 1)
+    await succeed(lim, 20)  # at the plateau: wait out probe_secs since the last step
+    assert await limit_of(lim) == 9
+    for expected in (10, 11):
+        await asyncio.sleep(0.55)
+        await succeed(lim, 2)
+        assert await limit_of(lim) == expected
+        held += await take(lim, 1)
+        await succeed(lim, 10)
+        assert await limit_of(lim) == expected, "one probe step per probe_secs"
+    await asyncio.sleep(0.55)
+    await succeed(lim, 2)
+    assert await limit_of(lim) == 12
+    held += await take(lim, 1)
+    await succeed(lim, 6)  # at 12 >= 10 / 0.9 the old ceiling is forgotten
+    assert await valkey.hget(keys.limiter(M, T), "w_max") == b"0"
+    assert (await limit_of(lim) or 0) >= 13, "normal growth again, no probe wait"
+    await release_all(lim, held)
+
+
+async def test_failed_release_does_not_leak_its_lease(
+    valkey: redis.asyncio.Redis, keys: KeySpace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug: a release that failed (pool exhausted) left its lease holding a slot for 240 s.
+
+    The lease is remembered and dropped by this pod's next acquire.
+    """
+    lim = make(valkey, keys, initial={M: 2})
+    lease = await lim.try_acquire(M, T, Lane.RT)
+    assert lease is not None
+
+    async def broken(*_: object) -> None:
+        raise RedisConnectionError("pool exhausted")
+
+    monkeypatch.setattr(lim, "_release", broken)
+    with pytest.raises(RedisConnectionError):
+        await lim.release(lease, throttled=False)
+    monkeypatch.undo()
+    assert (await lim.state(M, T)).inflight == 1
+    again = await lim.try_acquire(M, T, Lane.RT)
+    assert again is not None
+    assert (await lim.state(M, T)).inflight == 1, "the orphan was dropped first"
+    await lim.release(again, throttled=False)
+
+
+async def test_lost_acquire_reply_does_not_leak_a_lease(
+    valkey: redis.asyncio.Redis, keys: KeySpace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug: an acquire whose reply was lost after the script ran left an unknown live lease."""
+    lim = make(valkey, keys, initial={M: 2})
+    real = lim._acquire
+
+    async def ran_then_failed(keys_: Any, args: Any) -> Any:
+        await real(keys_, args)
+        raise RedisTimeoutError("reply lost")
+
+    monkeypatch.setattr(lim, "_acquire", ran_then_failed)
+    with pytest.raises(RedisTimeoutError):
+        await lim.try_acquire(M, T, Lane.RT)
+    monkeypatch.undo()
+    assert (await lim.state(M, T)).inflight == 1
+    lease = await lim.try_acquire(M, T, Lane.RT)
+    assert lease is not None
+    assert (await lim.state(M, T)).inflight == 1
+    await lim.release(lease, throttled=False)
+
+
+async def test_throttle_while_probing_cuts_back_to_the_plateau(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug S07: every cut was x0.7, so a limit at its known ceiling dipped 30 % each cycle.
+
+    A storm met while probing near w_max cuts x settle_ratio; a second storm soon after
+    (capacity really dropped) cuts x decrease_factor again.
+    """
+    lim = make(valkey, keys, initial={M: 20}, max_limit=100)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 20, "ramp": 0, "w_max": 21})
+    await throttle(lim)
+    assert await limit_of(lim) == 18  # floor(20 x 0.9), not 14
+    await asyncio.sleep(1.05)
+    await throttle(lim, 1)
+    assert await limit_of(lim) == 12  # floor(18 x 0.7): within probe_secs of the last cut
+
+
+async def test_probing_needs_every_slot_in_use(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Bug S07: probing grew on 0.9 x limit in use, so an unbound limit crept past capacity.
+
+    Above the plateau a success grows the limit only when all allowed slots are in use.
+    """
+    lim = make(valkey, keys, initial={M: 9}, increase_every=2, probe_secs=0.0, max_limit=100)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 9, "ramp": 0, "w_max": 10})
+    held = await take(lim, 7)
+    await succeed(lim, 6)  # inflight 8 of 9: busy, not full
+    assert await limit_of(lim) == 9
+    held += await take(lim, 1)
+    await succeed(lim, 2)  # inflight 9 of 9
+    assert await limit_of(lim) == 10
+    await release_all(lim, held)

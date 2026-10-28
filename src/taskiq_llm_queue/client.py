@@ -78,7 +78,7 @@ from taskiq_llm_queue.reliability.fallback import FallbackConfig
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, SyncAdaptiveLimiter
 from taskiq_llm_queue.reliability.local_limiter import LocalLimiter
 from taskiq_llm_queue.results.backend import LLMQResultBackend
-from taskiq_llm_queue.results.dispatcher import ResultDispatcher
+from taskiq_llm_queue.results.dispatcher import ResultDispatcher, ResultsUnavailable
 from taskiq_llm_queue.routing import CanaryRouter, RoutingConfig, routing_store
 from taskiq_llm_queue.routing_hooks import CallPath, QueueHooks, safe_hook
 from taskiq_llm_queue.tasks import JOB_VERSION, JobFunction, WorkerResultBackend, WorkerRuntime
@@ -99,6 +99,9 @@ Mode = Literal["send", "work", "both"]
 # HTTP status the OpenAI transport reports for an error reply, by `ErrorKind` value.
 _STATUS_BY_KIND: Mapping[str, int] = {"throttle": 429, "retryable": 503, "fatal": 400}
 _T = TypeVar("_T")  # PEP 695 needs 3.12; the package supports 3.11
+# Share of the remaining call budget an SQS send may use, so a failed send leaves the rest
+# for the `direct` failover run (capped further by `sqs_send_timeout_secs`).
+_SEND_BUDGET_SHARE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +234,8 @@ class LLMQueue:
         # of this pod (worker, direct and sync paths): both kept alive by the pod heartbeat.
         self._direct_claims: dict[str, int] = {}
         self._leases: set[Lease] = set()
+        # Cancel flags that could not be set while Valkey was down; set once a probe succeeds.
+        self._pending_cancels: set[str] = set()
         self._local_limiter = _LocalLimiters(self.failover, config)
         self._jobs: dict[str, JobFunction] = {}
         self._sync: _SyncRunner | None = None
@@ -256,7 +261,14 @@ class LLMQueue:
         state = self._state
         if state is None:
             raise QueueUnavailable("not started")
-        return await state.redis.ping()
+        pong = await state.redis.ping()
+        pending, self._pending_cancels = self._pending_cancels, set()
+        for request_id in pending:  # queued copies of calls served direct must not run again
+            try:
+                await state.claims.cancel(request_id)
+            except Exception:
+                self._pending_cancels.add(request_id)
+        return pong
 
     def _redis_ok(self) -> None:
         """Tell the failover policy Valkey answered (ends Valkey-down mode early)."""
@@ -298,6 +310,11 @@ class LLMQueue:
             redis=client,
             channel=self.keys.done_channel(self.pod_id),
             intervals_ms=config.result_dispatch_ms,
+            # A send-only pod's only steady Valkey traffic: its errors must open Valkey-down
+            # mode, or calls keep going to SQS that no worker can claim (S21).
+            on_error=self._report_redis,
+            on_recovered=self._redis_ok,
+            abandon_after_secs=config.valkey_wait_failover_secs,
         )
         deps = CoreDeps(
             config=config,
@@ -853,12 +870,17 @@ class LLMQueue:
         }
         task = broker.find_task(TASK_EMBED if embed else TASK_CALL)
         assert task is not None
+        # An unreachable SQS can hang a send on a dead pooled connection until botocore's 60 s
+        # read timeout (S20: ~50-70 s), past the call budget; bound it so direct still fits.
+        remaining = envelope.deadline_at - time.time()
+        send_secs = min(self.config.sqs_send_timeout_secs, _SEND_BUDGET_SHARE * remaining)
         try:
-            await (
+            await asyncio.wait_for(
                 task.kicker()
                 .with_task_id(sent.request_id)
                 .with_labels(**labels)
-                .kiq(sent.model_dump(mode="json"))
+                .kiq(sent.model_dump(mode="json")),
+                max(0.0, send_secs),
             )
         except asyncio.CancelledError:  # a batched send may still go out: flag it (DS14)
             await asyncio.shield(self._flag_cancel(state, envelope.request_id))
@@ -867,7 +889,7 @@ class LLMQueue:
             SendTaskError,
             SQSSendError,
             QueueUnavailable,
-            OSError,
+            OSError,  # includes TimeoutError from the bounded send (ambiguous: DS17 claim)
         ) as exc:  # taskiq wraps kick errors
             rejected = _deterministic_send_error(exc)
             if rejected is not None:  # the same message would fail again: no failover
@@ -896,6 +918,12 @@ class LLMQueue:
         remaining = max(0.0, envelope.deadline_at - time.time())
         try:
             reply = await state.dispatcher.wait(envelope.request_id, remaining, envelope.lane)
+        except ResultsUnavailable:
+            # Valkey gone for `valkey_wait_failover_secs`: no worker can claim the queued copy
+            # and no result can arrive, so serve the call here under the local cap (S21).
+            logger.warning("valkey_down_wait_direct", request_id=envelope.request_id)
+            await self._flag_cancel(state, envelope.request_id)
+            return await self._direct(envelope)
         except LLMQueueTimeout:
             await self._flag_cancel(state, envelope.request_id)
             raise
@@ -906,6 +934,10 @@ class LLMQueue:
         return reply
 
     async def _flag_cancel(self, state: _Started, request_id: str) -> None:
+        """Set the DS14 cancel flag; while Valkey is down, queue it for the recovery probe."""
+        if self.failover.redis_down():  # a Valkey call now would only add connect timeouts
+            self._pending_cancels.add(request_id)
+            return
         with contextlib.suppress(Exception):
             await state.claims.cancel(request_id)
 

@@ -185,6 +185,39 @@ class QueueConfig(BaseModel):
     retry_base_secs: float = Field(default=1.0, ge=0)
     sqs_wait_time_secs: int = Field(default=20, ge=0, le=20)
     sqs_failover_secs: float = Field(default=300.0, gt=0)
+    attempt_timeout_secs: float = Field(
+        default=180.0,
+        gt=0,
+        description="Longest one provider attempt may run (capped by the call's remaining "
+        "deadline); on expiry the worker tries the next fallback target. Unverified default: "
+        "long enough for an ~8k-token completion.",
+    )
+    provider_read_timeout_secs: float = Field(
+        default=300.0,
+        gt=0,
+        description="Socket read timeout of the built-in providers (botocore `read_timeout`, "
+        "httpx read for OpenAI-compatible servers).",
+    )
+    provider_connect_timeout_secs: float = Field(
+        default=10.0,
+        gt=0,
+        description="Connect timeout of the built-in providers (botocore `connect_timeout`, "
+        "httpx connect for OpenAI-compatible servers).",
+    )
+    sqs_send_timeout_secs: float = Field(
+        default=5.0,
+        gt=0,
+        description="Upper bound on one SQS send before the call fails over to direct; the "
+        "send also gets at most half the call's remaining budget. A send to an unreachable "
+        "SQS otherwise hangs on a dead pooled connection until the 60 s read timeout.",
+    )
+    valkey_wait_failover_secs: float = Field(
+        default=10.0,
+        gt=0,
+        description="How long result reads may fail before callers waiting on a queued call "
+        "run it direct under the local cap instead of waiting to their deadline. Longer than a "
+        "Valkey restart blip, so in-flight worker results are not run twice.",
+    )
 
     @field_validator("id_hash_salt")
     @classmethod
@@ -286,6 +319,11 @@ class QueueConfig(BaseModel):
             ("RETRY_BASE_SECS", "retry_base_secs", float),
             ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
             ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),
+            ("ATTEMPT_TIMEOUT_SECS", "attempt_timeout_secs", float),
+            ("PROVIDER_READ_TIMEOUT_SECS", "provider_read_timeout_secs", float),
+            ("PROVIDER_CONNECT_TIMEOUT_SECS", "provider_connect_timeout_secs", float),
+            ("SQS_SEND_TIMEOUT_SECS", "sqs_send_timeout_secs", float),
+            ("VALKEY_WAIT_FAILOVER_SECS", "valkey_wait_failover_secs", float),
             ("WORKER_SLOTS", "worker_slots", _int_map),
         ):
             value = get(name)
@@ -455,7 +493,7 @@ def _redis_kwargs(config: QueueConfig, retry: Any, client_name: str | None) -> d
     return {
         "username": config.redis_username,
         "password": password.get_secret_value() if password is not None else None,
-        "max_connections": config.redis_max_connections,
+        "max_connections": redis_pool_size(config),
         "socket_timeout": config.redis_socket_timeout_secs,
         "socket_connect_timeout": config.redis_socket_connect_timeout_secs,
         "health_check_interval": config.redis_health_check_interval_secs,
@@ -467,6 +505,32 @@ def _redis_kwargs(config: QueueConfig, retry: Any, client_name: str | None) -> d
 
 
 _POOL_WAIT_SECS = 5.0  # BlockingConnectionPool: wait this long for a free connection
+_POOL_SPARE = 16  # connections beyond the worker slots: heartbeat, dispatcher, callers
+
+
+def redis_pool_size(config: QueueConfig) -> int:
+    """Connection cap of the package's Valkey pools: `redis_max_connections`, raised to fit.
+
+    Every worker slot may hold a connection at once (claim, acquire poll, result store), so
+    with queued models the cap is at least their worker slots plus `_POOL_SPARE`. Bug: 32
+    connections under 154 slots waited out `_POOL_WAIT_SECS`, read as "Valkey down" and leaked
+    a limiter lease.
+    """
+    from taskiq_llm_queue.lifecycle import DEFAULT_JOB_SLOTS, DEFAULT_WORKER_SLOTS, JOBS_BROKER
+
+    brokers: dict[tuple[str, ...], int] = {}  # aliases with the same queues share one broker
+    for alias, model in config.models.items():
+        if model.queues:
+            key = tuple(sorted(model.queues.values()))
+            brokers.setdefault(key, config.worker_slots.get(alias, DEFAULT_WORKER_SLOTS))
+    slots = sum(brokers.values())
+    if config.job_queues:
+        slots += config.worker_slots.get(JOBS_BROKER, DEFAULT_JOB_SLOTS)
+    return (
+        max(config.redis_max_connections, slots + _POOL_SPARE)
+        if slots
+        else config.redis_max_connections
+    )
 
 
 def _backoff() -> Any:

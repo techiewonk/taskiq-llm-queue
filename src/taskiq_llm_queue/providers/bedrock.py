@@ -83,7 +83,8 @@ class BedrockProvider:
         """Build from `QueueConfig` (region, endpoint, deny list); checks every Bedrock target URL.
 
         `session` is the pod's shared `AioSession` (`LLMQueue.start` passes it); extra keyword
-        arguments go to the constructor (e.g. `client_kwargs`).
+        arguments go to the constructor (e.g. `client_kwargs`) and win over the config's
+        `provider_read_timeout_secs` / `provider_connect_timeout_secs`.
         """
         for model in config.models.values():
             if model.provider == "bedrock":
@@ -94,7 +95,11 @@ class BedrockProvider:
             endpoint_url=config.bedrock_endpoint_url,
             denied_hosts=config.denied_hosts,
             session=session,
-            **kwargs,
+            **{
+                "read_timeout_secs": config.provider_read_timeout_secs,
+                "connect_timeout_secs": config.provider_connect_timeout_secs,
+                **kwargs,
+            },
         )
 
     async def call(self, op: Op, params: Mapping[str, Any], target: Target) -> dict[str, Any]:
