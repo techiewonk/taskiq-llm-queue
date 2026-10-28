@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import warnings
 from typing import Any
 
 import pytest
@@ -17,15 +18,26 @@ from taskiq_llm_queue import (
     CallMeta,
     ConfigError,
     Lane,
+    LLMQueueCancelled,
     LLMQueueError,
     LLMQueueTimeout,
-    LLMReply,
     ModelConfig,
     ProviderError,
     QueueConfig,
     Target,
 )
-from taskiq_llm_queue.client import LLMQueue, _unwrap, decode_invoke
+from taskiq_llm_queue.client import (
+    EmbedResult,
+    InvokeResult,
+    LLMQueue,
+    _batch_ids,
+    _invoke_body,
+    _merge_meta,
+    _unwrap,
+    decode_invoke,
+)
+from taskiq_llm_queue.config import create_redis, create_sync_redis
+from taskiq_llm_queue.envelope import LLMReply
 from taskiq_llm_queue.lifecycle import limiter_settings, queue_for_lane, queue_name
 
 MODELS = {
@@ -48,14 +60,14 @@ def test_from_env_reads_runtime_tuning() -> None:
     cfg = QueueConfig.from_env(
         {
             "LLMQ_AC_MIN": "3",
-            "LLMQ_AC_PAUSE_S": "1.5",
+            "LLMQ_AC_PAUSE_SECS": "1.5",
             "LLMQ_AC_INITIAL": '{"big": 40}',
             "LLMQ_CB_THRESHOLD": "9",
             "LLMQ_WORKER_SLOTS": "big:300, jobs:4",
             "LLMQ_RESULT_DISPATCH_MS": "rt:50,bulk:1000",
-            "LLMQ_TIMEOUT_RT": "30",
-            "LLMQ_TIMEOUT_EMBED_BULK": "120",
-            "LLMQ_CONSUMER_DRAIN_S": "20",
+            "LLMQ_TIMEOUT_RT_SECS": "30",
+            "LLMQ_TIMEOUT_EMBED_BULK_SECS": "120",
+            "LLMQ_CONSUMER_DRAIN_SECS": "20",
             "LLMQ_MAX_FAILURES": "5",
             "LLMQ_FALLBACK_CHAINS": json.dumps({"chains": {"big": ["other"]}}),
             "LLMQ_JOB_QUEUES": '{"ingest": "jobs-ingest"}',
@@ -80,9 +92,9 @@ def test_from_env_collects_bad_tuning_values() -> None:
     """Every bad runtime value is reported in one ConfigError."""
     with pytest.raises(ConfigError) as info:
         QueueConfig.from_env(
-            {"LLMQ_AC_MIN": "x", "LLMQ_WORKER_SLOTS": "big", "LLMQ_TIMEOUT_RT": "soon"}
+            {"LLMQ_AC_MIN": "x", "LLMQ_WORKER_SLOTS": "big", "LLMQ_TIMEOUT_RT_SECS": "soon"}
         )
-    for name in ("AC_MIN", "WORKER_SLOTS", "TIMEOUT_RT"):
+    for name in ("AC_MIN", "WORKER_SLOTS", "TIMEOUT_RT_SECS"):
         assert name in str(info.value)
 
 
@@ -124,7 +136,7 @@ def test_unwrap_maps_errors() -> None:
     assert getattr(info.value, "status_code", None) == 429
     with pytest.raises(LLMQueueTimeout):
         _unwrap(LLMReply(request_id="a", ok=False, error={"type": "deadline_exceeded"}))
-    with pytest.raises(LLMQueueError, match="cancelled"):
+    with pytest.raises(LLMQueueCancelled, match="cancelled"):
         _unwrap(LLMReply(request_id="a", ok=False, cancelled=True, error={"type": "cancelled"}))
 
 
@@ -167,3 +179,117 @@ def test_lazy_exports_resolve() -> None:
     assert llmq.LLMQueue is LLMQueue
     result: Any = llmq.ConverseResult(response={}, meta=CallMeta())
     assert result.response == {}
+    assert llmq.ChatResult(response={"id": "x"}, meta=CallMeta()).response == {"id": "x"}
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        ("ThrottlingException", "ThrottlingException: ThrottlingException", "ThrottlingException"),
+        (
+            "ThrottlingException",
+            "ClientError: ThrottlingException",
+            "ThrottlingException: ClientError",
+        ),
+        ("no_capacity", "no capacity", "no_capacity: no capacity"),
+    ],
+)
+def test_provider_error_message_does_not_repeat_the_code(
+    code: str, message: str, expected: str
+) -> None:
+    reply = LLMReply(request_id="a", ok=False, error={"type": code, "message": message})
+    with pytest.raises(ProviderError) as info:
+        _unwrap(reply)
+    assert str(info.value) == expected
+
+
+def test_result_objects_are_easy_to_use() -> None:
+    """`InvokeResult` keeps the boto3-style `response`; `EmbedResult` acts as the vectors."""
+    inv = InvokeResult(b'{"a": 1}', "application/json", CallMeta(attempts=1))
+    assert inv.response == {"body": b'{"a": 1}', "contentType": "application/json"}
+    assert inv.json() == {"a": 1}
+    emb = EmbedResult([[1.0], [2.0]], CallMeta())
+    assert (len(emb), emb[1], list(emb)) == (2, [2.0], [[1.0], [2.0]])
+
+
+def test_embed_meta_merges_batches_and_ids_follow_request_id() -> None:
+    a = CallMeta(served_model="titan", served_target="p", queue_wait_ms=5, attempts=1)
+    b = CallMeta(served_model="titan", fallback_used=True, queue_wait_ms=9, attempts=2)
+    merged = _merge_meta([a, b])
+    assert (merged.served_target, merged.queue_wait_ms, merged.attempts) == ("p", 9, 3)
+    assert merged.fallback_used is True
+    assert _batch_ids("r", 1) == ["r"]
+    assert _batch_ids("r", 3) == ["r-0", "r-1", "r-2"]
+
+
+def test_invoke_body_accepts_json_text_and_bytes() -> None:
+    assert _invoke_body({"inputText": "a"}) == {"inputText": "a"}
+    assert _invoke_body(b'{"x": 1}') == '{"x": 1}'
+    with pytest.raises(ValueError, match="UTF-8"):
+        _invoke_body(b"\xff\xfe")
+
+
+def test_deprecated_env_names_still_work_and_warn_once() -> None:
+    """Old `_S` / suffix-less names are read when the new one is unset, with one warning."""
+    from taskiq_llm_queue import config as config_module
+
+    config_module._warned_env.discard("CB_WINDOW_S")
+    env = {"LLMQ_CB_WINDOW_S": "12", "LLMQ_TIMEOUT_RT": "33"}
+    with pytest.warns(DeprecationWarning, match="LLMQ_CB_WINDOW_S"):
+        cfg = QueueConfig.from_env(env)
+    assert (cfg.breaker.window_secs, cfg.timeout_secs[Lane.RT]) == (12.0, 33.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        QueueConfig.from_env({"LLMQ_CB_WINDOW_S": "12"})  # second time: silent
+    new_wins = QueueConfig.from_env({"LLMQ_CB_WINDOW_SECS": "7", "LLMQ_CB_WINDOW_S": "12"})
+    assert new_wins.breaker.window_secs == 7.0
+
+
+def test_secrets_and_region_defaults() -> None:
+    """Passwords and the hash salt never show in repr; the AWS chain picks the region."""
+    cfg = QueueConfig.from_env(
+        {"LLMQ_REDIS_PASSWORD": "pw", "LLMQ_ID_HASH_SALT": "s3cret", "LLMQ_REDIS_USERNAME": "u"}
+    )
+    assert "pw" not in repr(cfg)
+    assert "s3cret" not in repr(cfg)
+    assert cfg.redis_password is not None
+    assert cfg.redis_password.get_secret_value() == "pw"
+    assert (cfg.aws_region, cfg.id_hash_key) == (None, b"s3cret")
+    with pytest.raises(ValueError, match="id_hash_salt"):
+        QueueConfig(id_hash_salt="x" * 65)
+
+
+def test_redis_factory_applies_pool_settings() -> None:
+    """One factory: auth, socket timeouts, health checks, retries, client name; URL wins."""
+    cfg = QueueConfig(redis_password="pw", redis_username="u", redis_max_connections=7)
+    client = create_redis(cfg, client_name="llmq:pod-1")
+    kw = client.connection_pool.connection_kwargs
+    assert (kw["username"], kw["password"], kw["client_name"]) == ("u", "pw", "llmq:pod-1")
+    assert (kw["socket_timeout"], kw["socket_connect_timeout"]) == (5.0, 2.0)
+    assert kw["health_check_interval"] == 30
+    assert kw["retry"].get_retries() == 3
+    assert client.connection_pool.max_connections == 7
+    by_url = QueueConfig(redis_url="rediss://a:b@valkey.example:6390/2", redis_password="pw")
+    kw = create_redis(by_url).connection_pool.connection_kwargs
+    assert (kw["host"], kw["port"], kw["password"], kw["db"]) == ("valkey.example", 6390, "b", 2)
+    sync_kw = create_sync_redis(cfg).connection_pool.connection_kwargs
+    assert (sync_kw["socket_timeout"], sync_kw["password"]) == (5.0, "pw")
+
+
+class _FakeRunner:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def test_stop_closes_sync_runner_without_start() -> None:
+    """Sync-only use (no start()) still gets its runner thread closed by stop()/close_sync()."""
+    q = LLMQueue(QueueConfig(models=MODELS))
+    runner = _FakeRunner()
+    q._sync = runner  # type: ignore[assignment]  # stand-in runner
+    await q.stop()
+    assert runner.closed
+    assert q._sync is None
+    q.close_sync()  # idempotent

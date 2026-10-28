@@ -17,12 +17,14 @@ from lc_fakes import (  # type: ignore[import-not-found]  # bare-name test helpe
     FakeQueueClient,
 )
 
+from taskiq_llm_queue.config import ModelConfig, QueueConfig
 from taskiq_llm_queue.errors import LLMQueueError
 from taskiq_llm_queue.langchain import (
     QueuedBedrockEmbeddings,
     QueuedChatBedrockConverse,
     set_default_queue,
 )
+from taskiq_llm_queue.langchain.bedrock import _looks_like_bedrock_id
 
 MODEL_ID = "openai.gpt-oss-120b-1:0"
 META_KEYS = set(META.model_dump())
@@ -58,9 +60,28 @@ def test_no_boto3_client_is_created(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("langchain_aws.chat_models.bedrock_converse.create_aws_client", _boom)
     monkeypatch.setattr("langchain_aws.embeddings.bedrock.create_aws_client", _boom)
-    model = QueuedChatBedrockConverse(model="gpt120b")  # type: ignore[call-arg]  # README alias
-    assert model.model_id == "gpt120b"
+    model = QueuedChatBedrockConverse(model=MODEL_ID, model_alias="gpt120b")  # type: ignore[call-arg]  # parent alias of model_id
+    assert (model.model_id, model.model_alias) == (MODEL_ID, "gpt120b")
     QueuedBedrockEmbeddings(model_id="titan-v2")
+
+
+def test_alias_passed_as_model_is_a_clear_error() -> None:
+    """`model="gpt120b"` is a queue alias, not a Bedrock id: say what to pass instead."""
+    with pytest.raises(ValueError, match="looks like a queue alias"):
+        QueuedChatBedrockConverse(model="gpt120b")  # type: ignore[call-arg]  # parent alias
+    with pytest.raises(ValueError, match="needs model_id"):
+        QueuedChatBedrockConverse(model_alias="gpt120b")  # type: ignore[call-arg]  # no model_id
+    assert _looks_like_bedrock_id("arn:aws:bedrock:ap-south-1:1:application-inference-profile/x")
+    assert _looks_like_bedrock_id("apac.openai.gpt-oss-120b-1:0")
+
+
+def test_model_id_is_looked_up_from_the_queue_config() -> None:
+    """`model_alias` + `llmq=` is enough: the Bedrock id comes from `QueueConfig.models`."""
+    config = QueueConfig(models={"gpt120b": ModelConfig(provider="bedrock", model_id=MODEL_ID)})
+    fake = FakeQueueClient()
+    fake.config = config
+    model = QueuedChatBedrockConverse(model_alias="gpt120b", llmq=fake)  # type: ignore[call-arg]  # model_id resolved
+    assert model.model_id == MODEL_ID
 
 
 async def test_ainvoke_matches_parent_parsing() -> None:
@@ -90,7 +111,7 @@ async def test_ainvoke_matches_parent_parsing() -> None:
     op, model, request, kwargs = fake.calls[0]
     assert (op, model) == ("converse", "gpt120b")
     assert request == {k: v for k, v in stub.kwargs.items() if k != "modelId"}
-    assert kwargs == {"lane": None, "fallback": None, "timeout": None}
+    assert kwargs == {"lane": None, "fallback": None, "timeout_secs": None}
 
 
 async def test_response_metadata_has_call_meta() -> None:
@@ -155,23 +176,23 @@ async def test_callbacks_fire() -> None:
 async def test_lane_fallback_and_service_tier_are_passed() -> None:
     fake = FakeQueueClient()
     model = _queued(
-        fake, lane="rt", fallback_policy="chain", service_tier="priority", queue_timeout=30
+        fake, lane="rt", fallback_policy="chain", service_tier="priority", queue_timeout_secs=30
     )
     await model.ainvoke("hi")
     _, _, request, kwargs = fake.calls[0]
     assert request["serviceTier"] == {"type": "priority"}
-    assert kwargs == {"lane": "rt", "fallback": "chain", "timeout": 30}
+    assert kwargs == {"lane": "rt", "fallback": "chain", "timeout_secs": 30}
 
 
 async def test_default_queue_is_resolved_lazily() -> None:
     """A model built before the queue exists (import time) finds it on first call (D85)."""
-    model = QueuedChatBedrockConverse(model_id="gpt120b")
+    model = QueuedChatBedrockConverse(model_id=MODEL_ID)
     with pytest.raises(LLMQueueError, match="no LLM queue"):
         await model.ainvoke("hi")
     fake = FakeQueueClient()
     set_default_queue(fake)
     await model.ainvoke("hi")
-    assert fake.calls[0][:2] == ("converse", "gpt120b")  # alias defaults to model
+    assert fake.calls[0][:2] == ("converse", MODEL_ID)  # alias defaults to model_id
 
 
 def test_sync_invoke_uses_converse_sync() -> None:
@@ -191,13 +212,13 @@ async def test_embeddings_async_one_call_each() -> None:
             "embed",
             "titan-v2",
             ["abc"],
-            {"lane": "bulk", "input_type": "search_query", "timeout": None},
+            {"lane": "bulk", "input_type": "search_query", "timeout_secs": None},
         ),
         (
             "embed",
             "titan-v2",
             ["a", "bb"],
-            {"lane": "bulk", "input_type": "search_document", "timeout": None},
+            {"lane": "bulk", "input_type": "search_document", "timeout_secs": None},
         ),
     ]
 

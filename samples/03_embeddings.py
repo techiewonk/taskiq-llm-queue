@@ -13,7 +13,6 @@ Run: .venv/Scripts/python samples/03_embeddings.py
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 
 from _local import ensure_queues, local_config
@@ -48,8 +47,8 @@ async def main() -> None:
 
         # invoke_model: raw provider body (bytes) + content type, for anything not covered.
         raw = await llmq.invoke_model("titan", {"inputText": "hello", "dimensions": 256})
-        body = json.loads(raw["body"])
-        print("invoke_model       :", raw["contentType"], "->", len(body["embedding"]), "dims")
+        body = raw.json()
+        print("invoke_model       :", raw.content_type, "->", len(body["embedding"]), "dims")
 
         # LangChain adapter: aembed_documents is one queued `embed` call.
         # Pass the real Bedrock id as model_id (LangChain uses it to detect the provider) and

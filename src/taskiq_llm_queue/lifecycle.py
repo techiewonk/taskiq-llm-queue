@@ -24,6 +24,7 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import HybridSQSBroker
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.broker.queue import SQSQueue
+from taskiq_llm_queue.broker.serializer import WireSerializer
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.reliability.breaker import BreakerSettings
 from taskiq_llm_queue.reliability.claims import ClaimSettings
@@ -32,6 +33,7 @@ from taskiq_llm_queue.routing_hooks import QueueHooks
 from taskiq_llm_queue.tasks import WorkerRuntime, job_filter, register_tasks
 
 if TYPE_CHECKING:
+    from aiobotocore.session import AioSession
     from redis.asyncio import Redis
     from taskiq import AsyncResultBackend
 
@@ -194,16 +196,13 @@ def receive_budget(
         if failover is not None and failover.redis_down():
             return 0
         share = limiter.settings.share_for(lanes.get(queue.name, Lane.BG))
-        best = 0
-        try:
-            for target in model.targets:
-                state = await limiter.state(alias, target)
-                best = max(best, state.headroom(share))
+        try:  # every target in one pipelined round trip, on each poll
+            states = await limiter.states(alias, model.targets)
         except RedisError as exc:
             if failover is not None:
                 failover.report_redis_failure(exc)
             return 0
-        return best
+        return max((state.headroom(share) for state in states), default=0)
 
     return budget
 
@@ -243,11 +242,14 @@ def build_brokers(
     *,
     failover: FailoverPolicy | None = None,
     hooks: BrokerHooks | None = None,
+    session: AioSession | None = None,
 ) -> BrokerSet:
     """One broker per distinct model queue set, plus a jobs broker when `job_queues` is set.
 
     Every broker gets the three stable tasks, metadata labels (receipt handle for release),
-    the shared result backend and `runtime.on_lost`. Nothing connects until `startup()`.
+    the shared result backend, `runtime.on_lost` and the orjson `WireSerializer` (reads
+    stdlib-JSON messages from older pods and vice versa). `session` is the pod's one shared
+    aiobotocore session (credential chain resolved once). Nothing connects until `startup()`.
     """
     brokers = BrokerSet()
     by_queues: dict[tuple[str, ...], HybridSQSBroker] = {}
@@ -259,6 +261,7 @@ def build_brokers(
         "hooks": hooks,
         "on_lost": runtime.on_lost,
         "release_running_on_shutdown": True,
+        "session": session,
     }
     for alias, model in config.models.items():
         if not model.queues:
@@ -290,6 +293,7 @@ def build_brokers(
             receive_budget=receive_budget(alias, model, limiter, lanes, failover),
             **common,
         ).with_result_backend(result_backend)
+        broker.with_serializer(WireSerializer())
         register_tasks(broker, runtime)
         by_queues[key] = brokers.by_alias[alias] = broker
     job_queues = sorted(set(config.job_queues.values()))
@@ -307,6 +311,7 @@ def build_brokers(
             message_filter=job_filter(runtime),
             **common,
         ).with_result_backend(result_backend)
+        jobs.with_serializer(WireSerializer())
         register_tasks(jobs, runtime)
         brokers.jobs = jobs
     return brokers
@@ -384,7 +389,7 @@ class ClaimGroup:
 
 
 class PodRegistry:
-    """Live pods of one key prefix: a sorted set `<prefix>:pods` scored by expiry.
+    """Live pods of one key prefix: a sorted set (`KeySpace.pods`) scored by expiry.
 
     Each heartbeat re-adds this pod and drops expired ones; the count is the `live_pods` that
     splits the last known limit into a per-pod local cap while Valkey is down (DS18).

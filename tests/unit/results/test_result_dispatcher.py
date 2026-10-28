@@ -296,3 +296,75 @@ async def test_deadline_heap_is_compacted_under_fast_traffic(
     store.data["keeper"] = reply("keeper")
     await clock.advance(0.1)
     assert (await keeper).request_id == "keeper"
+
+
+class RecordingStore(DictStore):
+    """DictStore that records the ids of every take."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.takes: list[list[str]] = []
+
+    async def take_many(self, task_ids: Sequence[str]) -> dict[str, LLMReply]:
+        self.takes.append(sorted(task_ids))
+        return await super().take_many(task_ids)
+
+
+async def test_pubsub_wake_takes_only_announced_id() -> None:
+    """Item 4: a done message takes just its task id, not every pending waiter (real time)."""
+    server = fakeredis.FakeServer()
+    redis = fakeredis.FakeAsyncRedis(server=server)
+    keys = KeySpace("llmq:unit")
+    store = RecordingStore()
+    dispatcher = ResultDispatcher(
+        store, redis=redis, channel=keys.done_channel("pod-a"), intervals_ms={Lane.BG: 5000}
+    )
+    try:
+        waits = {i: asyncio.create_task(dispatcher.wait(i, 30, Lane.BG)) for i in "abcde"}
+        await asyncio.sleep(0.2)  # subscribed and napping
+        store.data["c"] = reply("c")
+        await publish_done(redis, keys, "pod-a", "c")
+        assert (await asyncio.wait_for(waits["c"], 2)).request_id == "c"
+        assert store.takes == [["c"]]
+        await publish_done(redis, keys, "pod-a", "gone")  # not ours: no take at all
+        await asyncio.sleep(0.2)
+        assert store.takes == [["c"]]
+        assert dispatcher.pending == 4
+    finally:
+        await dispatcher.stop()
+        await redis.aclose()
+
+
+async def test_hints_do_not_starve_the_sweep(clock: ManualClock) -> None:
+    """The interval sweep over every waiter still runs while hints keep waking the loop."""
+    store = RecordingStore()
+    dispatcher = ResultDispatcher(store, clock=clock, sleep=clock.sleep)
+    try:
+        waits = [asyncio.create_task(dispatcher.wait(i, 1e6, Lane.BG)) for i in ("x", "y")]
+        await settle()
+        for _ in range(6):  # a hint every 0.1 s for 0.6 s; the BG sweep is due at 0.5 s
+            dispatcher._hint(b"x")
+            await settle()
+            await clock.advance(0.1)
+        assert ["x", "y"] in store.takes
+        assert store.takes.count(["x"]) >= 4
+        for task in waits:
+            task.cancel()
+    finally:
+        await dispatcher.stop()
+
+
+async def test_deadline_wake_takes_due_ids_before_timing_out(clock: ManualClock) -> None:
+    store = RecordingStore()
+    dispatcher = ResultDispatcher(store, clock=clock, sleep=clock.sleep)
+    try:
+        short = asyncio.create_task(dispatcher.wait("short", 1.0, Lane.BULK))
+        long = asyncio.create_task(dispatcher.wait("long", 1e6, Lane.BULK))
+        await settle()
+        store.data["short"] = reply("short")
+        await clock.advance(1.0)  # deadline before the 2 s bulk sweep
+        assert (await short).request_id == "short"
+        assert store.takes == [["short"]]
+        long.cancel()
+    finally:
+        await dispatcher.stop()

@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
-from taskiq import AckableMessage, AsyncBroker, BrokerMessage
+from taskiq import AckableMessage, AsyncBroker, BrokerMessage, TaskiqMessage
+from taskiq.formatters.proxy_formatter import ProxyFormatter
 
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.acker import Acker, VisibilityResult
@@ -164,6 +165,7 @@ class HybridSQSBroker(AsyncBroker):
         self.hooks = hooks or BrokerHooks()
         self._on_lost = on_lost
         self._release_running_on_shutdown = release_running_on_shutdown
+        self.formatter = DeliveryFormatter(self)
         # A long poll cancelled client-side can still complete server-side and take a message
         # we release right after (seen on ElasticMQ), so by default polls finish naturally.
         self._stop_grace_secs = (
@@ -384,10 +386,9 @@ class HybridSQSBroker(AsyncBroker):
                 if delivery.done:
                     continue
                 delivery.started = True
-                yield AckableMessage(
-                    data=delivery.body.encode("utf-8"),
-                    ack=functools.partial(self._ack, delivery),
-                )
+                data = _Body(delivery.body.encode("utf-8"))
+                data.parsed, delivery.message = delivery.message, None
+                yield AckableMessage(data=data, ack=functools.partial(self._ack, delivery))
         finally:
             with contextlib.suppress(Exception):
                 await self._stop_pollers()
@@ -565,7 +566,46 @@ class HybridSQSBroker(AsyncBroker):
         self._buffer.put_nowait(delivery)
 
     def _screen(self, delivery: Delivery) -> tuple[str | None, str]:
-        """DS9 pre-filter: (reject reason or None, body to yield, with metadata if enabled)."""
+        """DS9 pre-filter: (reject reason or None, body to yield, with metadata if enabled).
+
+        With our `DeliveryFormatter` the body is parsed once and the validated message rides
+        to the Receiver on the yielded bytes; a replaced formatter gets the old re-dump path.
+        """
+        if not isinstance(self.formatter, DeliveryFormatter):
+            return self._screen_redump(delivery)
+        try:
+            raw = self.serializer.loadb(delivery.body.encode("utf-8"))
+            task_name, task_id = raw["task_name"], raw["task_id"]
+        except Exception:
+            return "unparseable", delivery.body
+        if isinstance(task_id, str):
+            delivery.task_id = task_id
+        if not isinstance(task_name, str) or self.find_task(task_name) is None:
+            return f"unknown_task:{task_name}", delivery.body
+        try:  # once per message; taskiq's Receiver would otherwise do the same again
+            parsed = TaskiqMessage.model_validate(raw)
+        except Exception:
+            return "unparseable", delivery.body
+        if not envelope_supported(parsed):
+            return "unsupported_envelope", delivery.body
+        if self._message_filter is not None and not self._message_filter(parsed):
+            return "filtered", delivery.body
+        if self._expose_metadata:
+            parsed.labels.update(self._metadata_labels(delivery))
+        delivery.message = parsed
+        return None, delivery.body
+
+    def _metadata_labels(self, delivery: Delivery) -> dict[str, str]:
+        """P12 labels: SQS message id, receipt handle, queue name and receive count."""
+        return {
+            SQS_MESSAGE_ID_LABEL: delivery.message_id,
+            SQS_RECEIPT_HANDLE_LABEL: delivery.receipt_handle,
+            SQS_QUEUE_LABEL: delivery.queue.name,
+            SQS_RECEIVE_COUNT_LABEL: str(delivery.receive_count),
+        }
+
+    def _screen_redump(self, delivery: Delivery) -> tuple[str | None, str]:
+        """`_screen` for a user formatter: parse with it, re-serialize to add metadata labels."""
         try:
             parsed = self.formatter.loads(delivery.body.encode("utf-8"))
         except Exception:
@@ -579,14 +619,7 @@ class HybridSQSBroker(AsyncBroker):
             return "filtered", delivery.body
         if not self._expose_metadata:
             return None, delivery.body
-        parsed.labels.update(
-            {
-                SQS_MESSAGE_ID_LABEL: delivery.message_id,
-                SQS_RECEIPT_HANDLE_LABEL: delivery.receipt_handle,
-                SQS_QUEUE_LABEL: delivery.queue.name,
-                SQS_RECEIVE_COUNT_LABEL: str(delivery.receive_count),
-            }
-        )
+        parsed.labels.update(self._metadata_labels(delivery))
         return None, self.formatter.dumps(parsed).message.decode("utf-8")
 
     async def _ack(self, delivery: Delivery) -> None:
@@ -837,6 +870,25 @@ class HybridSQSBroker(AsyncBroker):
         if self._acker is None:
             raise QueueUnavailable("broker is not started; call startup() first")
         return self._acker
+
+
+class _Body(bytes):
+    """Message bytes yielded to the Receiver, carrying the message `_screen` already parsed."""
+
+    parsed: TaskiqMessage | None = None
+
+
+class DeliveryFormatter(ProxyFormatter):
+    """taskiq's `ProxyFormatter` (broker serializer) that skips parsing a screened message.
+
+    The broker's `_screen` parses and validates each received body once; `loads` returns that
+    message (with P12 metadata labels) instead of decoding the same bytes again.
+    """
+
+    def loads(self, message: bytes) -> TaskiqMessage:
+        """The message screened with these bytes, else a normal serializer parse."""
+        parsed = message.parsed if isinstance(message, _Body) else None
+        return parsed if parsed is not None else super().loads(message)
 
 
 class _PollState:

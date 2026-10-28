@@ -51,7 +51,7 @@ async def main() -> None:
         job_id = await llmq.send_job(
             "ingest",
             {"source": run_tag, "texts": [f"note {i}" for i in range(20)]},
-            deadline_secs=600,  # drop the job if it has not run within 10 minutes
+            timeout_secs=600,  # drop the job if it has not run within 10 minutes
         )
         print("sent job:", job_id)
         await asyncio.wait_for(done.wait(), timeout=60)

@@ -213,6 +213,7 @@ class AdaptiveLimiter:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Register the Lua scripts on `client`; no I/O happens until the first call."""
+        self._client = client
         self._keys = keys
         self.settings = settings or LimiterSettings()
         self._clock = clock
@@ -291,12 +292,20 @@ class AdaptiveLimiter:
         by_target: dict[tuple[str, str], list[Lease]] = {}
         for lease in leases:
             by_target.setdefault((lease.model, lease.target), []).append(lease)
+        groups = list(by_target.items())
+        replies = await _lua.run_many(  # every target in one round trip
+            self._client,
+            [
+                (
+                    self._renew,
+                    [self._keys.leases(model, target)],
+                    [self.settings.lease_ttl_secs, *(lease.token for lease in group)],
+                )
+                for (model, target), group in groups
+            ],
+        )
         renewed: list[Lease] = []
-        for (model, target), group in by_target.items():
-            expires, _count = await self._renew(
-                [self._keys.leases(model, target)],
-                [self.settings.lease_ttl_secs, *(lease.token for lease in group)],
-            )
+        for ((model, target), group), (expires, _count) in zip(groups, replies, strict=True):
             renewed += [
                 Lease(model, target, ls.token, float(_lua.as_text(expires))) for ls in group
             ]
@@ -304,7 +313,19 @@ class AdaptiveLimiter:
 
     async def state(self, model: str, target: str) -> LimiterState:
         """Read the limit, live leases and pause without changing anything."""
-        limit, inflight, paused = await self._peek(self._key_pair(model, target), [])
+        reply = await self._peek(self._key_pair(model, target), [])
+        return self._peeked(model, target, reply)
+
+    async def states(self, model: str, targets: Iterable[str]) -> list[LimiterState]:
+        """`state` of several targets of one model in one pipelined round trip."""
+        names = list(targets)
+        replies = await _lua.run_many(
+            self._client, [(self._peek, self._key_pair(model, t), []) for t in names]
+        )
+        return [self._peeked(model, t, r) for t, r in zip(names, replies, strict=True)]
+
+    def _peeked(self, model: str, target: str, reply: Any) -> LimiterState:
+        limit, inflight, paused = reply
         state = LimiterState(
             None if int(limit) < 0 else int(limit), int(inflight), float(_lua.as_text(paused))
         )

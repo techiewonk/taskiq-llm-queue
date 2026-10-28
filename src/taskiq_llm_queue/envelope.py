@@ -7,14 +7,14 @@ worker releases the message instead of dropping it.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any, Literal
 
 import orjson
-import xxhash
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from taskiq_llm_queue.config import Lane
+from taskiq_llm_queue.config import DEFAULT_ID_HASH_SALT, Lane
 from taskiq_llm_queue.errors import UnsupportedEnvelopeError
 
 ENVELOPE_VERSION = 1
@@ -105,16 +105,30 @@ def parse_envelope(data: bytes | str | dict[str, Any]) -> Envelope:
     return Envelope.model_validate(raw)
 
 
-def hashed_id(value: str | None) -> str | None:
-    """Stable, non-reversible id for labels, logs and metrics (raw ids stay in the body)."""
-    return None if value is None else xxhash.xxh3_64_hexdigest(value.encode("utf-8"))
+def keyed_digest(value: str, salt: str | bytes = DEFAULT_ID_HASH_SALT) -> bytes:
+    """8-byte keyed BLAKE2b of `value`; equal on every pod that shares `salt` (max 64 bytes).
+
+    Keyed, so ids cannot be recovered by hashing guesses without the salt.
+    """
+    key = salt.encode("utf-8") if isinstance(salt, str) else salt
+    return hashlib.blake2b(value.encode("utf-8"), digest_size=8, key=key).digest()
 
 
-def task_labels(envelope: Envelope, *, hash_ids: bool = True) -> dict[str, str]:
+def hashed_id(value: str | None, salt: str | bytes = DEFAULT_ID_HASH_SALT) -> str | None:
+    """Stable, non-reversible id for labels, logs and metrics (raw ids stay in the body).
+
+    `salt` is `QueueConfig.id_hash_salt` (`LLMQ_ID_HASH_SALT`); set your own in production.
+    """
+    return None if value is None else keyed_digest(value, salt).hex()
+
+
+def task_labels(
+    envelope: Envelope, *, hash_ids: bool = True, salt: str | bytes = DEFAULT_ID_HASH_SALT
+) -> dict[str, str]:
     """Taskiq labels for one envelope: routing and context fields, ids hashed by default."""
     labels = {"lane": envelope.lane.value, "model": envelope.model}
     for key, value in (("session_id", envelope.session_id), ("user_id", envelope.user_id)):
-        shown = hashed_id(value) if hash_ids else value
+        shown = hashed_id(value, salt) if hash_ids else value
         if shown is not None:
             labels[key] = shown
     if envelope.reply_to:

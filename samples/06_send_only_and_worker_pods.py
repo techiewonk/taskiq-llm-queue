@@ -37,7 +37,7 @@ async def send(config: QueueConfig, calls: int = 12) -> None:
     await sender.start(mode="send")
     try:
         results = await asyncio.gather(
-            *(sender.converse("gpt20b", HELLO, timeout=60) for _ in range(calls))
+            *(sender.converse("gpt20b", HELLO, timeout_secs=60) for _ in range(calls))
         )
     finally:
         await sender.stop()

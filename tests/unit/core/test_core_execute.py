@@ -6,6 +6,7 @@ to assert DS8 / DS10 sequencing); the integration suite covers the real stores.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import time
@@ -566,3 +567,60 @@ async def test_unstored_reply_is_cached_and_reused_on_redelivery(world: World) -
     assert result.reply.ok
     assert len(world.provider.calls) == 1
     assert "r-1" in results.replies
+
+
+class HangingProvider(FakeProvider):
+    """Never answers within the test's deadline."""
+
+    async def call(self, op: str, params: Mapping[str, Any], target: Target) -> dict[str, Any]:
+        await asyncio.sleep(10)
+        return {}
+
+
+class ProviderTimeout(FakeProvider):
+    """Raises its own `TimeoutError` (e.g. a socket read timeout) well before the deadline."""
+
+    async def call(self, op: str, params: Mapping[str, Any], target: Target) -> dict[str, Any]:
+        self.calls.append((op, "?", dict(params)))
+        raise TimeoutError
+
+    def classify(self, exc: BaseException) -> ErrorInfo:
+        return ErrorInfo(ErrorKind.RETRYABLE, "timeout")
+
+
+async def test_deadline_cut_attempt_is_expired_not_provider_error(world: World) -> None:
+    """Item 7: our deadline cap firing means `deadline_exceeded` (caller sees a timeout)."""
+    world.deps.providers = lambda alias: HangingProvider()
+    now = time.time()
+    reply = (await execute_job(envelope(enqueued_at=now, deadline_at=now + 0.2), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert reply.error["type"] == "deadline_exceeded"
+    assert world.claims.log[-1] == "complete:expired"
+    assert world.limiter.held == 0
+
+
+async def test_provider_timeout_stays_retryable(world: World) -> None:
+    """A provider's own TimeoutError is retried and reported, not mistaken for the deadline."""
+    provider = ProviderTimeout()
+    world.deps.providers = lambda alias: provider
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert (reply.error["type"], reply.error["retryable"]) == ("timeout", True)
+    assert len(provider.calls) >= world.deps.config.retry_attempts  # retried, every step
+    assert world.claims.log[-1] == "complete:done"
+
+
+def test_attempt_message_does_not_repeat_the_code() -> None:
+    """`ThrottlingException: ThrottlingException` became just the code; others keep the type."""
+    from taskiq_llm_queue.core import _attempt_message
+
+    class ThrottlingException(Exception):
+        pass
+
+    same = ErrorInfo(ErrorKind.THROTTLE, "ThrottlingException")
+    assert _attempt_message(ThrottlingException(), same) == "ThrottlingException"
+    other = ErrorInfo(ErrorKind.RETRYABLE, "timeout")
+    assert _attempt_message(TimeoutError(), other) == "TimeoutError: timeout"
+    assert _attempt_message(ValueError(), ErrorInfo(ErrorKind.FATAL)) == "ValueError: fatal"

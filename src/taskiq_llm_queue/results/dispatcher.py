@@ -2,7 +2,8 @@
 
 Callers `await dispatcher.wait(task_id, timeout_secs, lane)`; a background loop polls all
 pending ids with one `ResultStore.take_many` per interval instead of one poll per waiter, and
-an optional pub/sub message on `KeySpace.done_channel(pod)` wakes it at once.
+an optional pub/sub message on `KeySpace.done_channel(pod)` (carrying the task id) wakes it at
+once to take just the announced ids; the interval sweep stays as the safety net.
 """
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ class ResultDispatcher:
         self._wake = asyncio.Event()  # poll now
         self._work = asyncio.Event()  # first waiter arrived while idle
         self._nap_secs = math.inf
+        self._hinted: set[str] = set()  # ids announced on the done channel since the last take
+        self._next_sweep: float | None = None  # when the next take over every waiter is due
         self._loop_task: asyncio.Task[None] | None = None
         self._pubsub_task: asyncio.Task[None] | None = None
         self.polls = 0  # take_many calls made; read by tests and metrics
@@ -159,26 +162,51 @@ class ResultDispatcher:
         return waiter
 
     async def _run(self) -> None:
-        """Poll loop: nap for the fastest pending lane's interval, take all, expire overdue."""
+        """Poll loop: sweep every waiter each fastest-lane interval, take hinted ids on wake-up.
+
+        A pub/sub wake takes only the announced ids (not every pending one, which cost one
+        `GET` per waiter per finished task); a deadline wake takes the ids that are due.
+        """
         while True:
             if not self._waiters:
                 self._nap_secs = math.inf
+                self._next_sweep = None
+                self._hinted.clear()
                 self._work.clear()
                 await self._work.wait()
                 self._wake.clear()
                 continue
             interval = min(self._intervals[lane] for lane in self._lanes) / 1000
+            now = self._clock()
+            due = now + interval  # a faster lane that just arrived pulls the sweep in
+            self._next_sweep = due if self._next_sweep is None else min(self._next_sweep, due)
+            nap = max(0.0, self._next_sweep - now)
             self._drop_stale_deadlines()
             if self._deadlines:
-                interval = min(interval, max(0.0, self._deadlines[0][0] - self._clock()))
-            self._nap_secs = interval
-            await self._nap(interval)
+                nap = min(nap, max(0.0, self._deadlines[0][0] - now))
+            self._nap_secs = nap
+            woken = await self._nap(nap)
             if self._waiters:
-                await self._poll()
+                await self._take(woken)
             self._expire()
 
-    async def _nap(self, secs: float) -> None:
-        """Sleep `secs` with the injected sleep, returning early when woken."""
+    async def _take(self, woken: bool) -> None:
+        """Full sweep when due (or woken without hints, e.g. a new waiter); else hinted/due ids."""
+        hinted, self._hinted = self._hinted, set()
+        if self._clock() >= (self._next_sweep or 0.0) or (woken and not hinted):
+            self._next_sweep = None
+            await self._poll(list(self._waiters))
+            return
+        now = self._clock()
+        due: set[str] = set()
+        if self._deadlines and self._deadlines[0][0] <= now:  # last look before they time out
+            due = {e[2] for e in self._deadlines if e[0] <= now and self._live(e) is not None}
+        ids = [i for i in hinted | due if i in self._waiters]
+        if ids:
+            await self._poll(ids)
+
+    async def _nap(self, secs: float) -> bool:
+        """Sleep `secs` with the injected sleep; True when woken early by the event."""
         if not self._wake.is_set():
             sleeper = asyncio.ensure_future(self._sleep(secs))
             waker = asyncio.ensure_future(self._wake.wait())
@@ -187,22 +215,35 @@ class ResultDispatcher:
             finally:
                 sleeper.cancel()
                 waker.cancel()
+        woken = self._wake.is_set()
         self._wake.clear()
+        return woken
 
-    async def _poll(self) -> None:
-        """One batched take over every pending id; store errors are logged and retried."""
+    async def _poll(self, task_ids: list[str]) -> None:
+        """One batched take over `task_ids`; store errors are logged and retried."""
         self.polls += 1
         try:
-            replies = await self._store.take_many(list(self._waiters))
+            replies = await self._store.take_many(task_ids)
         except Exception as exc:  # Redis blip: keep waiting, deadlines still apply
             logger.warning(
-                "result_poll_failed", pending=len(self._waiters), error_type=type(exc).__name__
+                "result_poll_failed", pending=len(task_ids), error_type=type(exc).__name__
             )
             return
         for task_id, reply in replies.items():
             waiter = self._waiters.get(task_id)
             if waiter is not None and self._discard(task_id, waiter) and not waiter.future.done():
                 waiter.future.set_result(reply)
+
+    def _hint(self, data: object) -> None:
+        """Note an announced task id and wake the loop; an unreadable message wakes a sweep."""
+        task_id = data.decode(errors="replace") if isinstance(data, bytes) else data
+        if not isinstance(task_id, str):
+            self._next_sweep = 0.0
+        elif task_id in self._waiters:
+            self._hinted.add(task_id)
+        else:
+            return  # not ours any more (resolved or timed out): no take needed
+        self._wake.set()
 
     def _live(self, entry: tuple[float, int, str]) -> _Waiter | None:
         """The waiter a heap entry still stands for, or None when the entry is stale."""
@@ -247,7 +288,7 @@ class ResultDispatcher:
             self._fail_all(QueueUnavailable("result dispatcher loop crashed"))
 
     async def _listen(self, redis: Redis, channel: str) -> None:
-        """Subscribe to the pod's done channel and wake the poll loop on every message."""
+        """Subscribe to the pod's done channel; each message names a task id to take now."""
         while True:
             pubsub = redis.pubsub()
             try:
@@ -255,7 +296,7 @@ class ResultDispatcher:
                 while True:
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                     if message is not None and self._waiters:
-                        self._wake.set()
+                        self._hint(message.get("data"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # reconnect; polling keeps working meanwhile

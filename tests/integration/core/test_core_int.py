@@ -8,7 +8,6 @@ own key prefix and its own freshly created SQS queues. fakellm runs in-process o
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import time
@@ -25,7 +24,7 @@ from aiohttp.test_utils import TestServer
 from redis.asyncio import Redis
 
 from taskiq_llm_queue import (
-    LLMQueueError,
+    LLMQueueCancelled,
     LLMQueueTimeout,
     ModelConfig,
     QueueConfig,
@@ -266,8 +265,8 @@ async def test_invoke_model_returns_raw_body(make_queue: MakeQueue) -> None:
     """invoke_model gives Bedrock's raw bytes body and content type."""
     llmq = await make_queue()
     raw = await llmq.invoke_model("titan", {"inputText": "a"})
-    assert raw["contentType"].startswith("application/json")
-    assert len(json.loads(raw["body"])["embedding"]) == 1024
+    assert raw.content_type.startswith("application/json")
+    assert len(raw.json()["embedding"]) == 1024
 
 
 async def test_embed_batches_per_provider(make_queue: MakeQueue) -> None:
@@ -289,8 +288,8 @@ async def test_chat_via_openai_compatible(make_queue: MakeQueue) -> None:
     body = await llmq.chat(
         "llama", {"model": "ignored", "messages": [{"role": "user", "content": "hi"}]}
     )
-    assert body["object"] == "chat.completion"
-    assert body["model"] == "llama-3.1-70b"
+    assert body.response["object"] == "chat.completion"
+    assert body.response["model"] == "llama-3.1-70b"
     vectors = await llmq.embed("llama", ["x", "y"])
     assert len(vectors) == 2
 
@@ -339,19 +338,25 @@ async def test_cancel_before_a_worker_picks_it_up(
     await asyncio.sleep(0.5)
     await sender.cancel("cancel-me")
     await make_queue("work", config=cfg)
-    with pytest.raises(LLMQueueError, match="cancelled"):
+    with pytest.raises(LLMQueueCancelled, match="cancelled"):
         await asyncio.wait_for(call, 20)
 
 
 async def test_timeout_sets_cancel_flag(make_queue: MakeQueue, fake: str, redis: Redis) -> None:
-    """A wait past `timeout` raises LLMQueueTimeout and flags the task cancelled."""
+    """A wait past `timeout_secs` raises LLMQueueTimeout and the task stops on the worker.
+
+    Both sides end at the same deadline: the caller times out and flags the task cancelled, or
+    the worker's deadline cap fires first and its `deadline_exceeded` reply (claim `expired`)
+    raises the same LLMQueueTimeout.
+    """
     await patch_model(fake, SMALL_KEY, {"latency_ms": {"p50": 4000, "p95": 4000}})
     llmq = await make_queue()
     t0 = time.monotonic()
     with pytest.raises(LLMQueueTimeout):
-        await llmq.converse("small", HELLO, timeout=1.0, request_id="slow-1")
+        await llmq.converse("small", HELLO, timeout_secs=1.0, request_id="slow-1")
     assert time.monotonic() - t0 < 3
-    assert await redis.exists(llmq.keys.cancel("slow-1"))
+    flagged = await redis.exists(llmq.keys.cancel("slow-1"))
+    assert flagged or await redis.hget(llmq.keys.job("slow-1"), "state") == b"expired"
 
 
 async def test_stop_drain_hands_back_running_work(

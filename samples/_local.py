@@ -56,10 +56,26 @@ LOCAL_ENV: dict[str, str] = {
     "LLMQ_RESULT_DISPATCH_MS": "rt:50,bg:100,bulk:200",
 }
 
-# ElasticMQ and fakellm accept any credentials, but botocore needs some to sign requests.
-os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
-os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
-os.environ.setdefault("AWS_DEFAULT_REGION", REGION)
+# `13_research_assistant_flow.py` sets this before importing `_local`: it loads `.env` /
+# Secrets Manager first and calls `use_dummy_credentials()` itself (local target only), so
+# dummy keys never shadow or mix with real ones.
+TARGET_ENV = "LLMQ_SAMPLES_TARGET"
+
+
+def use_dummy_credentials() -> None:
+    """ElasticMQ and fakellm accept any credentials, but botocore needs some to sign requests.
+
+    Real credentials already in the environment are kept (setdefault, all-or-nothing).
+    """
+    if "AWS_ACCESS_KEY_ID" not in os.environ:
+        os.environ["AWS_ACCESS_KEY_ID"] = "test"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "test"
+        os.environ.pop("AWS_SESSION_TOKEN", None)  # a real token with dummy keys fails
+    os.environ.setdefault("AWS_DEFAULT_REGION", REGION)
+
+
+if TARGET_ENV not in os.environ:
+    use_dummy_credentials()
 os.environ.setdefault(OPENAI_KEY_ENV, "sk-local")
 
 
@@ -144,6 +160,186 @@ async def ensure_queues(config: QueueConfig) -> None:
                 await sqs.get_queue_url(QueueName=name)
             except ClientError:
                 await sqs.create_queue(QueueName=name, Attributes={"VisibilityTimeout": "60"})
+
+
+# ------------------------------------------------- app settings (.env, Secrets Manager)
+#
+# Used by `13_research_assistant_flow.py`; the other samples never read a file or a secret.
+# Values are only ever put into `os.environ`; nothing here prints or logs a value.
+
+ENV_FILE_ENV = "LLMQ_ENV_FILE"  # path of the env file; default: <package root>/.env
+APP_VALKEY_ENV = "LLMQ_SAMPLES_APP_VALKEY"  # "true": queue on the app's Valkey (VALKEY_*)
+PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The research-assistant app's model ids (src/configs/llm_config.py, src/constants/llm.py,
+# src/core/query_planning/retrieve_query_plan.py). The app reads none of them from env.
+APP_MODEL_IDS = {
+    "gpt120b": "openai.gpt-oss-120b-1:0",
+    "gpt20b": "openai.gpt-oss-20b-1:0",
+    "titan": "amazon.titan-embed-text-v2:0",
+    "cohere": "cohere.embed-english-v3",
+}
+APP_DEFAULT_REGION = "ap-south-1"  # bedrock_client.py DEFAULT_AWS_*_REGION
+
+
+def env_file_path() -> str:
+    """`LLMQ_ENV_FILE` if set, else `<package root>/.env`."""
+    return os.environ.get(ENV_FILE_ENV) or os.path.join(PACKAGE_ROOT, ".env")
+
+
+def parse_env_file(path: str) -> dict[str, str]:
+    """Parse `KEY=VALUE` lines (optional `export `, quotes, `#` comments); no expansion."""
+    found: dict[str, str] = {}
+    with open(path, encoding="utf-8-sig") as file:
+        for raw in file:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not key.replace("_", "").isalnum():
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            found[key] = value
+    return found
+
+
+def load_env_file(path: str | None = None) -> list[str]:
+    """`os.environ.setdefault` every key of the env file; returns the key names it set."""
+    path = path or env_file_path()
+    if not os.path.isfile(path):
+        return []
+    loaded = []
+    for key, value in parse_env_file(path).items():
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
+def app_secret_name() -> str | None:
+    """The app's secret id: `SECRET_NAME_TEMPLATE.format(env=ENV)` (`secrets_loader.py`).
+
+    None unless `ENV` or `SECRET_NAME_TEMPLATE` is set: the samples do not guess an env.
+    """
+    if "ENV" not in os.environ and "SECRET_NAME_TEMPLATE" not in os.environ:
+        return None
+    template = os.environ.get("SECRET_NAME_TEMPLATE", "{env}/researchassistant/secret")
+    return template.format(env=os.environ.get("ENV", "dev"))
+
+
+async def load_app_secret(protected: set[str]) -> tuple[str, list[str]]:
+    """Fetch the app's Secrets Manager JSON and put its keys into `os.environ`.
+
+    Mirrors the app: the secret wins over `.env` values, but a key in `protected` (the real
+    process environment, captured before `.env` was loaded) is never overwritten. Region is
+    `AWS_REGION` (default `ap-south-1`), as in `secrets_loader.py`.
+
+    Returns:
+        The secret id and the key names that were set.
+
+    Raises:
+        LookupError: If neither `ENV` nor `SECRET_NAME_TEMPLATE` is set.
+        botocore errors: If the secret cannot be read (no credentials, access denied, ...).
+    """
+    name = app_secret_name()
+    if name is None:
+        raise LookupError("set ENV (and optionally SECRET_NAME_TEMPLATE) to read the secret")
+    region = os.environ.get("AWS_REGION", APP_DEFAULT_REGION)
+    async with get_session().create_client("secretsmanager", region_name=region) as client:
+        reply = await client.get_secret_value(SecretId=name)
+    values = orjson.loads(reply["SecretString"])
+    loaded = []
+    for key, value in values.items():
+        if key in protected:
+            continue
+        os.environ[key] = value if isinstance(value, str) else orjson.dumps(value).decode()
+        loaded.append(key)
+    return name, loaded
+
+
+def _first_env(*names: str) -> str | None:
+    """The first non-empty variable among `names` (app secrets use both cases)."""
+    for name in names:
+        if value := os.environ.get(name):
+            return value
+    return None
+
+
+def app_regions() -> tuple[str, str]:
+    """Chat and embedding regions, like `bedrock_client.py` (they can differ)."""
+    base = _first_env("AWS_REGION", "AWS_DEFAULT_REGION") or APP_DEFAULT_REGION
+    chat = _first_env("AWS_MODEL_REGION") or base
+    embed = _first_env("AWS_EMBEDDING_REGION") or base
+    return chat, embed
+
+
+def app_service_tier() -> str | None:
+    """`BEDROCK_SERVICE_TIER` if it is one the app accepts (`llm_config.py`), else None."""
+    tier = (os.environ.get("BEDROCK_SERVICE_TIER") or "").strip().lower()
+    return tier if tier in {"priority", "default", "flex", "reserved"} else None
+
+
+def app_valkey_env() -> dict[str, str]:
+    """`LLMQ_REDIS_*` from the app's Valkey settings, only when `LLMQ_SAMPLES_APP_VALKEY=true`.
+
+    Names: `VALKEY_HOST` / `VALKEY_PORT` / `VALKEY_KEY` / `VALKEY_SSL` (env) or the secret's
+    `valkey_host` / `valkey_port` / `valkey_key`. Off by default: the samples queue on the
+    local Docker Valkey even when the app's `.env` points at ElastiCache.
+    """
+    if os.environ.get(APP_VALKEY_ENV, "").lower() not in {"1", "true", "yes"}:
+        return {}
+    mapping = {
+        "LLMQ_REDIS_HOST": _first_env("VALKEY_HOST", "valkey_host"),
+        "LLMQ_REDIS_PORT": _first_env("VALKEY_PORT", "valkey_port"),
+        "LLMQ_REDIS_PASSWORD": _first_env("VALKEY_KEY", "valkey_key"),
+        "LLMQ_REDIS_SSL": os.environ.get("VALKEY_SSL", "true"),  # app default: TLS on
+    }
+    return {k: v for k, v in mapping.items() if v}
+
+
+def aws_models() -> dict[str, ModelConfig]:
+    """The app's Bedrock models on real AWS, on the same queue names as `local_models`."""
+    chat_region, embed_region = app_regions()
+    models = {}
+    for alias in ("gpt120b", "gpt20b"):
+        models[alias] = ModelConfig(
+            provider="bedrock",
+            model_id=APP_MODEL_IDS[alias],
+            targets={"primary": Target(region=chat_region)},
+            queues={"rt": f"llm-{alias}-rt", "default": f"llm-{alias}"},
+        )
+    for alias in ("titan", "cohere"):
+        models[alias] = ModelConfig(
+            provider="bedrock",
+            model_id=APP_MODEL_IDS[alias],
+            targets={"primary": Target(region=embed_region)},
+            queues={"rt": "llm-embed-rt", "default": "llm-embed", "bulk": "llm-embed-bulk"},
+        )
+    return models
+
+
+def aws_config(**overrides: Any) -> QueueConfig:
+    """Queue on the local stack (unless `LLMQ_*` says otherwise), models on real Bedrock.
+
+    `LLMQ_BEDROCK_ENDPOINT_URL` is dropped unless it is really set, so calls reach AWS.
+    """
+    env = dict(LOCAL_ENV)
+    env.pop("LLMQ_BEDROCK_ENDPOINT_URL")
+    env.update(app_valkey_env())
+    env.update({k: v for k, v in os.environ.items() if k.startswith("LLMQ_")})
+    fields = QueueConfig.from_env(env).model_dump()
+    if "LLMQ_MODELS" not in env:
+        fields["models"] = aws_models()
+    if "LLMQ_FALLBACK_CHAINS" not in env:
+        fields["fallback_default"] = {"chains": {"gpt120b": ["gpt20b"], "gpt20b": ["gpt120b"]}}
+    fields.update(overrides)
+    return QueueConfig.model_validate(fields)
 
 
 # ---------------------------------------------------------------- fakellm admin API
@@ -238,7 +434,8 @@ async def _reset(scenario: Any) -> None:
     from redis.asyncio import Redis
 
     config = local_config()
-    client = Redis(host=config.redis_host, port=config.redis_port, password=config.redis_password)
+    password = config.redis_password.get_secret_value() if config.redis_password else None
+    client = Redis(host=config.redis_host, port=config.redis_port, password=password)
     try:
         keys = [k async for k in client.scan_iter(match=f"{config.key_prefix}:*", count=500)]
         if keys:

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from taskiq import TaskiqMessage
+
     from taskiq_llm_queue.broker.queue import SQSQueue
 
 
@@ -24,6 +26,7 @@ class Delivery:
     now own the message), so the running task can stop without writing a result (DS6).
     `outcome` is "acked" or "released" once `done`; `after_ack` callbacks run only after
     SQS confirmed the delete. `expires_at` is the `expiry` attribute (epoch seconds).
+    `message` is the screened, validated taskiq message until it is handed to the Receiver.
     """
 
     queue: SQSQueue
@@ -44,3 +47,4 @@ class Delivery:
     expires_at: float | None = None
     outcome: str | None = None
     after_ack: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+    message: TaskiqMessage | None = None

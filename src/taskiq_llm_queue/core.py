@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import orjson
+from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import RedisError
 
 from taskiq_llm_queue._logging import get_logger
@@ -24,8 +25,11 @@ from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
 from taskiq_llm_queue.errors import ErrorInfo, ErrorKind, QueueUnavailable
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
+from taskiq_llm_queue.reliability import _lua
+from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter
+from taskiq_llm_queue.results.backend import LLMQResultBackend
 from taskiq_llm_queue.routing_hooks import QueueHooks, safe_hook
 
 if TYPE_CHECKING:
@@ -36,7 +40,6 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.keys import KeySpace
     from taskiq_llm_queue.protocols import Lease, Limiter, Provider, ResultStore
     from taskiq_llm_queue.reliability.breaker import CircuitBreaker
-    from taskiq_llm_queue.reliability.claims import RedisClaimStore
     from taskiq_llm_queue.reliability.fallback import FallbackStep
 
 logger = get_logger(__name__)
@@ -275,6 +278,8 @@ async def execute_job(
                 check_cancel=claims is not None,
                 requeue=claims is not None and store,
                 progress=progress,
+                # the claim script just checked the cancel flag (DS14): skip one EXISTS
+                fresh_claim=isinstance(claims, RedisClaimStore),
             )
     except _Stopped as stop:
         state = stop.state
@@ -303,19 +308,102 @@ async def execute_job(
         reply = error_reply(envelope, "internal_error", type(exc).__name__, retryable=False)
     if store:
         try:
-            await _store(reply, envelope, deps)
+            await _finish(reply, envelope, deps, claims, state)
         except QueueUnavailable:
             deps.reply_cache.put(reply, expires_at=envelope.deadline_at)
             raise
+    elif claims is not None:
+        await _quietly(
+            claims.complete(envelope.request_id, state, worker=deps.worker),
+            "claim_complete_failed",
+            envelope,
+        )
+    return JobResult(ClaimDecision.RUN, reply)
+
+
+async def _finish(
+    reply: LLMReply,
+    envelope: Envelope,
+    deps: CoreDeps,
+    claims: RedisClaimStore | None,
+    state: ClaimState,
+) -> None:
+    """DS8 tail: store the result, then complete the claim, then wake-up and params cleanup.
+
+    One pipelined round trip when our stores share one non-cluster client (4 before); else
+    the same steps one by one. Raises `QueueUnavailable` when the result cannot be stored.
+    """
+    results, redis = deps.results, deps.redis
+    if (
+        redis is not None
+        and not isinstance(redis, RedisCluster)  # cluster nodes would run out of order
+        and isinstance(results, LLMQResultBackend)
+        and results.uses(redis)
+        and (claims is None or (isinstance(claims, RedisClaimStore) and claims.client is redis))
+        and await _finish_pipelined(reply, envelope, deps, results, claims, state)
+    ):
+        return
+    await _store(reply, envelope, deps)
     if claims is not None:  # the reply is out; a failed CAS only lets a duplicate re-ack
         await _quietly(
             claims.complete(envelope.request_id, state, worker=deps.worker),
             "claim_complete_failed",
             envelope,
         )
-    if store and deps.redis is not None:
+    if deps.redis is not None:
         await _after_store(envelope, deps)
-    return JobResult(ClaimDecision.RUN, reply)
+
+
+async def _finish_pipelined(
+    reply: LLMReply,
+    envelope: Envelope,
+    deps: CoreDeps,
+    results: LLMQResultBackend,
+    claims: RedisClaimStore | None,
+    state: ClaimState,
+) -> bool:
+    """SET result, claim CAS, PUBLISH, DEL params in one non-transactional pipeline (DS8).
+
+    Valkey runs one connection's commands in order, so `done` is never written before the
+    result, and a write it refuses (OOM, READONLY) is refused to the claim script too. A failed
+    round trip is retried whole (each step is idempotent) until `_store`'s give-up time.
+    Returns False when the `SET` alone was refused; the caller then goes step by step.
+    """
+    assert deps.redis is not None
+    rid = envelope.request_id
+    complete = claims.complete_call(rid, state, worker=deps.worker) if claims else None
+    give_up_at = min(envelope.deadline_at, deps.clock() + deps.store_retry_secs)
+    while True:
+        try:
+            async with deps.redis.pipeline(transaction=False) as pipe:
+                results.queue_put(pipe, reply, ttl_secs=deps.config.result_ttl_secs)
+                if complete is not None:
+                    _lua.queue_script(pipe, *complete)
+                if envelope.reply_to:
+                    pipe.publish(deps.keys.done_channel(envelope.reply_to), rid)
+                if envelope.params_ref:
+                    pipe.delete(envelope.params_ref)
+                replies = await pipe.execute(raise_on_error=False)
+            break
+        except Exception as exc:
+            if deps.clock() + _RESULT_RETRY_SECS >= give_up_at:
+                raise QueueUnavailable(f"cannot store result {rid}") from exc
+            logger.warning("result_write_failed", request_id=rid, error_type=type(exc).__name__)
+            await deps.sleep(_RESULT_RETRY_SECS)
+    if isinstance(replies[0], Exception):
+        logger.warning("result_write_failed", request_id=rid, error_type=type(replies[0]).__name__)
+        return False
+    if claims is not None and complete is not None:
+        try:
+            outcome = await _lua.settle(replies[1], *complete)
+            claims.complete_outcome(outcome, rid, worker=deps.worker)
+        except Exception as exc:  # the reply is out; a failed CAS only lets a duplicate re-ack
+            logger.warning("claim_complete_failed", request_id=rid, error_type=type(exc).__name__)
+    rest = replies[2:] if complete is not None else replies[1:]
+    if failed := next((r for r in rest if isinstance(r, Exception)), None):
+        # a lost wake-up only delays the result until the next poll
+        logger.warning("result_cleanup_failed", request_id=rid, error_type=type(failed).__name__)
+    return True
 
 
 async def _quietly(call: Awaitable[Any], event: str, envelope: Envelope) -> None:
@@ -408,6 +496,13 @@ def _classify(provider: Provider, exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorKind.RETRYABLE, type(exc).__name__)
 
 
+def _attempt_message(exc: BaseException, info: ErrorInfo) -> str:
+    """`ExcType: code` for an error reply, or just the code when it is the type's name."""
+    code = info.code or info.kind.value
+    name = type(exc).__name__
+    return code if code == name else f"{name}: {code}"
+
+
 def _acquire_wait(envelope: Envelope, deps: CoreDeps, *, bounded: bool) -> float:
     """Slot wait for one attempt: rt 2 s (DS13); queued bg/bulk bounded (DS4); else the deadline."""
     remaining = envelope.deadline_at - deps.clock()
@@ -430,10 +525,19 @@ def _requeue_secs(envelope: Envelope, deps: CoreDeps) -> int | None:
 
 
 async def _take_slot(
-    envelope: Envelope, step: FallbackStep, deps: CoreDeps, *, check_cancel: bool, bounded: bool
+    envelope: Envelope,
+    step: FallbackStep,
+    deps: CoreDeps,
+    *,
+    check_cancel: bool,
+    bounded: bool,
+    fresh_claim: bool = False,
 ) -> Lease | None:
-    """Acquire one slot; cancel and deadline are checked before and right after (DS14)."""
-    await _check_live(envelope, deps, check_cancel)
+    """Acquire one slot; cancel and deadline are checked before and right after (DS14).
+
+    `fresh_claim`: the claim script checked the cancel flag just now, so skip the first check.
+    """
+    await _check_live(envelope, deps, check_cancel and not fresh_claim)
     wait = _acquire_wait(envelope, deps, bounded=bounded)
     abort = _cancel_probe(envelope, deps) if check_cancel else None
     lease = await deps.limiter.acquire(
@@ -472,12 +576,14 @@ async def run_call(
     check_cancel: bool = False,
     requeue: bool = False,
     progress: _Progress | None = None,
+    fresh_claim: bool = False,
 ) -> LLMReply:
     """Walk the fallback steps; each step gets `retry_attempts` attempts with backoff (§8).
 
     A limiter slot covers one attempt and is released in `finally` before any sleep (DS10).
     When no step could run: `requeue` raises `_Requeue` (bg/bulk), an all-open breaker waits
     and tries again within the deadline. Raises `_Stopped`; a Valkey error propagates.
+    `fresh_claim` skips the cancel check before the first slot (the claim just made it).
     """
     config = deps.config
     steps = resolve_fallback(
@@ -503,8 +609,14 @@ async def run_call(
             call_params = params_for_step(envelope.op, params, model_cfg.model_id)
             for attempt in range(config.retry_attempts):
                 lease = await _take_slot(
-                    envelope, step, deps, check_cancel=check_cancel, bounded=requeue
+                    envelope,
+                    step,
+                    deps,
+                    check_cancel=check_cancel,
+                    bounded=requeue,
+                    fresh_claim=fresh_claim,
                 )
+                fresh_claim = False
                 if lease is None:
                     last, last_message = (
                         ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"),
@@ -514,17 +626,18 @@ async def run_call(
                 progress.attempts += 1
                 deps.leases.add(lease)
                 info: ErrorInfo | None = None
+                # Deadline cap: no extra task, unlike wait_for, and `expired()` tells it apart
+                # from a provider's own timeout.
+                cap = asyncio.timeout(max(0.1, envelope.deadline_at - deps.clock()))
                 t0 = time.monotonic()
                 try:
-                    timeout = max(0.1, envelope.deadline_at - deps.clock())
-                    response = await asyncio.wait_for(
-                        provider.call(envelope.op, call_params, target), timeout
-                    )
+                    async with cap:
+                        response = await provider.call(envelope.op, call_params, target)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     info = _classify(provider, exc)
-                    last, last_message = info, f"{type(exc).__name__}: {info.code or info.kind}"
+                    last, last_message = info, _attempt_message(exc, info)
                 finally:
                     deps.leases.discard(lease)
                     await _release(
@@ -569,6 +682,8 @@ async def run_call(
                     await _record(deps, step, ok=False)
                 else:  # a throttle belongs to the limiter: frees a half-open probe, no count
                     await _record(deps, step, ok=None)
+                if cap.expired():  # the call's deadline cut it off: expired, not a provider error
+                    raise _Stopped(ClaimState.EXPIRED)
                 if attempt + 1 < config.retry_attempts:
                     delay = backoff_secs(
                         attempt, config.retry_base_secs, deps.rng, info.retry_after_secs

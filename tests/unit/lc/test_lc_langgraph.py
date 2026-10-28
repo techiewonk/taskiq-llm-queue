@@ -12,6 +12,7 @@ from lc_fakes import CONVERSE_TEXT_RESPONSE, FakeQueueClient  # type: ignore[imp
 
 from taskiq_llm_queue.langchain import QueuedChatBedrockConverse
 
+MODEL_ID = "openai.gpt-oss-120b-1:0"
 SRC = Path(__file__).resolve().parents[3] / "src"
 
 
@@ -37,7 +38,7 @@ def _graph(model: QueuedChatBedrockConverse) -> Any:
 
 async def test_graph_custom_stream_mode_unchanged() -> None:
     fake = FakeQueueClient(converse_response=CONVERSE_TEXT_RESPONSE)
-    app = _graph(QueuedChatBedrockConverse(model_id="gpt120b", llmq=fake))
+    app = _graph(QueuedChatBedrockConverse(model_id=MODEL_ID, model_alias="gpt120b", llmq=fake))
     events = [e async for e in app.astream({"question": "hi"}, stream_mode=["custom"])]
     assert events == [("custom", {"status": "calling"}), ("custom", {"status": "done"})]
     assert fake.ops == ["converse"]
@@ -45,7 +46,7 @@ async def test_graph_custom_stream_mode_unchanged() -> None:
 
 async def test_graph_messages_stream_mode_gives_one_full_message() -> None:
     fake = FakeQueueClient(converse_response=CONVERSE_TEXT_RESPONSE)
-    app = _graph(QueuedChatBedrockConverse(model_id="gpt120b", llmq=fake))
+    app = _graph(QueuedChatBedrockConverse(model_id=MODEL_ID, model_alias="gpt120b", llmq=fake))
     messages: list[BaseMessage] = [
         msg async for msg, _meta in app.astream({"question": "hi"}, stream_mode="messages")
     ]

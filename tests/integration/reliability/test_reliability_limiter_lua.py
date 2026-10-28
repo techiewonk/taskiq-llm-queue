@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import pytest
 import redis
 import redis.asyncio
+from redis.asyncio.client import Pipeline
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.protocols import Lease, Limiter, ReceiveGate
-from taskiq_llm_queue.reliability import AdaptiveLimiter, LimiterSettings, SyncAdaptiveLimiter
+from taskiq_llm_queue.reliability import AdaptiveLimiter, LimiterSettings, SyncAdaptiveLimiter, _lua
 
 pytestmark = pytest.mark.integration
 
@@ -368,3 +370,39 @@ async def test_sync_limiter_shares_state(
     sync.release(lease, throttled=True)
     assert (await lim.state(M, T)).paused_secs > 0
     await lim.release(held[0], throttled=False)
+
+
+async def test_states_and_renew_take_one_round_trip(
+    valkey: redis.asyncio.Redis, keys: KeySpace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 6: the receive budget reads, and the heartbeat renews, every target at once."""
+    lim = make(valkey, keys, initial={M: 4}, lease_ttl_secs=5)
+    held = [await lim.try_acquire(M, t, Lane.RT) for t in ("a", "b", "b")]
+    leases = [lease for lease in held if lease is not None]
+    assert len(leases) == 3
+    executes = 0
+    original = Pipeline.execute
+
+    async def counting(pipe: Pipeline, raise_on_error: bool = True) -> Any:
+        nonlocal executes
+        executes += 1
+        return await original(pipe, raise_on_error)
+
+    monkeypatch.setattr(Pipeline, "execute", counting)
+    states = await lim.states(M, ["a", "b", "c"])
+    assert [(s.limit, s.inflight) for s in states] == [(4, 1), (4, 2), (None, 0)]
+    renewed = await lim.renew(leases)
+    assert executes == 2
+    assert [r.token for r in renewed] == [lease.token for lease in leases]
+    assert all(r.expires_at >= lease.expires_at for r, lease in zip(renewed, leases, strict=True))
+    monkeypatch.undo()
+    assert [await lim.state(M, t) for t in ("a", "b", "c")] == states
+
+
+async def test_run_many_reloads_an_unknown_script(valkey: redis.asyncio.Redis) -> None:
+    """A NOSCRIPT reply (server restarted or flushed) re-runs that script alone, loading it."""
+    script = valkey.register_script("return ARGV[1]")
+    script.sha = "0" * 40
+    known = valkey.register_script("return 'k'")
+    await known([], [])
+    assert await _lua.run_many(valkey, [(known, [], []), (script, [], ["x"])]) == [b"k", b"x"]

@@ -8,6 +8,7 @@ Resolution order per provider name: `QueueConfig.providers` (`"pkg.mod:Class"`),
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable, Mapping
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,8 @@ from taskiq_llm_queue.protocols import Provider
 from taskiq_llm_queue.providers.hosts import denied_pattern
 
 if TYPE_CHECKING:
+    from aiobotocore.session import AioSession
+
     from taskiq_llm_queue.config import QueueConfig
 
 ENTRY_POINT_GROUP = "taskiq_llm_queue.providers"
@@ -60,7 +63,8 @@ class ProviderRegistry:
     """Builds and caches one `Provider` per name for a `QueueConfig`, enforcing policy.
 
     Used by workers to find the provider for a model alias; `aclose()` closes them all.
-    `factories` injects ready factories (e.g. a Bedrock provider with a shared session).
+    `factories` injects ready factories. `aws_session` (set by `LLMQueue.start`) goes to every
+    factory with a `session` keyword, so AWS providers share one credential chain.
     """
 
     def __init__(
@@ -72,6 +76,7 @@ class ProviderRegistry:
     ) -> None:
         """Validate every provider the config needs and resolve its factory; collect errors."""
         self._config = config
+        self.aws_session: AioSession | None = None
         self._providers: dict[str, Provider] = {}
         self._factories: dict[str, ProviderFactory] = {}
         injected = dict(factories or {})
@@ -113,7 +118,10 @@ class ProviderRegistry:
         if factory is None:
             raise ConfigError(f"provider {name!r} is not configured or not allowed")
         try:
-            provider = factory(self._config)
+            if self.aws_session is not None and _takes_session(factory):
+                provider = factory(self._config, session=self.aws_session)  # type: ignore[call-arg]  # checked by _takes_session
+            else:
+                provider = factory(self._config)
         except ConfigError:
             raise
         except Exception as exc:  # name the provider: a bare TypeError from a plugin is opaque
@@ -136,6 +144,16 @@ class ProviderRegistry:
             close = getattr(provider, "aclose", None)
             if callable(close):
                 await close()
+
+
+def _takes_session(factory: ProviderFactory) -> bool:
+    """True when the factory names a `session` keyword (e.g. `BedrockProvider.from_config`)."""
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):  # callables without a signature
+        return False
+    param = parameters.get("session")
+    return param is not None and param.kind in (param.KEYWORD_ONLY, param.POSITIONAL_OR_KEYWORD)
 
 
 def _host_errors(config: QueueConfig) -> list[str]:

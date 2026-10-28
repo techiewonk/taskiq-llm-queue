@@ -32,12 +32,13 @@ async def main() -> None:
     try:
         with request_context(lane="rt", session_id="s-2"):
             # 1. Client API: any chat-completions body; the alias picks the real model id.
-            body = await llmq.chat(
+            result = await llmq.chat(
                 "llama",
                 {"messages": [{"role": "user", "content": "Say hi in five words."}]},
             )
-            print("chat()           :", body["choices"][0]["message"]["content"][:60])
-            print("  model / usage  :", body["model"], body["usage"])
+            print("chat()           :", result.response["choices"][0]["message"]["content"][:60])
+            print("  model / usage  :", result.response["model"], result.response["usage"])
+            print("  served by      :", result.meta.served_model, result.meta.served_target)
 
             # 2. LangChain: unchanged ChatOpenAI code, only the class differs.
             model = QueuedChatOpenAI(llmq=llmq, model="llama-3.1-70b", model_alias="llama")

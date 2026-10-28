@@ -7,12 +7,55 @@ reply are truncated to integers.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+from redis.exceptions import NoScriptError
+
+if TYPE_CHECKING:
+    from redis.commands.core import AsyncScript
+
+ScriptCall = tuple["AsyncScript", Sequence[Any], Sequence[Any]]
 
 
 def as_text(value: Any) -> str:
     """Decode a Redis reply item; the package's own pool runs without `decode_responses`."""
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def queue_script(pipe: Any, script: AsyncScript, keys: Sequence[Any], args: Sequence[Any]) -> None:
+    """Queue a registered script on a pipeline as a raw `EVALSHA`.
+
+    `script(..., client=pipe)` would register it on the pipeline, and redis-py then spends an
+    extra `SCRIPT EXISTS` round trip on every `execute`; `settle` handles a `NOSCRIPT` reply.
+    """
+    pipe.evalsha(script.sha, len(keys), *keys, *args)
+
+
+async def settle(reply: Any, script: AsyncScript, keys: Sequence[Any], args: Sequence[Any]) -> Any:
+    """Reply of a queued script: re-run it alone on `NOSCRIPT` (it did not run), raise errors."""
+    if isinstance(reply, NoScriptError):
+        return await script(list(keys), list(args))
+    if isinstance(reply, Exception):
+        raise reply
+    return reply
+
+
+async def run_many(client: Any, calls: Sequence[ScriptCall]) -> list[Any]:
+    """Run several scripts in one non-transactional pipeline: one round trip, not one each.
+
+    Works on cluster clients too (the pipeline groups commands by node); replies keep order.
+    """
+    if not calls:
+        return []
+    async with client.pipeline(transaction=False) as pipe:
+        for script, keys, args in calls:
+            queue_script(pipe, script, keys, args)
+        replies = await pipe.execute(raise_on_error=False)
+    return [
+        await settle(reply, script, keys, args)
+        for reply, (script, keys, args) in zip(replies, calls, strict=True)
+    ]
 
 
 _NOW = """

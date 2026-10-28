@@ -29,8 +29,8 @@ def legacy_sync_code(llmq: LLMQueue) -> None:
     result = llmq.converse_sync("gpt20b", HELLO, lane="rt")
     print("converse_sync :", result.meta.served_model, "worker =", result.meta.worker)
 
-    body = llmq.chat_sync("llama", {"messages": [{"role": "user", "content": "hi"}]})
-    print("chat_sync     :", body["choices"][0]["message"]["content"][:40])
+    chat = llmq.chat_sync("llama", {"messages": [{"role": "user", "content": "hi"}]})
+    print("chat_sync     :", chat.response["choices"][0]["message"]["content"][:40])
 
     vectors = llmq.embed_sync("cohere", ["a", "b", "c"], input_type="search_query")
     print("embed_sync    :", len(vectors), "vectors")

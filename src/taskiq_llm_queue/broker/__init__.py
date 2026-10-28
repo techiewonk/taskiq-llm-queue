@@ -19,6 +19,7 @@ from taskiq_llm_queue.broker.broker import (
     SQS_QUEUE_LABEL,
     SQS_RECEIPT_HANDLE_LABEL,
     SQS_RECEIVE_COUNT_LABEL,
+    DeliveryFormatter,
     HybridSQSBroker,
     ReceiveBudget,
 )
@@ -43,6 +44,7 @@ from taskiq_llm_queue.broker.s3_offload import (
     S3OffloadMiddleware,
 )
 from taskiq_llm_queue.broker.scheduler import SlotScheduler
+from taskiq_llm_queue.broker.serializer import WireSerializer
 
 __all__ = [
     "DEDUPLICATION_ID_LABEL",
@@ -61,6 +63,7 @@ __all__ = [
     "BrokerConfigError",
     "BrokerHooks",
     "Delivery",
+    "DeliveryFormatter",
     "ErrorFamily",
     "Heartbeat",
     "HybridSQSBroker",
@@ -75,6 +78,7 @@ __all__ = [
     "SQSSendError",
     "SlotScheduler",
     "VisibilityResult",
+    "WireSerializer",
     "backoff_delay",
     "classify_code",
     "classify_error",

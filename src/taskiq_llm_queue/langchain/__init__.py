@@ -12,7 +12,9 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 from taskiq_llm_queue.langchain._client import (
+    ChatResultLike,
     ConverseResultLike,
+    EmbedResultLike,
     QueueClient,
     get_default_queue,
     set_default_queue,
@@ -34,7 +36,9 @@ _LAZY = {
 }
 
 __all__ = [
+    "ChatResultLike",
     "ConverseResultLike",
+    "EmbedResultLike",
     "QueueClient",
     "QueuedBedrockEmbeddings",
     "QueuedChatBedrockConverse",

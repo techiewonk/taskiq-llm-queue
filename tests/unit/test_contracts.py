@@ -13,16 +13,17 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
+from redis.crc import key_slot
 
 import taskiq_llm_queue as llmq
 from taskiq_llm_queue import (
-    ENVELOPE_VERSION,
     ConfigError,
-    Envelope,
-    KeySpace,
     Lane,
+    LLMQueueCancelled,
     LLMQueueError,
     LLMQueueTimeout,
     ModelConfig,
@@ -32,10 +33,23 @@ from taskiq_llm_queue import (
     Target,
     UnsupportedEnvelopeError,
     current_context,
-    parse_envelope,
     request_context,
 )
-from taskiq_llm_queue.envelope import hashed_id, task_labels
+from taskiq_llm_queue.envelope import (
+    ENVELOPE_VERSION,
+    Envelope,
+    hashed_id,
+    parse_envelope,
+    task_labels,
+)
+from taskiq_llm_queue.keys import KeySpace
+from taskiq_llm_queue.protocols import ClaimState
+from taskiq_llm_queue.reliability import _lua
+from taskiq_llm_queue.reliability.breaker import CircuitBreaker
+from taskiq_llm_queue.reliability.claims import RedisClaimStore
+from taskiq_llm_queue.reliability.config_store import fallback_store
+from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, SyncAdaptiveLimiter
+from taskiq_llm_queue.routing import routing_store
 
 
 def _envelope(**overrides: object) -> Envelope:
@@ -63,6 +77,15 @@ def test_all_exports_resolve() -> None:
     assert missing == []
 
 
+def test_all_is_the_client_surface() -> None:
+    """Wire / plumbing names left __all__ but stay importable (from submodules and here)."""
+    for name in ("LLMQueue", "ConverseResult", "ChatResult", "InvokeResult", "EmbedResult"):
+        assert name in llmq.__all__
+    for name in ("Envelope", "KeySpace", "TASK_CALL", "ENVELOPE_VERSION", "Limiter", "LLMReply"):
+        assert name not in llmq.__all__
+        assert getattr(llmq, name) is not None
+
+
 def test_import_has_no_heavy_side_effects() -> None:
     """Importing the package loads no AWS/Redis clients and starts no threads (library rule)."""
     code = (
@@ -80,6 +103,7 @@ def test_error_tree_has_one_root() -> None:
     """Callers catch LLMQueueError for everything the package raises."""
     for exc_type in (
         LLMQueueTimeout,
+        LLMQueueCancelled,
         QueueUnavailable,
         ProviderError,
         ConfigError,
@@ -128,6 +152,7 @@ def test_labels_hash_ids_by_default() -> None:
     labels = task_labels(_envelope(reply_to="pod-a"))
     assert labels["session_id"] == hashed_id("s-1") != "s-1"
     assert labels["user_id"] == hashed_id("u-1")
+    assert task_labels(_envelope(), salt=b"other")["user_id"] != labels["user_id"]
     assert (labels["lane"], labels["model"], labels["reply_to"]) == ("bg", "gpt120b", "pod-a")
     assert task_labels(_envelope(), hash_ids=False)["user_id"] == "u-1"
 
@@ -211,11 +236,24 @@ def test_key_schema() -> None:
         ks.routing,
         ks.fallback,
         ks.audit,
+        ks.pods,
         ks.schema,
     ]
     assert all(k.startswith("llmq:prod:") for k in keys)
-    assert ks.job("a") == "llmq:prod:job:a"
+    assert ks.job("a") == "llmq:prod:{r:a}:job"
+    assert ks.limiter("m", "p") == "llmq:prod:{m:m:p}:ac"
+    assert ks.routing == "llmq:prod:{cfg}:routing"
+    assert ks.pods == "llmq:prod:pods"
     assert len(set(keys)) == len(keys)
+
+
+def test_hashed_id_is_keyed_blake2b_and_stable() -> None:
+    """Same salt → same 16-hex id on every pod; another salt → another id (not guessable)."""
+    assert hashed_id("u-1") == "60c492a1cb883215"  # pinned: a change re-buckets every user
+    assert len(hashed_id("u-1") or "") == 16
+    assert hashed_id("u-1", b"prod-salt") == hashed_id("u-1", "prod-salt")
+    assert hashed_id("u-1", b"prod-salt") != hashed_id("u-1")
+    assert hashed_id(None) is None
 
 
 # ---------------------------------------------------------------- context
@@ -257,3 +295,138 @@ def test_context_reaches_threads_only_with_copy_context() -> None:
             thread.start()
             thread.join()
     assert seen == {"plain": None, "copied": "s-9"}
+
+
+# ---------------------------------------------------------------- cluster slots
+
+
+class _Recorder:
+    """Stands in for a registered Lua script: records each call's keys, returns a canned reply."""
+
+    def __init__(self, calls: list[tuple[str, list[str]]], name: str, reply: object) -> None:
+        self._calls, self._name, self._reply = calls, name, reply
+        self.sha = name
+
+    def _record(self, keys: Sequence[str] | None) -> object:
+        self._calls.append((self._name, list(keys or [])))
+        return self._reply
+
+    def __call__(self, keys: Sequence[str] | None = None, args: object = None) -> object:
+        return self._record(keys)
+
+
+class _AsyncRecorder(_Recorder):
+    async def __call__(self, keys: Sequence[str] | None = None, args: object = None) -> object:
+        return self._record(keys)
+
+
+def _script_names() -> dict[str, str]:
+    """Every public Lua script in `_lua`, by source text (what `register_script` receives)."""
+    return {
+        value: name
+        for name, value in vars(_lua).items()
+        if name.isupper()
+        and not name.startswith("_")
+        and isinstance(value, str)
+        and "KEYS" in value
+    }
+
+
+_REPLIES: dict[str, object] = {
+    "LIMITER_ACQUIRE": [1, 1, 10, b"123.0"],
+    "LIMITER_RELEASE": [10, 1, b"0"],
+    "LIMITER_PEEK": [10, 0, b"0"],
+    "LEASE_RENEW": [b"123.0", 1],
+    "BREAKER": [b"closed", 1],
+    "CLAIM": b"run",
+    "CLAIM_HEARTBEAT": [],
+    "CLAIM_COMPLETE": 1,
+    "CLAIM_RELEASE": 1,
+    "CONFIG_SET": b"",
+}
+
+
+class _Pipeline:
+    """Records `EVALSHA` calls queued by `_lua.run_many` (sha = script name here)."""
+
+    def __init__(self, calls: list[tuple[str, list[str]]]) -> None:
+        self._calls = calls
+        self._replies: list[object] = []
+
+    async def __aenter__(self) -> _Pipeline:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> None:
+        self._calls.append((sha, [str(k) for k in keys_and_args[:numkeys]]))
+        self._replies.append(_REPLIES[sha])
+
+    async def execute(self, raise_on_error: bool = True) -> list[object]:
+        return self._replies
+
+
+class _ScriptClient:
+    """Fake Redis client: `register_script` hands out recorders (async or sync)."""
+
+    def __init__(self, calls: list[tuple[str, list[str]]], *, sync: bool = False) -> None:
+        self.calls, self._sync, self._names = calls, sync, _script_names()
+
+    def register_script(self, source: str) -> _Recorder:
+        name = self._names[source]
+        kind = _Recorder if self._sync else _AsyncRecorder
+        return kind(self.calls, name, _REPLIES[name])
+
+    def pipeline(self, transaction: bool = True) -> _Pipeline:
+        return _Pipeline(self.calls)
+
+
+def _slots(keys: Sequence[str]) -> set[int]:
+    return {key_slot(key.encode()) for key in keys}
+
+
+async def test_every_lua_call_site_uses_one_cluster_slot() -> None:
+    """Each script call's keys share one hash slot, as cluster-mode Valkey requires."""
+    calls: list[tuple[str, list[str]]] = []
+    client: Any = _ScriptClient(calls)
+    keys = KeySpace("llmq:prod")
+    limiter = AdaptiveLimiter(client, keys)
+    lease = await limiter.try_acquire("gpt120b", "apac", Lane.RT)
+    assert lease is not None
+    await limiter.release(lease, throttled=True)
+    await limiter.state("gpt120b", "apac")
+    await limiter.renew([lease])
+    sync_limiter = SyncAdaptiveLimiter(_ScriptClient(calls, sync=True), keys)  # type: ignore[arg-type]  # fake client
+    sync_lease = sync_limiter.acquire("gpt120b", "primary", Lane.BG, 1.0)
+    assert sync_lease is not None
+    sync_limiter.release(sync_lease, throttled=False)
+    breaker = CircuitBreaker(client, keys)
+    await breaker.allow("gpt120b", "apac")
+    claims = RedisClaimStore(client, keys)
+    await claims.claim("llm-1", deadline_at=time.time() + 60, worker="pod-a")
+    await claims.heartbeat_owned(["llm-1"], worker="pod-a")
+    await claims.complete_owned("llm-1", ClaimState.DONE, worker="pod-a")
+    await claims.release_owned("llm-1", worker="pod-a")
+    for store in (routing_store(client, keys), fallback_store(client, keys)):
+        await store.reset(actor="t")
+
+    assert {name for name, _ in calls} == set(_script_names().values())  # every script ran
+    for name, call_keys in calls:
+        assert len(_slots(call_keys)) == 1, (name, call_keys)
+
+
+async def test_claim_heartbeat_batch_uses_one_slot() -> None:
+    calls: list[tuple[str, list[str]]] = []
+    claims = RedisClaimStore(_ScriptClient(calls), KeySpace("llmq:prod"))  # type: ignore[arg-type]  # fake client
+    await claims.heartbeat_owned(["llm-1", "llm-2", "llm-3"], worker="pod-a")
+    assert all(len(_slots(keys)) == 1 for _, keys in calls)
+
+
+def test_tagged_keys_share_slots_by_design() -> None:
+    """Per-request and per-target keys group; different requests / targets spread out."""
+    ks = KeySpace("llmq:prod")
+    assert len(_slots([ks.job("a"), ks.cancel("a"), ks.params("a"), ks.result("a")])) == 1
+    assert len(_slots([ks.limiter("m", "t"), ks.leases("m", "t"), ks.breaker("m", "t")])) == 1
+    assert len(_slots([ks.routing, ks.fallback, ks.audit])) == 1
+    assert len(_slots([ks.job(f"r-{i}") for i in range(20)])) > 1

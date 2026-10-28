@@ -32,7 +32,7 @@ class LiveConfigStore(Generic[ModelT]):  # PEP 695 needs 3.12; package supports 
     """One live config value of type `model_type` at `key`, with audit trail and reload loop.
 
     `current` is the last good value (the startup default until a load succeeds); hot paths read
-    it without I/O, and `run_reload` refreshes it every `interval_secs` (`LLMQ_CFG_RELOAD_S`).
+    it without I/O, and `run_reload` refreshes it every `interval_secs` (`LLMQ_CFG_RELOAD_SECS`).
     """
 
     def __init__(

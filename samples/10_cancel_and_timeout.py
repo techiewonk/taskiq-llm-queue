@@ -43,16 +43,16 @@ async def timeouts(llmq: LLMQueue) -> None:
     """Parts 2-4: per-call timeout, absolute deadline, and asyncio cancellation."""
     t0 = time.monotonic()
     try:
-        await llmq.converse("gpt120b", HELLO, timeout=0.5)
+        await llmq.converse("gpt120b", HELLO, timeout_secs=0.5)
     except LLMQueueTimeout as exc:
         secs = time.monotonic() - t0
-        print(f"2. timeout=0.5          -> LLMQueueTimeout after {secs:.1f}s: {exc}")
+        print(f"2. timeout_secs=0.5     -> LLMQueueTimeout after {secs:.1f}s: {exc}")
 
     t0 = time.monotonic()
     try:
-        await llmq.converse("gpt120b", HELLO, deadline=time.time() + 0.5)
+        await llmq.converse("gpt120b", HELLO, deadline_at=time.time() + 0.5)
     except LLMQueueTimeout:
-        print(f"3. deadline=now+0.5     -> LLMQueueTimeout after {time.monotonic() - t0:.1f}s")
+        print(f"3. deadline_at=now+0.5  -> LLMQueueTimeout after {time.monotonic() - t0:.1f}s")
 
     task = asyncio.create_task(llmq.converse("gpt120b", HELLO))
     await asyncio.sleep(0.5)

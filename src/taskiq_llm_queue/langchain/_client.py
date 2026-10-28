@@ -26,6 +26,26 @@ class ConverseResultLike(Protocol):
     def meta(self) -> CallMeta: ...
 
 
+class ChatResultLike(Protocol):
+    """What `chat` returns: the OpenAI-compatible completion body and how it was served."""
+
+    @property
+    def response(self) -> dict[str, Any]: ...
+
+    @property
+    def meta(self) -> CallMeta: ...
+
+
+class EmbedResultLike(Protocol):
+    """What `embed` returns: one vector per text, in input order, and how they were served."""
+
+    @property
+    def vectors(self) -> list[list[float]]: ...
+
+    @property
+    def meta(self) -> CallMeta: ...
+
+
 @runtime_checkable
 class QueueClient(Protocol):
     """The subset of `LLMQueue` the LangChain adapters and the HTTP transport use.
@@ -41,8 +61,9 @@ class QueueClient(Protocol):
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API (D87)
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
     ) -> ConverseResultLike: ...
 
     def converse_sync(
@@ -52,8 +73,9 @@ class QueueClient(Protocol):
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
     ) -> ConverseResultLike: ...
 
     async def embed(
@@ -63,8 +85,10 @@ class QueueClient(Protocol):
         *,
         lane: Lane | str | None = None,
         input_type: str | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API (D87)
-    ) -> list[list[float]]: ...
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> EmbedResultLike: ...
 
     def embed_sync(
         self,
@@ -73,8 +97,10 @@ class QueueClient(Protocol):
         *,
         lane: Lane | str | None = None,
         input_type: str | None = None,
-        timeout: float | None = None,
-    ) -> list[list[float]]: ...
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> EmbedResultLike: ...
 
     async def chat(
         self,
@@ -83,9 +109,10 @@ class QueueClient(Protocol):
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API (D87)
-        deadline: float | None = None,
-    ) -> dict[str, Any]: ...
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> ChatResultLike: ...
 
 
 _default_queue: QueueClient | None = None

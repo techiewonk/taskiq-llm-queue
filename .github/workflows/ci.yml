@@ -40,6 +40,20 @@ jobs:
       - run: uv sync --all-extras --resolution lowest-direct
       - run: uv run pytest tests/unit -q
 
+  langchain-1x:
+    # The dev lock pins the LangChain 0.3 line; the extras also allow 1.x, so test the adapters there.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --locked
+      - run: >-
+          uv pip install "langchain-core>=1,<2" "langchain-aws>=1,<2"
+          "langchain-openai>=1,<2" "langgraph>=1" "openai>=2,<4"
+      - run: uv run --no-sync pytest tests/unit/lc -q
+
   integration:
     # Valkey 8.1, ElasticMQ 1.7.1 and fakellm from docker/compose.yaml (same stack as local).
     runs-on: ubuntu-latest

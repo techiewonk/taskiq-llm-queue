@@ -13,11 +13,11 @@ import random
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Literal
 
-import xxhash
 from pydantic import BaseModel, ConfigDict, Field
 
 from taskiq_llm_queue._logging import get_logger
-from taskiq_llm_queue.config import Lane
+from taskiq_llm_queue.config import DEFAULT_ID_HASH_SALT, Lane
+from taskiq_llm_queue.envelope import keyed_digest
 from taskiq_llm_queue.metrics_names import CONFIG_INVALID_TOTAL
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore
 
@@ -67,9 +67,9 @@ class RoutingConfig(BaseModel):
         return self.model_copy(update={"allow_users": users})
 
 
-def bucket(key: str) -> int:
-    """Stable bucket 0-99 for a session or user id; equal on every pod and every restart."""
-    return xxhash.xxh3_64_intdigest(key.encode("utf-8")) % 100
+def bucket(key: str, salt: str | bytes = DEFAULT_ID_HASH_SALT) -> int:
+    """Stable bucket 0-99 for a session or user id; equal on every pod sharing `salt`."""
+    return int.from_bytes(keyed_digest(key, salt), "big") % 100
 
 
 def routing_store(
@@ -95,9 +95,14 @@ class CanaryRouter:
         metrics: MetricsSink | None = None,
         reload_secs: float = DEFAULT_RELOAD_SECS,
         rand: Callable[[], float] = random.random,
+        salt: str | bytes = DEFAULT_ID_HASH_SALT,
     ) -> None:
-        """Keep the store and metrics sink; `rand` buckets calls that carry no id at all."""
+        """Keep the store and metrics sink; `rand` buckets calls that carry no id at all.
+
+        `salt` keys the sticky bucket hash (`QueueConfig.id_hash_salt`); all pods must share it.
+        """
         self.store = store
+        self._salt = salt
         self._metrics = metrics
         self._reload_secs = reload_secs
         self._rand = rand
@@ -125,7 +130,7 @@ class CanaryRouter:
             return "sqs"
         key = session_id or user_id
         # No id at all: not sticky, but still honours the percentage on average.
-        point = bucket(key) if key else int(self._rand() * 100)
+        point = bucket(key, self._salt) if key else int(self._rand() * 100)
         return "sqs" if point < pct else "direct"
 
     async def reload(self) -> RoutingConfig:

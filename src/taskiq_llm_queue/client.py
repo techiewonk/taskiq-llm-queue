@@ -13,13 +13,12 @@ import contextlib
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import orjson
-from redis.asyncio import BlockingConnectionPool, Redis
-from redis.asyncio.connection import Connection, SSLConnection
+from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from taskiq.exceptions import SendTaskError
 
@@ -27,7 +26,7 @@ from taskiq_llm_queue import metrics_names as mn
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
 from taskiq_llm_queue.broker.events import BrokerHooks
-from taskiq_llm_queue.config import Lane
+from taskiq_llm_queue.config import Lane, create_redis, create_sync_redis
 from taskiq_llm_queue.context import current_context
 from taskiq_llm_queue.core import CoreDeps, InfraError, JobResult, execute_job
 from taskiq_llm_queue.envelope import (
@@ -41,6 +40,7 @@ from taskiq_llm_queue.envelope import (
 )
 from taskiq_llm_queue.errors import (
     ConfigError,
+    LLMQueueCancelled,
     LLMQueueError,
     LLMQueueTimeout,
     ProviderError,
@@ -85,6 +85,7 @@ from taskiq_llm_queue.tasks import JOB_VERSION, JobFunction, WorkerResultBackend
 
 if TYPE_CHECKING:
     import redis
+    from aiobotocore.session import AioSession
 
     from taskiq_llm_queue.config import QueueConfig
     from taskiq_llm_queue.envelope import FallbackPolicy, Op
@@ -106,6 +107,57 @@ class ConverseResult:
 
     response: dict[str, Any]
     meta: CallMeta
+
+
+@dataclass(frozen=True, slots=True)
+class ChatResult:
+    """`chat` result: the OpenAI-compatible chat completion body and how it was served."""
+
+    response: dict[str, Any]
+    meta: CallMeta
+
+
+@dataclass(frozen=True, slots=True)
+class InvokeResult:
+    """`invoke_model` result: the raw model body, its content type and how it was served.
+
+    `response` gives the InvokeModel-style `{"body": bytes, "contentType": str}`; `json()`
+    parses a JSON body.
+    """
+
+    body: bytes
+    content_type: str
+    meta: CallMeta
+
+    @property
+    def response(self) -> dict[str, Any]:
+        """`{"body": bytes, "contentType": str}`, as boto3's InvokeModel reply has them."""
+        return {"body": self.body, "contentType": self.content_type}
+
+    def json(self) -> Any:
+        """The body parsed as JSON (embedding and most text models reply in JSON)."""
+        return orjson.loads(self.body)
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedResult:
+    """`embed` result: one vector per input text, in input order, and how they were served.
+
+    It also behaves as the list of vectors (`len`, iteration, indexing). With several provider
+    batches, `meta` merges them: first batch's model/target, summed attempts, slowest waits.
+    """
+
+    vectors: list[list[float]]
+    meta: CallMeta
+
+    def __len__(self) -> int:
+        return len(self.vectors)
+
+    def __iter__(self) -> Iterator[list[float]]:
+        return iter(self.vectors)
+
+    def __getitem__(self, index: int) -> list[float]:
+        return self.vectors[index]
 
 
 @dataclass(slots=True)
@@ -134,8 +186,8 @@ class LLMQueue:
     `router` picks `sqs` or `direct` per call; without one, `routing_enabled` builds a
     `CanaryRouter` on the live routing config, else `sqs` when the model has queues. `failover`
     defaults to a `FailoverState` from the config. `hooks` defaults to `MetricsHooks(metrics)`
-    (if it is also a `BrokerHooks`, the brokers report to it too). `provider_factories` and
-    `redis` are injection points for tests and custom wiring.
+    (if it is also a `BrokerHooks`, the brokers report to it too). `provider_factories`,
+    `redis` and `aws_session` are injection points for tests and custom wiring.
     """
 
     def __init__(
@@ -149,6 +201,7 @@ class LLMQueue:
         metrics: MetricsSink | None = None,
         provider_factories: Mapping[str, ProviderFactory] | None = None,
         redis: Redis | None = None,
+        aws_session: AioSession | None = None,
     ) -> None:
         """Validate providers (boot-time `ConfigError`); no I/O until `start()`."""
         self.config = config
@@ -169,8 +222,11 @@ class LLMQueue:
         self._factories = dict(provider_factories or {})
         self.registry = ProviderRegistry(config, factories=self._factories)
         self._injected_redis = redis
+        self._injected_session = aws_session
+        self.aws_session: AioSession | None = aws_session
         self._state: _Started | None = None
         self._direct_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._embed_groups: dict[str, list[str]] = {}  # embed request id -> batch request ids
         # DS17 claims held as `direct:<pod>` (request id -> holders) and every in-flight lease
         # of this pod (worker, direct and sync paths): both kept alive by the pod heartbeat.
         self._direct_claims: dict[str, int] = {}
@@ -227,7 +283,10 @@ class LLMQueue:
             raise ConfigError(f"mode must be send, work or both, got {mode!r}")
         config = self.config
         owns = self._injected_redis is None
-        client = self._injected_redis or _redis_client(config)
+        client = self._injected_redis or create_redis(config, client_name=self._redis_name())
+        # One AWS session (credential chain, IRSA refresh) for every provider of this pod.
+        self.aws_session = self._injected_session or _new_aws_session()
+        self.registry.aws_session = self.aws_session
         results = LLMQResultBackend.from_config(config, redis=client)
         limiter = AdaptiveLimiter(client, self.keys, limiter_settings(config))
         claims = RedisClaimStore(client, self.keys, claim_settings(config))
@@ -268,6 +327,7 @@ class LLMQueue:
             WorkerResultBackend(results),
             failover=self.failover,
             hooks=broker_hooks,
+            session=self.aws_session,
         )
         started: list[Any] = []
         try:
@@ -284,7 +344,7 @@ class LLMQueue:
             raise
         workers = Workers(brokers, runtime) if mode in ("work", "both") else None
         interval = claims.settings.heartbeat_interval_secs
-        pods = PodRegistry(client, f"{self.keys.prefix}:pods", self.pod_id, ttl_secs=3 * interval)
+        pods = PodRegistry(client, self.keys.pods, self.pod_id, ttl_secs=3 * interval)
         state = _Started(
             mode,
             client,
@@ -312,6 +372,7 @@ class LLMQueue:
                 routing_store(client, self.keys, default),
                 metrics=self.metrics,
                 reload_secs=config.cfg_reload_secs,
+                salt=config.id_hash_key,
             )
             await self._own_router.reload()
             self._own_router.start()
@@ -350,10 +411,12 @@ class LLMQueue:
         """Ordered shutdown (§7.4): pause → drain running tasks → hand back leftovers → close.
 
         `drain_secs` defaults to `config.drain_secs`. Waiting callers on this pod are failed
-        with `QueueUnavailable`. Idempotent.
+        with `QueueUnavailable`. Also closes the sync runner (even if `start()` never ran, e.g.
+        when only `*_sync` calls were made). Idempotent.
         """
         state, self._state = self._state, None
         if state is None:
+            await asyncio.to_thread(self.close_sync)
             return
         _set_default_queue(None, only=self)
         drain = self.config.drain_secs if drain_secs is None else drain_secs
@@ -385,7 +448,15 @@ class LLMQueue:
             with contextlib.suppress(Exception):
                 await state.redis.aclose()
                 await state.redis.connection_pool.disconnect()
-        runner, self._sync = self._sync, None
+        await asyncio.to_thread(self.close_sync)
+
+    def close_sync(self) -> None:
+        """Close the sync runner (thread, loop, providers, blocking Valkey client); idempotent.
+
+        For sync-only apps that never call `start()`/`stop()`; a later sync call starts a new one.
+        """
+        with self._sync_lock:
+            runner, self._sync = self._sync, None
         if runner is not None:
             runner.close()
 
@@ -409,36 +480,42 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
         request_id: str | None = None,
     ) -> ConverseResult:
-        """Bedrock Converse through the queue; `response` is the exact Converse dict."""
+        """Bedrock Converse through the queue; `response` is the exact Converse dict.
+
+        `timeout_secs` (relative) defaults to the lane timeout; `deadline_at` (epoch seconds)
+        caps it. Raises `LLMQueueTimeout`, `LLMQueueCancelled` or `ProviderError`.
+        """
         reply = await self._call(
-            "converse", model, request, lane, fallback, timeout, deadline, request_id
+            "converse", model, request, lane, fallback, timeout_secs, deadline_at, request_id
         )
         return ConverseResult(reply.response or {}, reply.meta)
 
     async def invoke_model(
         self,
         model: str,
-        request: dict[str, Any],
+        body: Mapping[str, Any] | list[Any] | str | bytes,
         *,
+        content_type: str = "application/json",
+        accept: str = "application/json",
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
         request_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Bedrock InvokeModel; `request` is the model body (or full kwargs with `body`).
+    ) -> InvokeResult:
+        """Bedrock InvokeModel with the model-native `body` (JSON value, or UTF-8 text/bytes).
 
-        Returns `{"body": bytes, "contentType": str}`.
+        Returns the raw reply body (`InvokeResult.body`, `.json()`) and how it was served.
         """
-        params = request if "body" in request else {"body": request}
+        params = {"body": _invoke_body(body), "contentType": content_type, "accept": accept}
         reply = await self._call(
-            "invoke_model", model, params, lane, fallback, timeout, deadline, request_id
+            "invoke_model", model, params, lane, fallback, timeout_secs, deadline_at, request_id
         )
-        return decode_invoke(reply.response or {})
+        return _invoke_result(reply)
 
     async def chat(
         self,
@@ -447,15 +524,15 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
         request_id: str | None = None,
-    ) -> dict[str, Any]:
-        """OpenAI-compatible chat completion; returns the completion body as a dict."""
+    ) -> ChatResult:
+        """OpenAI-compatible chat completion; `response` is the completion body as a dict."""
         reply = await self._call(
-            "chat", model, request, lane, fallback, timeout, deadline, request_id
+            "chat", model, request, lane, fallback, timeout_secs, deadline_at, request_id
         )
-        return reply.response or {}
+        return ChatResult(reply.response or {}, reply.meta)
 
     async def embed(
         self,
@@ -464,35 +541,55 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         input_type: str | None = None,
-        timeout: float | None = None,  # noqa: ASYNC109  # frozen client API
-        deadline: float | None = None,
-    ) -> list[list[float]]:
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> EmbedResult:
         """Embed `texts` as one task per provider batch (Titan 1, Cohere 96, OpenAI 2048).
 
-        Embeddings never switch model; vectors come back in input order.
+        Embeddings never switch model; vectors come back in input order. With several batches
+        each task gets `<request_id>-<n>`; `cancel(request_id)` cancels all of them.
         """
         if not texts:
-            return []
+            return EmbedResult([], CallMeta())
         plan = self._embed_plan(model, texts, input_type)
-        replies = await asyncio.gather(
-            *(
-                self._call(
-                    op, model, params, lane, "same_model", timeout, deadline, None, embed=True
+        rid = request_id or _new_request_id()
+        ids = _batch_ids(rid, len(plan))
+        parent = rid if len(plan) > 1 else None
+        self._embed_groups[rid] = ids
+        try:
+            replies = await asyncio.gather(
+                *(
+                    self._call(
+                        op,
+                        model,
+                        params,
+                        lane,
+                        "same_model",
+                        timeout_secs,
+                        deadline_at,
+                        batch_id,
+                        embed=True,
+                        parent_request_id=parent,
+                    )
+                    for (op, params), batch_id in zip(plan, ids, strict=True)
                 )
-                for op, params in plan
             )
-        )
-        return [
-            v for (op, _), reply in zip(plan, replies, strict=True) for v in _vectors(op, reply)
-        ]
+        finally:
+            self._embed_groups.pop(rid, None)
+        return _embed_result(plan, replies)
 
     async def cancel(self, request_id: str) -> None:
-        """Cancel a call: set the shared cancel flag (DS14) and stop a local `direct` run."""
-        task = self._direct_tasks.get(request_id)
-        if task is not None and not task.done():
-            task.cancel()
-        if self._state is not None:
-            await self._state.claims.cancel(request_id)
+        """Cancel a call, or every batch of an `embed`; its caller gets `LLMQueueCancelled`.
+
+        Sets the shared cancel flag (DS14) and stops a local `direct` run.
+        """
+        for rid in self._embed_groups.get(request_id) or [request_id]:
+            task = self._direct_tasks.get(rid)
+            if task is not None and not task.done():
+                task.cancel()
+            if self._state is not None:
+                await self._state.claims.cancel(rid)
 
     # ------------------------------------------------------------------ jobs
 
@@ -506,20 +603,29 @@ class LLMQueue:
         payload: dict[str, Any],
         *,
         job_id: str | None = None,
-        deadline_secs: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
     ) -> str:
-        """Send one job to `config.job_queues[name]`; returns its job id (not awaited)."""
+        """Send one job to `config.job_queues[name]`; returns its job id (not awaited).
+
+        The job must finish within `timeout_secs` (default `state_ttl_secs`), capped by
+        `deadline_at` (epoch seconds).
+        """
         state = self._require_started()
         queue = self.config.job_queues.get(name)
         if queue is None or state.brokers.jobs is None:
             raise ConfigError(f"no job queue configured for {name!r}")
         job_id = job_id or f"job-{uuid.uuid4().hex}"
+        now = time.time()
+        deadline = now + (timeout_secs if timeout_secs is not None else self.config.state_ttl_secs)
+        if deadline_at is not None:
+            deadline = min(deadline, deadline_at)
         body: dict[str, Any] = {
             "v": JOB_VERSION,
             "request_id": job_id,
             "job": name,
             "payload": payload,
-            "deadline_at": time.time() + (deadline_secs or self.config.state_ttl_secs),
+            "deadline_at": max(deadline, now),
         }
         task = state.brokers.jobs.find_task(TASK_JOB)
         assert task is not None
@@ -535,11 +641,14 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,
-        deadline: float | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
     ) -> ConverseResult:
         """Blocking `converse`: runs `direct` under the shared limiter (sync fallback)."""
-        reply = self._run_sync(model, "converse", request, lane, fallback, timeout, deadline)
+        reply = self._run_sync(
+            model, "converse", request, lane, fallback, timeout_secs, deadline_at, request_id
+        )
         return ConverseResult(reply.response or {}, reply.meta)
 
     def chat_sync(
@@ -549,12 +658,35 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         fallback: FallbackPolicy | None = None,
-        timeout: float | None = None,
-        deadline: float | None = None,
-    ) -> dict[str, Any]:
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> ChatResult:
         """Blocking `chat`: runs `direct` under the shared limiter (sync fallback)."""
-        reply = self._run_sync(model, "chat", request, lane, fallback, timeout, deadline)
-        return reply.response or {}
+        reply = self._run_sync(
+            model, "chat", request, lane, fallback, timeout_secs, deadline_at, request_id
+        )
+        return ChatResult(reply.response or {}, reply.meta)
+
+    def invoke_model_sync(
+        self,
+        model: str,
+        body: Mapping[str, Any] | list[Any] | str | bytes,
+        *,
+        content_type: str = "application/json",
+        accept: str = "application/json",
+        lane: Lane | str | None = None,
+        fallback: FallbackPolicy | None = None,
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> InvokeResult:
+        """Blocking `invoke_model`: runs `direct` under the shared limiter (sync fallback)."""
+        params = {"body": _invoke_body(body), "contentType": content_type, "accept": accept}
+        reply = self._run_sync(
+            model, "invoke_model", params, lane, fallback, timeout_secs, deadline_at, request_id
+        )
+        return _invoke_result(reply)
 
     def embed_sync(
         self,
@@ -563,17 +695,22 @@ class LLMQueue:
         *,
         lane: Lane | str | None = None,
         input_type: str | None = None,
-        timeout: float | None = None,
-        deadline: float | None = None,
-    ) -> list[list[float]]:
+        timeout_secs: float | None = None,
+        deadline_at: float | None = None,
+        request_id: str | None = None,
+    ) -> EmbedResult:
         """Blocking `embed`: one `direct` call per provider batch under the shared limiter."""
         if not texts:
-            return []
-        out: list[list[float]] = []
-        for op, params in self._embed_plan(model, texts, input_type):
-            reply = self._run_sync(model, op, params, lane, "same_model", timeout, deadline, True)
-            out.extend(_vectors(op, reply))
-        return out
+            return EmbedResult([], CallMeta())
+        plan = self._embed_plan(model, texts, input_type)
+        ids = _batch_ids(request_id or _new_request_id(), len(plan))
+        replies = [
+            self._run_sync(
+                model, op, params, lane, "same_model", timeout_secs, deadline_at, rid, embed=True
+            )
+            for (op, params), rid in zip(plan, ids, strict=True)
+        ]
+        return _embed_result(plan, replies)
 
     # ------------------------------------------------------------------ internals
 
@@ -610,11 +747,12 @@ class LLMQueue:
         params: dict[str, Any],
         lane: Lane | str | None,
         fallback: FallbackPolicy | None,
-        timeout: float | None,
-        deadline: float | None,
+        timeout_secs: float | None,
+        deadline_at: float | None,
         request_id: str | None,
         *,
         embed: bool = False,
+        parent_request_id: str | None = None,
     ) -> Envelope:
         """Build the envelope from `request_context` (lane, session, user) and lane timeouts."""
         self.config.resolve(model)  # unknown alias / target → ConfigError before anything runs
@@ -622,11 +760,12 @@ class LLMQueue:
         call_lane = Lane(lane) if lane is not None else ctx.lane
         waits = self.config.embed_timeout_secs if embed else self.config.timeout_secs
         now = time.time()
-        deadline_at = now + (timeout if timeout is not None else waits[call_lane])
-        if deadline is not None:
-            deadline_at = min(deadline_at, deadline)
+        deadline = now + (timeout_secs if timeout_secs is not None else waits[call_lane])
+        if deadline_at is not None:
+            deadline = min(deadline, deadline_at)
         return Envelope(
-            request_id=request_id or f"llm-{uuid.uuid4().hex}",
+            request_id=request_id or _new_request_id(),
+            parent_request_id=parent_request_id,
             session_id=ctx.session_id,
             user_id=ctx.user_id,
             reply_to=self.pod_id,
@@ -636,7 +775,7 @@ class LLMQueue:
             model=model,
             params=params,
             enqueued_at=now,
-            deadline_at=max(deadline_at, now),
+            deadline_at=max(deadline, now),
         )
 
     def _route(self, alias: str, envelope: Envelope) -> CallPath:
@@ -659,15 +798,25 @@ class LLMQueue:
         params: dict[str, Any],
         lane: Lane | str | None,
         fallback: FallbackPolicy | None,
-        timeout: float | None,  # noqa: ASYNC109  # timeout is a queue wait, not an asyncio timeout
-        deadline: float | None,
+        timeout_secs: float | None,
+        deadline_at: float | None,
         request_id: str | None,
         *,
         embed: bool = False,
+        parent_request_id: str | None = None,
     ) -> LLMReply:
         """Build, route and run one call; raises the mapped error for an `ok=False` reply."""
         envelope = self._envelope(
-            op, model, params, lane, fallback, timeout, deadline, request_id, embed=embed
+            op,
+            model,
+            params,
+            lane,
+            fallback,
+            timeout_secs,
+            deadline_at,
+            request_id,
+            embed=embed,
+            parent_request_id=parent_request_id,
         )
         alias = model.partition("@")[0]
         path = self._route(alias, envelope)
@@ -698,7 +847,7 @@ class LLMQueue:
             self._report_redis(exc)
             return await self._direct(envelope)
         labels = {
-            **task_labels(sent, hash_ids=self.config.hash_ids),
+            **task_labels(sent, hash_ids=self.config.hash_ids, salt=self.config.id_hash_key),
             "queue_name": queue_name(queue),
             "expiry": repr(sent.deadline_at),
         }
@@ -830,7 +979,7 @@ class LLMQueue:
         if result.reply is not None:
             return result.reply
         if result.decision is ClaimDecision.ACK_CANCELLED:
-            raise LLMQueueError(f"call {envelope.request_id} was cancelled")
+            raise LLMQueueCancelled(f"call {envelope.request_id} was cancelled")
         state = self._require_started()
         return await self._wait(state, envelope)  # the queued copy runs elsewhere
 
@@ -869,15 +1018,17 @@ class LLMQueue:
         params: dict[str, Any],
         lane: Lane | str | None,
         fallback: FallbackPolicy | None,
-        timeout: float | None,
-        deadline: float | None,
+        timeout_secs: float | None,
+        deadline_at: float | None,
+        request_id: str | None,
+        *,
         embed: bool = False,
     ) -> LLMReply:
         """Run one call `direct` on the private sync loop; counts `llmq_sync_fallback_total`."""
         if self.config.strict_async:
             raise LLMQueueError(f"sync {op} call refused: strict_async is set")
         envelope = self._envelope(
-            op, model, params, lane, fallback, timeout, deadline, None, embed=embed
+            op, model, params, lane, fallback, timeout_secs, deadline_at, request_id, embed=embed
         )
         self.sync_fallback_count += 1
         safe_hook(self.hooks.on_sync_fallback, model.partition("@")[0])
@@ -887,6 +1038,11 @@ class LLMQueue:
             runner = self._sync
         reply = runner.run(runner.execute(envelope), envelope.deadline_at - time.time() + 5)
         return _unwrap(reply)
+
+    def _redis_name(self) -> str | None:
+        """`CLIENT SETNAME` value: the configured name plus this pod's id."""
+        base = self.config.redis_client_name
+        return f"{base}:{self.pod_id}" if base else None
 
 
 class _LocalLimiters:
@@ -1029,15 +1185,7 @@ class _SyncRunner:
         if owner.failover.redis_down():
             return owner._local_limiter
         if self._redis is None:
-            import redis as sync_redis
-
-            cfg = owner.config
-            self._redis = sync_redis.Redis(
-                host=cfg.redis_host,
-                port=cfg.redis_port,
-                password=cfg.redis_password,
-                ssl=cfg.redis_ssl,
-            )
+            self._redis = create_sync_redis(owner.config, client_name=owner._redis_name())
         return _SyncLimiter(
             SyncAdaptiveLimiter(self._redis, owner.keys, limiter_settings(owner.config))
         )
@@ -1082,6 +1230,60 @@ def decode_invoke(response: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _new_request_id() -> str:
+    return f"llm-{uuid.uuid4().hex}"
+
+
+def _new_aws_session() -> AioSession:
+    """A fresh aiobotocore session (credential chain resolved once, shared by its clients)."""
+    from aiobotocore.session import get_session
+
+    return get_session()
+
+
+def _batch_ids(request_id: str, count: int) -> list[str]:
+    """Request id per embed batch: the id itself for one batch, else `<id>-<n>`."""
+    return [request_id] if count == 1 else [f"{request_id}-{i}" for i in range(count)]
+
+
+def _invoke_body(body: Mapping[str, Any] | list[Any] | str | bytes) -> Any:
+    """Envelope-safe InvokeModel body: JSON values as-is, bytes as UTF-8 text."""
+    if isinstance(body, bytes):
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("invoke_model body bytes must be UTF-8 text") from exc
+    if isinstance(body, Mapping):
+        return dict(body)
+    return body
+
+
+def _invoke_result(reply: LLMReply) -> InvokeResult:
+    raw = decode_invoke(reply.response or {})
+    return InvokeResult(raw["body"], raw["contentType"], reply.meta)
+
+
+def _merge_meta(metas: Sequence[CallMeta]) -> CallMeta:
+    """One `CallMeta` for several batches: first model/target, summed attempts, slowest waits."""
+    if not metas:
+        return CallMeta()
+    first = metas[0]
+    return CallMeta(
+        served_model=first.served_model,
+        served_target=first.served_target,
+        fallback_used=any(m.fallback_used for m in metas),
+        queue_wait_ms=max(m.queue_wait_ms for m in metas),
+        provider_ms=max(m.provider_ms for m in metas),
+        attempts=sum(m.attempts for m in metas),
+        worker=first.worker,
+    )
+
+
+def _embed_result(plan: Sequence[tuple[Op, Any]], replies: Sequence[LLMReply]) -> EmbedResult:
+    vectors = [v for (op, _), reply in zip(plan, replies, strict=True) for v in _vectors(op, reply)]
+    return EmbedResult(vectors, _merge_meta([r.meta for r in replies]))
+
+
 def _vectors(op: Op, reply: LLMReply) -> list[list[float]]:
     """Vectors from one embed reply: Bedrock InvokeModel body or OpenAI embeddings `data`."""
     response = reply.response or {}
@@ -1116,12 +1318,12 @@ def _unwrap(reply: LLMReply) -> LLMReply:
     code = str(error.get("type", "error"))
     message = str(error.get("message", code))
     if reply.cancelled or code == "cancelled":
-        raise LLMQueueError(f"call {reply.request_id} was cancelled")
+        raise LLMQueueCancelled(f"call {reply.request_id} was cancelled")
     if code == "deadline_exceeded":
         raise LLMQueueTimeout(f"call {reply.request_id} ran past its deadline")
     retry_after = error.get("retry_after_secs")
     exc = ProviderError(
-        f"{code}: {message}",
+        _error_text(code, message),
         retryable=bool(error.get("retryable", False)),
         retry_after_secs=float(retry_after) if retry_after is not None else None,
     )
@@ -1129,17 +1331,13 @@ def _unwrap(reply: LLMReply) -> LLMReply:
     raise exc
 
 
-def _redis_client(config: QueueConfig) -> Redis:
-    """The package's own bounded pool (no `decode_responses`), separate from the app's."""
-    pool = BlockingConnectionPool(
-        connection_class=SSLConnection if config.redis_ssl else Connection,
-        host=config.redis_host,
-        port=config.redis_port,
-        password=config.redis_password,
-        max_connections=config.redis_max_connections,
-        timeout=5.0,
-    )
-    return Redis(connection_pool=pool)
+def _error_text(code: str, message: str) -> str:
+    """`code: message` without repeating the code (`ThrottlingException: ThrottlingException`)."""
+    parts: list[str] = []
+    for part in [code, *message.split(": ")]:
+        if part and part not in parts:
+            parts.append(part)
+    return ": ".join(parts) or "error"
 
 
 def _set_default_queue(llmq: LLMQueue | None, *, only: LLMQueue | None = None) -> None:

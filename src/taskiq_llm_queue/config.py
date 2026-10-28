@@ -2,26 +2,40 @@
 
 `QueueConfig` is the single object an app builds (directly or with `from_env`) and passes to
 `LLMQueue`. Validation runs once at construction, so bad config fails at boot, not mid-request.
+`create_redis` / `create_sync_redis` build the package's Redis/Valkey clients from it.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import threading
+import warnings
 from collections.abc import Callable, Mapping
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.errors import ConfigError
+
+if TYPE_CHECKING:
+    import redis
+    import redis.asyncio
+
+logger = get_logger(__name__)
 
 # Built-in provider names; custom providers (QueueConfig.providers / entry points) add their own.
 BUILTIN_PROVIDERS = frozenset({"bedrock", "openai"})
 ProviderKind = str
 ENV_PREFIX = "LLMQ_"
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+# Key of the BLAKE2b hash behind hashed ids and canary buckets. Public and fixed, so only good
+# for local use: set your own `LLMQ_ID_HASH_SALT` in production (all pods must share it).
+DEFAULT_ID_HASH_SALT = "taskiq-llm-queue/id-hash/v1"
+_MAX_SALT_BYTES = 64  # BLAKE2b key limit
 
 
 class Lane(StrEnum):
@@ -118,14 +132,24 @@ class QueueConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     key_prefix: str = "llmq:local"
+    # Redis/Valkey: `redis_url` (redis:// or rediss://) wins over host/port/ssl when set; its
+    # credentials win over `redis_username` / `redis_password`.
+    redis_url: SecretStr | None = None
     redis_host: str = "localhost"
     redis_port: int = 6379
-    redis_password: str | None = None
+    redis_username: str | None = None
+    redis_password: SecretStr | None = None
     redis_ssl: bool = False
     redis_max_connections: int = Field(default=32, ge=1)
+    redis_socket_timeout_secs: float = Field(default=5.0, gt=0)
+    redis_socket_connect_timeout_secs: float = Field(default=2.0, gt=0)
+    redis_health_check_interval_secs: int = Field(default=30, ge=0)
+    redis_retry_attempts: int = Field(default=3, ge=0, le=10)
+    redis_client_name: str | None = "taskiq-llm-queue"
     sqs_endpoint_url: str | None = None
     bedrock_endpoint_url: str | None = None
-    aws_region: str = "us-east-1"
+    # None lets the AWS chain decide (AWS_REGION, profile, IRSA / Pod Identity).
+    aws_region: str | None = None
     models: dict[str, ModelConfig] = Field(default_factory=dict)
     allowed_providers: frozenset[ProviderKind] = BUILTIN_PROVIDERS
     denied_hosts: tuple[str, ...] = ()
@@ -137,6 +161,7 @@ class QueueConfig(BaseModel):
     result_ttl_secs: int = Field(default=300, ge=10)
     inline_max_bytes: int = Field(default=200_000, ge=1024, le=1_000_000)
     hash_ids: bool = True
+    id_hash_salt: SecretStr = SecretStr(DEFAULT_ID_HASH_SALT)
     strict_async: bool = False
     # --- runtime tuning (all optional; defaults are the recommended production starts)
     limiter: LimiterTuning = Field(default_factory=LimiterTuning)
@@ -160,6 +185,14 @@ class QueueConfig(BaseModel):
     retry_base_secs: float = Field(default=1.0, ge=0)
     sqs_wait_time_secs: int = Field(default=20, ge=0, le=20)
     sqs_failover_secs: float = Field(default=300.0, gt=0)
+
+    @field_validator("id_hash_salt")
+    @classmethod
+    def _salt_fits(cls, value: SecretStr) -> SecretStr:
+        size = len(value.get_secret_value().encode("utf-8"))
+        if not 1 <= size <= _MAX_SALT_BYTES:
+            raise ValueError(f"id_hash_salt must be 1-{_MAX_SALT_BYTES} bytes, got {size}")
+        return value
 
     @field_validator("models")
     @classmethod
@@ -203,6 +236,11 @@ class QueueConfig(BaseModel):
             )
         return alias, cfg, target
 
+    @property
+    def id_hash_key(self) -> bytes:
+        """`id_hash_salt` as the BLAKE2b key for hashed ids and canary buckets."""
+        return self.id_hash_salt.get_secret_value().encode("utf-8")
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> QueueConfig:
         """Build a config from `LLMQ_*` variables; `LLMQ_MODELS` holds the models as JSON.
@@ -212,17 +250,24 @@ class QueueConfig(BaseModel):
         env = os.environ if environ is None else environ
 
         def get(name: str) -> str | None:
-            return env.get(ENV_PREFIX + name)
+            return env_value(env, name)
 
         raw: dict[str, object] = {}
         errors: list[str] = []
         for name, key, conv in (
             ("KEY_PREFIX", "key_prefix", str),
+            ("REDIS_URL", "redis_url", str),
             ("REDIS_HOST", "redis_host", str),
             ("REDIS_PORT", "redis_port", int),
+            ("REDIS_USERNAME", "redis_username", str),
             ("REDIS_PASSWORD", "redis_password", str),
             ("REDIS_SSL", "redis_ssl", _to_bool),
             ("REDIS_MAX_CONNECTIONS", "redis_max_connections", int),
+            ("REDIS_SOCKET_TIMEOUT_SECS", "redis_socket_timeout_secs", float),
+            ("REDIS_SOCKET_CONNECT_TIMEOUT_SECS", "redis_socket_connect_timeout_secs", float),
+            ("REDIS_HEALTH_CHECK_INTERVAL_SECS", "redis_health_check_interval_secs", int),
+            ("REDIS_RETRY_ATTEMPTS", "redis_retry_attempts", int),
+            ("REDIS_CLIENT_NAME", "redis_client_name", str),
             ("SQS_ENDPOINT_URL", "sqs_endpoint_url", str),
             ("BEDROCK_ENDPOINT_URL", "bedrock_endpoint_url", str),
             ("AWS_REGION", "aws_region", str),
@@ -230,16 +275,17 @@ class QueueConfig(BaseModel):
             ("RESULT_TTL_SECS", "result_ttl_secs", int),
             ("INLINE_MAX_BYTES", "inline_max_bytes", int),
             ("HASH_IDS", "hash_ids", _to_bool),
+            ("ID_HASH_SALT", "id_hash_salt", str),
             ("STRICT_ASYNC", "strict_async", _to_bool),
             ("ROUTING_ENABLED", "routing_enabled", _to_bool),
             ("MAX_FAILURES", "max_failures", int),
             ("LOCAL_LIMIT_CAP", "local_limit_cap", int),
-            ("CFG_RELOAD_S", "cfg_reload_secs", float),
-            ("CONSUMER_DRAIN_S", "drain_secs", float),
+            ("CFG_RELOAD_SECS", "cfg_reload_secs", float),
+            ("CONSUMER_DRAIN_SECS", "drain_secs", float),
             ("RETRY_ATTEMPTS", "retry_attempts", int),
-            ("RETRY_BASE_S", "retry_base_secs", float),
-            ("SQS_WAIT_TIME_S", "sqs_wait_time_secs", int),
-            ("SQS_FAILOVER_S", "sqs_failover_secs", float),
+            ("RETRY_BASE_SECS", "retry_base_secs", float),
+            ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
+            ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),
             ("WORKER_SLOTS", "worker_slots", _int_map),
         ):
             value = get(name)
@@ -285,16 +331,53 @@ _LIMITER_ENV: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ("AC_RAMP_WINDOW", "ramp_window", int),
     ("AC_INCREASE_EVERY", "increase_every", int),
     ("AC_DECREASE_FACTOR", "decrease_factor", float),
-    ("AC_PAUSE_S", "pause_secs", float),
+    ("AC_PAUSE_SECS", "pause_secs", float),
     ("AC_BG_SHARE", "bg_share", float),
     ("AC_RAMP_CAP", "ramp_cap", int),
-    ("AC_LEASE_TTL_S", "lease_ttl_secs", float),
+    ("AC_LEASE_TTL_SECS", "lease_ttl_secs", float),
 )
 _BREAKER_ENV: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ("CB_THRESHOLD", "threshold", int),
-    ("CB_WINDOW_S", "window_secs", float),
-    ("CB_COOLDOWN_S", "cooldown_secs", float),
+    ("CB_WINDOW_SECS", "window_secs", float),
+    ("CB_COOLDOWN_SECS", "cooldown_secs", float),
 )
+# Deprecated `LLMQ_*` spellings (current name -> old name), read only when the new one is unset.
+DEPRECATED_ENV: Mapping[str, str] = {
+    "CFG_RELOAD_SECS": "CFG_RELOAD_S",
+    "CONSUMER_DRAIN_SECS": "CONSUMER_DRAIN_S",
+    "RETRY_BASE_SECS": "RETRY_BASE_S",
+    "SQS_WAIT_TIME_SECS": "SQS_WAIT_TIME_S",
+    "SQS_FAILOVER_SECS": "SQS_FAILOVER_S",
+    "AC_PAUSE_SECS": "AC_PAUSE_S",
+    "AC_LEASE_TTL_SECS": "AC_LEASE_TTL_S",
+    "CB_WINDOW_SECS": "CB_WINDOW_S",
+    "CB_COOLDOWN_SECS": "CB_COOLDOWN_S",
+    **{f"TIMEOUT_{lane.value.upper()}_SECS": f"TIMEOUT_{lane.value.upper()}" for lane in Lane},
+    **{
+        f"TIMEOUT_EMBED_{lane.value.upper()}_SECS": f"TIMEOUT_EMBED_{lane.value.upper()}"
+        for lane in Lane
+    },
+}
+_warned_env: set[str] = set()
+_warned_lock = threading.Lock()
+
+
+def env_value(env: Mapping[str, str], name: str) -> str | None:
+    """`LLMQ_<name>`, else its deprecated spelling (warned once per process), else None."""
+    value = env.get(ENV_PREFIX + name)
+    old = DEPRECATED_ENV.get(name)
+    if value is not None or old is None:
+        return value
+    value = env.get(ENV_PREFIX + old)
+    if value is not None:
+        with _warned_lock:
+            first = old not in _warned_env
+            _warned_env.add(old)
+        if first:
+            message = f"{ENV_PREFIX}{old} is deprecated; use {ENV_PREFIX}{name}"
+            warnings.warn(message, DeprecationWarning, stacklevel=3)
+            logger.warning("deprecated_env_name", old=ENV_PREFIX + old, new=ENV_PREFIX + name)
+    return value
 
 
 def _int_map(value: str) -> dict[str, int]:
@@ -311,17 +394,18 @@ def _int_map(value: str) -> dict[str, int]:
 
 
 def _lanes_from_env(get: _Getter, raw: dict[str, object], errors: list[str]) -> None:
-    """`LLMQ_TIMEOUT_<LANE>`, `LLMQ_TIMEOUT_EMBED_<LANE>` and `LLMQ_RESULT_DISPATCH_MS`."""
+    """`LLMQ_TIMEOUT_<LANE>_SECS`, `LLMQ_TIMEOUT_EMBED_<LANE>_SECS`, `LLMQ_RESULT_DISPATCH_MS`."""
     for prefix, key in (("TIMEOUT_", "timeout_secs"), ("TIMEOUT_EMBED_", "embed_timeout_secs")):
         lanes: dict[Lane, float] = {}
         for lane in Lane:
-            value = get(prefix + lane.value.upper())
+            name = f"{prefix}{lane.value.upper()}_SECS"
+            value = get(name)
             if value is None:
                 continue
             try:
                 lanes[lane] = float(value)
             except ValueError as exc:
-                errors.append(f"{ENV_PREFIX}{prefix}{lane.value.upper()}: {exc}")
+                errors.append(f"{ENV_PREFIX}{name}: {exc}")
         if lanes:
             default = QueueConfig.model_fields[key].get_default(call_default_factory=True)
             raw[key] = {**default, **lanes}
@@ -361,3 +445,73 @@ def _to_bool(value: str) -> bool:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"not a boolean: {value!r}")
+
+
+def _redis_kwargs(config: QueueConfig, retry: Any, client_name: str | None) -> dict[str, Any]:
+    """Pool settings shared by the async and sync clients (everything but the address)."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    password = config.redis_password
+    return {
+        "username": config.redis_username,
+        "password": password.get_secret_value() if password is not None else None,
+        "max_connections": config.redis_max_connections,
+        "socket_timeout": config.redis_socket_timeout_secs,
+        "socket_connect_timeout": config.redis_socket_connect_timeout_secs,
+        "health_check_interval": config.redis_health_check_interval_secs,
+        "retry": retry,
+        "retry_on_error": [RedisConnectionError],
+        "client_name": client_name or config.redis_client_name,
+        "timeout": _POOL_WAIT_SECS,
+    }
+
+
+_POOL_WAIT_SECS = 5.0  # BlockingConnectionPool: wait this long for a free connection
+
+
+def _backoff() -> Any:
+    from redis.backoff import ExponentialBackoff
+
+    return ExponentialBackoff(cap=1.0, base=0.1)
+
+
+def create_redis(config: QueueConfig, *, client_name: str | None = None) -> redis.asyncio.Redis:
+    """The package's own async client: bounded blocking pool, socket timeouts and retries.
+
+    The one factory for every async Valkey client the package builds (no `decode_responses`).
+    Connection errors are retried `redis_retry_attempts` times with exponential backoff.
+    """
+    from redis.asyncio import BlockingConnectionPool, Redis
+    from redis.asyncio.connection import Connection, SSLConnection
+    from redis.asyncio.retry import Retry
+
+    kwargs = _redis_kwargs(config, Retry(_backoff(), config.redis_retry_attempts), client_name)
+    if config.redis_url is not None:
+        pool = BlockingConnectionPool.from_url(config.redis_url.get_secret_value(), **kwargs)
+    else:
+        pool = BlockingConnectionPool(
+            connection_class=SSLConnection if config.redis_ssl else Connection,
+            host=config.redis_host,
+            port=config.redis_port,
+            **kwargs,
+        )
+    return Redis(connection_pool=pool)
+
+
+def create_sync_redis(config: QueueConfig, *, client_name: str | None = None) -> redis.Redis:
+    """Blocking twin of `create_redis` (same settings) for sync callers and tools."""
+    from redis import BlockingConnectionPool, Redis
+    from redis.connection import Connection, SSLConnection
+    from redis.retry import Retry
+
+    kwargs = _redis_kwargs(config, Retry(_backoff(), config.redis_retry_attempts), client_name)
+    if config.redis_url is not None:
+        pool = BlockingConnectionPool.from_url(config.redis_url.get_secret_value(), **kwargs)
+    else:
+        pool = BlockingConnectionPool(  # type: ignore[no-untyped-call]  # redis stub gap
+            connection_class=SSLConnection if config.redis_ssl else Connection,
+            host=config.redis_host,
+            port=config.redis_port,
+            **kwargs,
+        )
+    return Redis(connection_pool=pool)

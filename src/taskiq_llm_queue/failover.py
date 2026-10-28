@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from taskiq_llm_queue._logging import get_logger
+from taskiq_llm_queue.config import env_value
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.metrics_names import FAILOVER_ACTIVE
 from taskiq_llm_queue.reliability.limiter import local_cap
@@ -31,7 +32,7 @@ Probe = Callable[[], Awaitable[object]]
 
 @dataclass(frozen=True, slots=True)
 class FailoverSettings:
-    """Failover timings and the local cap (`LLMQ_SQS_FAILOVER_S`, `LLMQ_LOCAL_LIMIT_CAP`).
+    """Failover timings and the local cap (`LLMQ_SQS_FAILOVER_SECS`, `LLMQ_LOCAL_LIMIT_CAP`).
 
     `live_pods` < 1 means unknown: the local cap is then `local_cap_fallback`, never
     `last_known_limit` per pod, so an unknown pod count cannot overshoot the provider limit.
@@ -55,24 +56,27 @@ class FailoverSettings:
     def from_env(
         cls, environ: Mapping[str, str] | None = None, *, live_pods: int = 0
     ) -> FailoverSettings:
-        """Read `LLMQ_SQS_FAILOVER_S` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise `ConfigError`."""
+        """Read `LLMQ_SQS_FAILOVER_SECS` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise `ConfigError`.
+
+        The deprecated `LLMQ_SQS_FAILOVER_S` is still read (warned once).
+        """
         env = os.environ if environ is None else environ
         values: dict[str, str] = {}
         errors: list[str] = []
-        for name, conv in (("LLMQ_SQS_FAILOVER_S", float), ("LLMQ_LOCAL_LIMIT_CAP", int)):
-            raw = env.get(name)
+        for name, conv in (("SQS_FAILOVER_SECS", float), ("LOCAL_LIMIT_CAP", int)):
+            raw = env_value(env, name)
             if raw is None:
                 continue
             try:
                 conv(raw)
             except ValueError as exc:
-                errors.append(f"{name}: {exc}")
+                errors.append(f"LLMQ_{name}: {exc}")
             values[name] = raw
         if errors:
             raise ConfigError("; ".join(errors))
         return cls(
-            sqs_failover_secs=float(values.get("LLMQ_SQS_FAILOVER_S", 300.0)),
-            local_cap_fallback=int(values.get("LLMQ_LOCAL_LIMIT_CAP", 20)),
+            sqs_failover_secs=float(values.get("SQS_FAILOVER_SECS", 300.0)),
+            local_cap_fallback=int(values.get("LOCAL_LIMIT_CAP", 20)),
             live_pods=live_pods,
         )
 

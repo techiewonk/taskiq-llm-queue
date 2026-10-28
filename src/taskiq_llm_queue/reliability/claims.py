@@ -1,6 +1,6 @@
 """Exactly-once execution on at-least-once SQS delivery: the claim record per task (DS1-DS3).
 
-`llmq:<env>:job:<id>` holds `state`, `worker`, `heartbeat_at`, `deadline_at` and `failures`;
+`<prefix>:{r:<id>}:job` holds `state`, `worker`, `heartbeat_at`, `deadline_at` and `failures`;
 every transition is one Lua CAS using Valkey `TIME`. Used by the claim middleware before a task
 runs, by the heartbeat loop, and by `direct` failover (DS17: claim as `direct:<pod>`).
 """
@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+
+from redis.crc import key_slot
 
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.keys import KeySpace
@@ -118,11 +120,21 @@ class RedisClaimStore:
         if not request_ids:
             return []
         s = self.settings
-        lost = await self._heartbeat(
-            [self._keys.job(rid) for rid in request_ids],
-            [worker, s.state_ttl_secs, s.exec_max_secs],
+        args: list[Any] = [worker, s.state_ttl_secs, s.exec_max_secs]
+        keys = [self._keys.job(rid) for rid in request_ids]
+        # Each job key has its own `{r:<id>}` slot and a cluster script may touch only one:
+        # one call per slot, all pipelined in a single round trip (standalone Valkey too).
+        by_slot: dict[int, list[int]] = {}
+        for index, key in enumerate(keys):
+            by_slot.setdefault(key_slot(key.encode()), []).append(index)
+        groups = list(by_slot.values())
+        replies = await _lua.run_many(
+            self._client, [(self._heartbeat, [keys[i] for i in group], args) for group in groups]
         )
-        return [request_ids[int(i) - 1] for i in lost]
+        missing = sorted(
+            group[int(i) - 1] for group, lost in zip(groups, replies, strict=True) for i in lost
+        )
+        return [request_ids[index] for index in missing]
 
     async def heartbeat(self, request_ids: Sequence[str], *, worker: str) -> None:
         """Refresh heartbeats and TTLs for running tasks."""
@@ -144,11 +156,25 @@ class RedisClaimStore:
 
         A record without an owner (released, or missing) is written; `worker=None` skips the check.
         """
+        script, keys, args = self.complete_call(request_id, state, worker=worker)
+        return self.complete_outcome(await script(keys, args), request_id, worker=worker)
+
+    @property
+    def client(self) -> redis.asyncio.Redis:
+        """The client the scripts run on (lets a caller share one pipeline with it)."""
+        return self._client
+
+    def complete_call(
+        self, request_id: str, state: ClaimState, *, worker: str | None
+    ) -> _lua.ScriptCall:
+        """The `complete_owned` script call, to queue in a caller's pipeline (`_lua`)."""
         if state not in _TERMINAL:
             raise ValueError(f"complete() needs a terminal state, got {state!r}")
-        reply = await self._complete(
-            [self._keys.job(request_id)], [state.value, self.settings.state_ttl_secs, worker or ""]
-        )
+        args = [state.value, self.settings.state_ttl_secs, worker or ""]
+        return self._complete, [self._keys.job(request_id)], args
+
+    def complete_outcome(self, reply: Any, request_id: str, *, worker: str | None) -> ClaimOutcome:
+        """Interpret a `complete_call` reply: APPLIED, or NOT_OWNER (logged)."""
         if int(reply) < 0:
             logger.warning("claim_complete_not_owner", request_id=request_id, worker=worker)
             return ClaimOutcome.NOT_OWNER

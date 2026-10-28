@@ -18,6 +18,10 @@ class LLMQueueTimeout(LLMQueueError):  # public name is part of the frozen API
     """The caller waited longer than its lane timeout or deadline for a result."""
 
 
+class LLMQueueCancelled(LLMQueueError):
+    """The call was cancelled (`LLMQueue.cancel`, or its caller went away) before it finished."""
+
+
 class QueueUnavailable(LLMQueueError):  # public name is part of the frozen API
     """SQS or Redis/Valkey could not be reached and no fallback path was allowed."""
 

@@ -5,7 +5,7 @@ import openai
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
-from lc_fakes import CHAT_TOOL_RESPONSE, FakeQueueClient  # type: ignore[import-not-found]  # bare-name test helper
+from lc_fakes import CHAT_TOOL_RESPONSE, META, FakeQueueClient, FakeResult  # type: ignore[import-not-found]  # bare-name test helper
 
 from taskiq_llm_queue.errors import (
     ConfigError,
@@ -53,7 +53,40 @@ async def test_ainvoke_goes_through_chat() -> None:
     assert body["messages"] == [{"role": "user", "content": "hi"}]
     assert body["model"] == "llama-3.1-70b"
     assert not body.get("stream")
-    assert kwargs == {"lane": "rt", "fallback": "chain", "timeout": None}
+    assert kwargs == {"lane": "rt", "fallback": "chain", "timeout_secs": None}
+
+
+async def test_response_metadata_has_call_meta() -> None:
+    """Like the Bedrock adapter: served model/target, attempts and queue wait are visible."""
+    reply = await _chat(FakeQueueClient()).ainvoke("hi")
+    md = reply.response_metadata
+    assert (md["served_model"], md["served_target"]) == ("gpt120b", "apac")
+    assert (md["attempts"], md["queue_wait_ms"], md["fallback_used"]) == (2, 42, True)
+    assert md["model_name"] == "llama-3.1-70b"  # the parent's own fields stay
+
+
+async def test_concurrent_bedrock_calls_keep_their_own_replies() -> None:
+    """Placeholder client handlers are per task: concurrent calls never swap replies."""
+    import asyncio
+    from typing import Any
+
+    from taskiq_llm_queue.langchain import QueuedChatBedrockConverse
+
+    class Slow:
+        async def converse(self, model: str, request: dict[str, Any], **kw: Any) -> Any:
+            text = request["messages"][0]["content"][0]["text"]
+            await asyncio.sleep(0.01 if text == "a" else 0)
+            body = {"output": {"message": {"role": "assistant", "content": [{"text": text}]}}}
+            return FakeResult({**body, "stopReason": "end_turn", "usage": USAGE}, META)
+
+    model = QueuedChatBedrockConverse(
+        model_id="openai.gpt-oss-120b-1:0", model_alias="gpt120b", llmq=Slow()
+    )
+    first, second = await asyncio.gather(model.ainvoke("a"), model.ainvoke("b"))
+    assert (first.content, second.content) == ("a", "b")
+
+
+USAGE = {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
 
 
 async def test_tool_calls_round_trip() -> None:
@@ -111,7 +144,7 @@ async def test_embeddings_async_base64_round_trip() -> None:
     fake = FakeQueueClient()
     emb = QueuedOpenAIEmbeddings(model="bge", llmq=fake, lane="bulk")
     assert await emb.aembed_documents(["a", "bb"]) == [[1.0, 0.5], [2.0, 0.5]]
-    assert fake.calls == [("embed", "bge", ["a", "bb"], {"lane": "bulk", "timeout": None})]
+    assert fake.calls == [("embed", "bge", ["a", "bb"], {"lane": "bulk", "timeout_secs": None})]
 
 
 def test_embeddings_sync_uses_embed_sync() -> None:

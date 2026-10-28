@@ -46,7 +46,7 @@ class BedrockProvider:
         self,
         *,
         session: AioSession | None = None,
-        region: str = "us-east-1",
+        region: str | None = None,
         endpoint_url: str | None = None,
         denied_hosts: Iterable[str] = (),
         read_timeout_secs: float = DEFAULT_READ_TIMEOUT_SECS,
@@ -56,6 +56,7 @@ class BedrockProvider:
     ) -> None:
         """Keep settings only; no SDK import and no client until the first call.
 
+        `region=None` (and no `Target.region`) lets the AWS chain pick the region.
         `client_kwargs` go to `create_client` (e.g. explicit credentials for a fake endpoint).
         """
         self._denied_hosts = tuple(denied_hosts)
@@ -71,15 +72,18 @@ class BedrockProvider:
             "retries": {"total_max_attempts": 1, "mode": "standard"},
         }
         self._client_kwargs = dict(client_kwargs or {})
-        self._clients: dict[tuple[str, str | None], BedrockRuntimeClient] = {}
+        self._clients: dict[tuple[str | None, str | None], BedrockRuntimeClient] = {}
         self._stack = AsyncExitStack()
         self._lock = asyncio.Lock()
 
     @classmethod
-    def from_config(cls, config: QueueConfig, **kwargs: Any) -> BedrockProvider:
+    def from_config(
+        cls, config: QueueConfig, *, session: AioSession | None = None, **kwargs: Any
+    ) -> BedrockProvider:
         """Build from `QueueConfig` (region, endpoint, deny list); checks every Bedrock target URL.
 
-        Extra keyword arguments go to the constructor (e.g. `session`, `client_kwargs`).
+        `session` is the pod's shared `AioSession` (`LLMQueue.start` passes it); extra keyword
+        arguments go to the constructor (e.g. `client_kwargs`).
         """
         for model in config.models.values():
             if model.provider == "bedrock":
@@ -89,6 +93,7 @@ class BedrockProvider:
             region=config.aws_region,
             endpoint_url=config.bedrock_endpoint_url,
             denied_hosts=config.denied_hosts,
+            session=session,
             **kwargs,
         )
 

@@ -262,3 +262,14 @@ async def test_one_missed_heartbeat_is_not_stale(
     await store.claim(RID, deadline_at=later(), worker="a")
     await asyncio.sleep(0.22)  # one beat missed, the next one late
     assert await store.claim(RID, deadline_at=later(), worker="b") is ClaimDecision.DEFER
+
+
+async def test_heartbeat_batches_per_slot(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Item 8: hash-tagged job keys sit in many slots; one script call per slot, one trip."""
+    store = make(valkey, keys)
+    ids = [f"hb-{i}" for i in range(6)]
+    for rid in ids[:4]:
+        assert await store.claim(rid, deadline_at=later(), worker="a") is ClaimDecision.RUN
+    assert await store.claim("hb-4", deadline_at=later(), worker="b") is ClaimDecision.RUN
+    lost = await store.heartbeat_owned(ids, worker="a")
+    assert lost == ["hb-4", "hb-5"]  # another owner, and no record at all

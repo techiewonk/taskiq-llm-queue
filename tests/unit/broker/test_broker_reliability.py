@@ -9,15 +9,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
-from taskiq import AckableMessage, TaskiqMessage, TaskiqResult
+from taskiq import AckableMessage, InMemoryBroker, TaskiqMessage, TaskiqResult
+from taskiq.formatters.proxy_formatter import ProxyFormatter
 
-from taskiq_llm_queue.broker import BrokerHooks, Delivery, Heartbeat, HybridSQSBroker, SQSQueue
+from taskiq_llm_queue.broker import (
+    SQS_MESSAGE_ID_LABEL,
+    SQS_RECEIPT_HANDLE_LABEL,
+    SQS_RECEIVE_COUNT_LABEL,
+    BrokerHooks,
+    Delivery,
+    Heartbeat,
+    HybridSQSBroker,
+    SQSQueue,
+    WireSerializer,
+)
 from taskiq_llm_queue.broker.acker import Acker
 from taskiq_llm_queue.broker.heartbeat import HeartbeatManager
 from taskiq_llm_queue.broker.s3_offload import (
@@ -469,3 +481,96 @@ async def test_offload_read_failure_releases_delivery() -> None:
     assert (handle, 30) in fake.visibility
     assert fake.deleted == []
     assert _KEY in s3.objects
+
+
+# ---------------------------------------------------------------- single parse, wire format
+
+_NON_ASCII = {"text": "नमस्ते दुनिया 你好世界", "n": 1.5, "nested": {"k": [1, None, True]}}
+
+
+def _wire_message(task_id: str = "w1") -> TaskiqMessage:
+    return TaskiqMessage(
+        task_id=task_id, task_name=TASK, labels={"lane": "rt"}, args=[_NON_ASCII], kwargs={}
+    )
+
+
+def test_wire_format_compatible_both_ways() -> None:
+    """Rolling deploy: stdlib-JSON pods and orjson pods read each other's messages."""
+    old = InMemoryBroker()  # taskiq default: JSONSerializer(ensure_ascii=True)
+    new = InMemoryBroker().with_serializer(WireSerializer())
+    message = _wire_message()
+    old_bytes = old.formatter.dumps(message).message
+    new_bytes = new.formatter.dumps(message).message
+    assert new.formatter.loads(old_bytes) == message
+    assert old.formatter.loads(new_bytes) == message
+    assert len(new_bytes) < len(old_bytes)  # UTF-8 instead of \uXXXX escapes
+
+
+def test_wire_serializer_falls_back_for_big_ints() -> None:
+    value = {"big": 2**70, "text": "你好"}
+    raw = WireSerializer().dumpb(value)
+    assert json.loads(raw) == value
+    assert "你好".encode() in raw
+
+
+async def test_old_pod_message_received_by_new_broker() -> None:
+    """A body written with taskiq's stdlib serializer runs on an orjson broker unchanged."""
+    fake = FakeSQS()
+    broker = _broker(fake, expose_message_metadata=True)
+    broker.with_serializer(WireSerializer())
+    fake.push(broker, "w1")
+    fake.inbox[0]["Body"] = InMemoryBroker().formatter.dumps(_wire_message()).message.decode()
+    async with listening(broker) as stream:
+        parsed = _parse(broker, await _next(stream))
+    assert parsed.args == [_NON_ASCII]
+    assert parsed.labels[SQS_MESSAGE_ID_LABEL] == "m1"
+
+
+async def test_receive_parses_once_and_keeps_body() -> None:
+    """Item 2: one serializer parse per message; metadata labels ride on the parsed message."""
+    fake = FakeSQS()
+    broker = _broker(fake, expose_message_metadata=True)
+    broker.with_serializer(WireSerializer())
+    handle = fake.push(broker, "t1", labels={"lane": "rt"})
+    body = fake.inbox[0]["Body"]
+    parses = 0
+    original = broker.serializer.loadb
+
+    def counting(value: bytes) -> Any:
+        nonlocal parses
+        parses += 1
+        return original(value)
+
+    broker.serializer.loadb = counting  # type: ignore[method-assign]
+    async with listening(broker) as stream:
+        raw = await _next(stream)
+        assert raw.data.decode() == body  # not re-serialized to add labels
+        parsed = _parse(broker, raw)
+        assert parsed is _parse(broker, raw)
+        assert parsed.labels[SQS_RECEIPT_HANDLE_LABEL] == handle
+        assert parsed.labels[SQS_RECEIVE_COUNT_LABEL] == "1"
+        assert parsed.labels["lane"] == "rt"
+    assert parses == 1
+
+
+async def test_replaced_formatter_still_gets_metadata() -> None:
+    """A user formatter takes the old path: parse with it, re-dump with the labels."""
+    fake = FakeSQS()
+    broker = _broker(fake, expose_message_metadata=True)
+    broker.with_formatter(ProxyFormatter(broker))
+    fake.push(broker, "t1")
+    async with listening(broker) as stream:
+        parsed = _parse(broker, await _next(stream))
+    assert parsed.labels[SQS_MESSAGE_ID_LABEL] == "m1"
+
+
+async def test_invalid_message_is_released_not_handed_to_taskiq() -> None:
+    """DS9: a body taskiq could not validate is released (taskiq would ack and lose it)."""
+    fake = FakeSQS()
+    broker = _broker(fake)
+    handle = fake.push(broker, "t1")
+    fake.inbox[0]["Body"] = json.dumps({"task_id": "t1", "task_name": TASK, "args": 5})
+    async with listening(broker) as stream:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(stream.__anext__(), 0.3)
+    assert (handle, 30) in fake.visibility

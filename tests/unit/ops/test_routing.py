@@ -72,9 +72,22 @@ def test_same_session_same_path_10k_calls_and_across_instances() -> None:
 
 
 def test_bucket_is_stable_known_value() -> None:
-    """The bucket must not change between releases (xxh3_64 of the UTF-8 id)."""
-    assert bucket("session-1") == bucket("session-1")
+    """The bucket must not change between releases (keyed BLAKE2b of the UTF-8 id)."""
+    assert bucket("session-1") == 91  # default salt; pinned
+    assert bucket("session-1", b"x") == 27  # the salt (LLMQ_ID_HASH_SALT) moves buckets
     assert 0 <= bucket("x") < 100
+
+
+def test_router_uses_its_salt() -> None:
+    """Two routers with different salts bucket the same session differently (sticky per salt)."""
+    cfg = cfg_with(50)
+    sessions = [f"s-{i}" for i in range(200)]
+    plain = make_router(cfg)
+    salted = CanaryRouter(routing_store(fakeredis.FakeAsyncRedis(), KEYS, cfg), salt=b"other")
+    routes_a = [plain.route("gpt20b", Lane.RT, s, None) for s in sessions]
+    routes_b = [salted.route("gpt20b", Lane.RT, s, None) for s in sessions]
+    assert routes_a != routes_b
+    assert routes_b == [salted.route("gpt20b", Lane.RT, s, None) for s in sessions]
 
 
 @pytest.mark.parametrize("lane", list(Lane))

@@ -10,7 +10,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+import orjson
 from redis.asyncio import BlockingConnectionPool, Redis
+from redis.asyncio.cluster import RedisCluster
 from redis.asyncio.connection import Connection, SSLConnection
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.exceptions import ResultGetError
@@ -25,6 +27,11 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 DEFAULT_TAKE_BATCH = 1000  # keys per MGET; 10K waiters on one pod -> 10 MGETs per interval
+# taskiq's `TaskiqResult` JSON around one embedded reply, so old readers and taskiq's
+# `get_result` still see the usual shape. Serializing the reply once with orjson (measured, 4 KB
+# reply): encode 14.8 -> 6.0 us English, 40 -> 6.9 us Hindi; decode 68 -> 15 us Hindi.
+_RESULT_HEAD = b'{"is_err":false,"log":null,"return_value":'
+_RESULT_TAIL = b',"execution_time":0.0,"labels":{},"error":null}'
 
 
 class LLMQResultBackend(AsyncResultBackend[Any]):
@@ -75,19 +82,22 @@ class LLMQResultBackend(AsyncResultBackend[Any]):
 
     @classmethod
     def from_config(cls, config: QueueConfig, *, redis: Redis | None = None) -> LLMQResultBackend:
-        """Build a backend from `QueueConfig` (prefix, Redis endpoint, pool size, result TTL)."""
+        """Build a backend from `QueueConfig` (prefix, Redis endpoint, pool size, result TTL).
+
+        Without `redis`, the client comes from `config.create_redis` (URL, credentials, TLS,
+        retries) and is owned, so the last `shutdown` closes it.
+        """
+        from taskiq_llm_queue.config import create_redis
         from taskiq_llm_queue.keys import KeySpace
 
-        return cls(
+        backend = cls(
             KeySpace(config.key_prefix),
-            redis=redis,
-            host=config.redis_host,
-            port=config.redis_port,
-            password=config.redis_password,
-            ssl=config.redis_ssl,
+            redis=redis or create_redis(config),
             max_connections=config.redis_max_connections,
             result_ttl_secs=config.result_ttl_secs,
         )
+        backend._owns_client = redis is None
+        return backend
 
     @property
     def redis(self) -> Redis:
@@ -135,31 +145,50 @@ class LLMQResultBackend(AsyncResultBackend[Any]):
 
     async def put(self, reply: LLMReply, *, ttl_secs: int) -> None:
         """Store an `LLMReply` under its `request_id` (the task id) in taskiq's result format."""
-        result = TaskiqResult[Any](
-            is_err=False, return_value=reply.model_dump(mode="json"), execution_time=0.0
-        )
-        await self.redis.set(
-            self.keys.result(reply.request_id), result.model_dump_json().encode(), ex=ttl_secs
-        )
+        await self.redis.set(self.keys.result(reply.request_id), encode_reply(reply), ex=ttl_secs)
+
+    def uses(self, client: object) -> bool:
+        """True when results are written through `client` (so they can share its pipeline)."""
+        return self._redis is client
+
+    def queue_put(self, pipe: Any, reply: LLMReply, *, ttl_secs: int) -> None:
+        """Queue `put`'s write on a caller's pipeline (same key, bytes and TTL)."""
+        pipe.set(self.keys.result(reply.request_id), encode_reply(reply), ex=ttl_secs)
 
     async def take_many(self, task_ids: Sequence[str]) -> dict[str, LLMReply]:
-        """Fetch and delete whichever results are ready: one atomic `MGET`+`DEL` per batch.
+        """Fetch and delete whichever results are ready, in one round trip per batch.
 
-        MULTI/EXEC makes the delete cover exactly what the read saw, so a result written in
-        between is never lost. Needs non-cluster Redis: the keys span hash slots.
+        Each read deletes exactly what it saw, so a result written in between is never lost:
+        `MGET`+`DEL` in MULTI/EXEC, or on a cluster client (keys in many slots) one `GETDEL`
+        per key in a non-transactional pipeline that redis-py splits by node.
         """
         ready: dict[str, LLMReply] = {}
+        cluster = isinstance(self.redis, RedisCluster)
         for start in range(0, len(task_ids), self.take_batch):
             ids = list(task_ids[start : start + self.take_batch])
             keys = [self.keys.result(task_id) for task_id in ids]
-            async with self.redis.pipeline(transaction=True) as pipe:
-                pipe.mget(keys)
-                pipe.delete(*keys)
-                values, _ = await pipe.execute()
+            async with self.redis.pipeline(transaction=not cluster) as pipe:
+                if cluster:
+                    for key in keys:
+                        pipe.getdel(key)
+                    values = await pipe.execute()
+                else:
+                    pipe.mget(keys)
+                    pipe.delete(*keys)
+                    values, _ = await pipe.execute()
             for task_id, raw in zip(ids, values, strict=True):
                 if raw is not None:
                     ready[task_id] = decode_reply(task_id, raw)
         return ready
+
+
+def encode_reply(reply: LLMReply) -> bytes:
+    """`TaskiqResult` JSON (`is_err=false`) for a reply, serializing the reply only once."""
+    try:
+        body = orjson.dumps(reply.model_dump(mode="json"))
+    except TypeError:  # orjson refuses e.g. ints beyond 64 bits; pydantic does not
+        body = reply.model_dump_json().encode()
+    return _RESULT_HEAD + body + _RESULT_TAIL
 
 
 def decode_reply(task_id: str, raw: bytes | str) -> LLMReply:
@@ -168,6 +197,12 @@ def decode_reply(task_id: str, raw: bytes | str) -> LLMReply:
     A task that raised, or a value that is not an `LLMReply`, becomes `ok=False` with an
     `error` dict, so the waiting caller is always released with a value.
     """
+    try:  # one JSON pass for the common case: a stored reply, not a task error
+        data = orjson.loads(raw)
+        if isinstance(data, dict) and data.get("is_err") is False:
+            return LLMReply.model_validate(data["return_value"])
+    except Exception:
+        pass  # not a reply at all: the full taskiq decode below reports it
     try:
         result = TaskiqResult[Any].model_validate_json(raw)
         if result.is_err:

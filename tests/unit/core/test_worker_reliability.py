@@ -477,3 +477,28 @@ async def test_sync_lease_won_after_timeout_is_released() -> None:
             break
         await asyncio.sleep(0.05)
     assert [lease.token for lease in inner.released] == ["late"]
+
+
+def test_built_brokers_use_the_wire_serializer(rig: Rig) -> None:
+    """Item 1: every worker/sender broker writes orjson bodies (readable by older pods)."""
+    from taskiq_llm_queue.broker import DeliveryFormatter, WireSerializer
+    from taskiq_llm_queue.lifecycle import build_brokers
+    from taskiq_llm_queue.reliability import AdaptiveLimiter
+    from taskiq_llm_queue.tasks import WorkerResultBackend
+
+    models = {
+        "big": ModelConfig(
+            provider="bedrock",
+            model_id="big-id",
+            targets={"primary": Target(region="r1")},
+            queues={"rt": "q-rt", "default": "q-bg"},
+        )
+    }
+    config = QueueConfig(models=models, job_queues={"default": "q-jobs"})
+    limiter = AdaptiveLimiter(fakeredis.FakeAsyncRedis(), KeySpace("t"))
+    backend = WorkerResultBackend(cast(Any, Results()))
+    brokers = build_brokers(config, rig.runtime, limiter, backend)
+    assert len(brokers.all()) == 2
+    for broker in brokers.all():
+        assert isinstance(broker.serializer, WireSerializer)
+        assert isinstance(broker.formatter, DeliveryFormatter)

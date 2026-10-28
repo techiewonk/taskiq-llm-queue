@@ -8,12 +8,14 @@ from typing import Any
 
 import fakeredis
 import pytest
+from redis.asyncio.client import Pipeline
 from taskiq import InMemoryBroker, TaskiqResult
 from taskiq.exceptions import ResultGetError
 from taskiq.task import AsyncTaskiqTask
 
 from taskiq_llm_queue import KeySpace, LLMReply, QueueConfig, ResultStore
 from taskiq_llm_queue.results import LLMQResultBackend, decode_reply
+from taskiq_llm_queue.results.backend import encode_reply
 
 KEYS = KeySpace("llmq:unit")
 
@@ -161,3 +163,49 @@ def test_from_config() -> None:
     backend = LLMQResultBackend.from_config(cfg)
     assert backend.keys == KeySpace("llmq:x")
     assert backend.result_ttl_secs == 77
+
+
+def _old_put_bytes(value: LLMReply) -> bytes:
+    """What `put` wrote before the single-serialization change (older worker pods)."""
+    result = TaskiqResult[Any](
+        is_err=False, return_value=value.model_dump(mode="json"), execution_time=0.0
+    )
+    return result.model_dump_json().encode()
+
+
+async def test_put_format_is_compatible_both_ways(
+    backend: LLMQResultBackend, fake_redis: fakeredis.FakeAsyncRedis
+) -> None:
+    """Rolling deploy: new and old result bytes are the same JSON and decode both ways."""
+    value = LLMReply(request_id="t1", ok=True, response={"text": "नमस्ते 你好", "n": 1.5})
+    new = encode_reply(value)
+    assert json.loads(new) == json.loads(_old_put_bytes(value))
+    assert decode_reply("t1", _old_put_bytes(value)) == value
+    assert LLMReply.model_validate(TaskiqResult[Any].model_validate_json(new).return_value) == value
+    await backend.put(value, ttl_secs=60)
+    assert await fake_redis.get(KEYS.result("t1")) == new
+    assert LLMReply.model_validate((await backend.get_result("t1")).return_value) == value
+
+
+async def test_take_many_on_cluster_client_uses_getdel(
+    fake_redis: fakeredis.FakeAsyncRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 8: hash-tagged keys sit in many slots, so a cluster client takes per key."""
+    import taskiq_llm_queue.results.backend as module
+
+    monkeypatch.setattr(module, "RedisCluster", fakeredis.FakeAsyncRedis)
+    getdels = 0
+    original = Pipeline.getdel
+
+    def counting(self: Pipeline, *args: Any, **kwargs: Any) -> Any:
+        nonlocal getdels
+        getdels += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, "getdel", counting)
+    backend = LLMQResultBackend(KEYS, redis=fake_redis)
+    await backend.put(reply("a"), ttl_secs=60)
+    await backend.put(reply("c"), ttl_secs=60)
+    assert await backend.take_many(["a", "b", "c"]) == {"a": reply("a"), "c": reply("c")}
+    assert getdels == 3
+    assert await backend.take_many(["a", "c"]) == {}

@@ -200,3 +200,77 @@ def test_job_send_puts_taskiq_message_on_jobs_ingest(
         "sender": "tester",
         "queue_name": "jobs-ingest",
     }
+
+
+def test_routing_and_fallback_start_from_app_defaults_and_merge(
+    cli_env: dict[str, str],
+    prefix: str,
+    sync_valkey: redis.Redis,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With nothing stored, get/set start from LLMQ_ROUTING_DEFAULT / LLMQ_FALLBACK_CHAINS."""
+    env = {
+        **cli_env,
+        "LLMQ_ROUTING_DEFAULT": json.dumps({"models": {"gpt120b": {"bg": 25}}}),
+        "LLMQ_FALLBACK_CHAINS": json.dumps({"chains": {"gpt120b": ["gpt20b"]}}),
+    }
+    assert json.loads(run(env, capsys, "routing", "get"))["models"] == {"gpt120b": {"bg": 25}}
+    run(env, capsys, "routing", "set", "--model", "gpt20b", "--lane", "rt", "--pct", "10")
+    stored = json.loads(run(env, capsys, "routing", "get"))
+    assert stored["models"] == {"gpt120b": {"bg": 25}, "gpt20b": {"rt": 10}}
+    run(env, capsys, "routing", "reset")
+    assert sync_valkey.get(KeySpace(prefix).routing) is None
+
+    run(env, capsys, "fallback", "set", "--model", "gpt20b", "--chain", "gpt120b")
+    chains = json.loads(run(env, capsys, "fallback", "get"))["chains"]
+    assert set(chains) == {"gpt120b", "gpt20b"}  # the default's gpt120b chain was kept
+
+
+def test_fallback_set_file_merges_unless_replace(
+    cli_env: dict[str, str], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    run(cli_env, capsys, "fallback", "set", "--model", "gpt120b", "--chain", "gpt20b")
+    file = tmp_path / "fallback.json"
+    file.write_text(json.dumps({"chains": {"gpt20b": ["gpt120b"]}}))
+    run(cli_env, capsys, "fallback", "set", "--file", str(file))
+    assert set(json.loads(run(cli_env, capsys, "fallback", "get"))["chains"]) == {
+        "gpt120b",
+        "gpt20b",
+    }
+    run(cli_env, capsys, "fallback", "set", "--file", str(file), "--replace")
+    assert set(json.loads(run(cli_env, capsys, "fallback", "get"))["chains"]) == {"gpt20b"}
+
+
+def test_limiter_and_breaker_reset(
+    cli_env: dict[str, str],
+    prefix: str,
+    sync_valkey: redis.Redis,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`limiter reset` forgets the learned limit; `breaker reset` closes an open breaker."""
+    keys = KeySpace(prefix)
+    sync_valkey.hset(keys.limiter("gpt20b", "primary"), mapping={"limit": 3, "ramp": 0})
+    sync_valkey.hset(keys.breaker("gpt20b", "primary"), mapping={"state": "open"})
+    rows = json.loads(run(cli_env, capsys, "limiter", "reset", "--model", "gpt20b"))
+    assert rows[0]["before"]["limit"] == 3
+    assert not sync_valkey.exists(keys.limiter("gpt20b", "primary"))
+    shown = json.loads(run(cli_env, capsys, "breaker", "show", "--model", "gpt20b@primary"))
+    assert len(shown) == 1
+    reset = json.loads(
+        run(cli_env, capsys, "breaker", "reset", "--model", "gpt20b", "--target", "primary")
+    )
+    assert reset[0]["breaker"] == "closed"
+    assert not sync_valkey.exists(keys.breaker("gpt20b", "primary"))
+    assert [r["key"] for r in audit(sync_valkey, prefix)] == [
+        keys.limiter("gpt20b", "primary"),
+        keys.breaker("gpt20b", "primary"),
+    ]
+
+
+def test_queues_lists_counts(
+    cli_env: dict[str, str], jobs_queue: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = {**cli_env, "LLMQ_JOB_QUEUES": json.dumps({"ingest": "jobs-ingest"})}
+    rows = json.loads(run(env, capsys, "queues"))
+    (row,) = [r for r in rows if r["queue"] == "jobs-ingest"]
+    assert {"visible", "in_flight", "delayed"} <= set(row)

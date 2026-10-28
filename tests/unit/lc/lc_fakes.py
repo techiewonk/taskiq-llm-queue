@@ -94,10 +94,18 @@ CHAT_TOOL_RESPONSE: dict[str, Any] = {
 
 
 @dataclass(frozen=True)
-class FakeConverseResult:
-    """Same shape as `LLMQueue.converse`'s `ConverseResult`."""
+class FakeResult:
+    """Same shape as `LLMQueue.converse` / `chat` results (`response`, `meta`)."""
 
     response: dict[str, Any]
+    meta: CallMeta
+
+
+@dataclass(frozen=True)
+class FakeEmbedResult:
+    """Same shape as `LLMQueue.embed`'s `EmbedResult`."""
+
+    vectors: list[list[float]]
     meta: CallMeta
 
 
@@ -117,7 +125,7 @@ class FakeQueueClient:
 
     def _converse(self, op: str, model: str, request: dict[str, Any], **kw: Any) -> Any:
         self._record(op, model, request, kw)
-        return FakeConverseResult(copy.deepcopy(self.converse_response), META)
+        return FakeResult(copy.deepcopy(self.converse_response), META)
 
     async def converse(self, model: str, request: dict[str, Any], **kw: Any) -> Any:
         return self._converse("converse", model, request, **kw)
@@ -125,19 +133,19 @@ class FakeQueueClient:
     def converse_sync(self, model: str, request: dict[str, Any], **kw: Any) -> Any:
         return self._converse("converse_sync", model, request, **kw)
 
-    def _embed(self, op: str, model: str, texts: list[str], **kw: Any) -> list[list[float]]:
+    def _embed(self, op: str, model: str, texts: list[str], **kw: Any) -> FakeEmbedResult:
         self._record(op, model, texts, kw)
-        return [[float(len(text)), 0.5] for text in texts]
+        return FakeEmbedResult([[float(len(text)), 0.5] for text in texts], META)
 
-    async def embed(self, model: str, texts: list[str], **kw: Any) -> list[list[float]]:
+    async def embed(self, model: str, texts: list[str], **kw: Any) -> FakeEmbedResult:
         return self._embed("embed", model, texts, **kw)
 
-    def embed_sync(self, model: str, texts: list[str], **kw: Any) -> list[list[float]]:
+    def embed_sync(self, model: str, texts: list[str], **kw: Any) -> FakeEmbedResult:
         return self._embed("embed_sync", model, texts, **kw)
 
-    async def chat(self, model: str, request: dict[str, Any], **kw: Any) -> dict[str, Any]:
+    async def chat(self, model: str, request: dict[str, Any], **kw: Any) -> FakeResult:
         self._record("chat", model, request, kw)
-        return copy.deepcopy(self.chat_response)
+        return FakeResult(copy.deepcopy(self.chat_response), META)
 
     @property
     def ops(self) -> list[str]:
