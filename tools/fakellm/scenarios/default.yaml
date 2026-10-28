@@ -1,0 +1,25 @@
+# fakellm default scenario (TESTING.md "Scenario file"): one block per model AND target.
+# Bedrock keys are "<modelId>@<region>" (region from the SigV4 scope) or a cross-region
+# profile id; OpenAI-compatible keys are the request's "model". Unknown keys use defaults.
+#
+# Behaviour fields: latency_ms {p50, p95}, max_concurrency, rpm, throttle_rate,
+# error_rate_5xx, timeout_rate, tool_calls (echo|none), dims, force_error, retry_after_s.
+seed: 42
+strict_models: false
+defaults: {latency_ms: {p50: 800, p95: 2500}, error_rate_5xx: 0.0}
+models:
+  "openai.gpt-oss-120b-1:0@ap-south-1":
+    max_concurrency: 50          # more in flight -> ThrottlingException (what the limiter must learn)
+    rpm: 3000                    # optional request-rate cap
+    latency_ms: {p50: 2500, p95: 5000}
+    tool_calls: echo             # reply with a toolUse block when tools are sent
+  "apac.openai.gpt-oss-120b-1:0":            # cross-region profile target
+    max_concurrency: 80
+  "openai.gpt-oss-20b-1:0@ap-south-1":
+    max_concurrency: 100
+    latency_ms: {p50: 900, p95: 2000}
+  "amazon.titan-embed-text-v2:0@ap-south-1": {max_concurrency: 200, latency_ms: {p50: 60, p95: 150}, dims: 1024}
+  "cohere.embed-english-v3@ap-south-1":      {max_concurrency: 100, latency_ms: {p50: 80, p95: 200}, dims: 1024}
+  "llama-3.1-70b":                            # OpenAI-compatible
+    max_concurrency: 30
+phases: []                       # e.g. - {at_s: 180, model: "openai.gpt-oss-120b-1:0@ap-south-1", set: {throttle_rate: 1.0}}

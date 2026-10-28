@@ -1,8 +1,8 @@
-# Local test stack for taskiq-llm-queue (plan D70, D91: Docker only, no .env).
-# Start:  docker compose -f libs/taskiq_llm_queue/docker/compose.yaml up -d --wait
-# Stop:   docker compose -f libs/taskiq_llm_queue/docker/compose.yaml down
+# Local test stack for taskiq-llm-queue. All config is in this file (no .env needed).
+# Start:  docker compose -f docker/compose.yaml up -d --wait     (or: make up)
+# Stop:   docker compose -f docker/compose.yaml down              (or: make down)
 #
-# Core services only for now. fakellm, worker, locust, prometheus and grafana are added as they're built.
+# Core services (valkey, sqs, fakellm) for now. worker, locust, prometheus and grafana are added as they're built.
 name: llmq-test
 
 x-llmq-env: &llmq-env
@@ -32,3 +32,18 @@ services:
     image: softwaremill/elasticmq-native:1.7.1
     volumes: ["./elasticmq.conf:/opt/elasticmq.conf:ro"]
     ports: ["9324:9324", "9325:9325"]
+
+  fakellm:
+    # Fake Bedrock (Converse, InvokeModel) + OpenAI (chat, embeddings); admin API on the same port.
+    # Pick a scenario with SCENARIO=<name> (file tools/fakellm/scenarios/<name>.yaml).
+    build: {context: ../tools/fakellm, dockerfile: ../../docker/fakellm.Dockerfile}
+    environment:
+      FAKELLM_SCENARIO: /scenarios/${SCENARIO:-default}.yaml
+      FAKELLM_SEED: ${FAKELLM_SEED:-42}
+    volumes: ["../tools/fakellm/scenarios:/scenarios:ro"]
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
