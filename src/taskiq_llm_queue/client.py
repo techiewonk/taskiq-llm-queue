@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import math
 import threading
 import time
 import uuid
@@ -236,6 +237,7 @@ class LLMQueue:
         self._leases: set[Lease] = set()
         # Cancel flags that could not be set while Valkey was down; set once a probe succeeds.
         self._pending_cancels: set[str] = set()
+        self._sent_at = -math.inf  # monotonic time the last SQS send completed (any queue)
         self._local_limiter = _LocalLimiters(self.failover, config)
         self._jobs: dict[str, JobFunction] = {}
         self._sync: _SyncRunner | None = None
@@ -870,19 +872,16 @@ class LLMQueue:
         }
         task = broker.find_task(TASK_EMBED if embed else TASK_CALL)
         assert task is not None
-        # An unreachable SQS can hang a send on a dead pooled connection until botocore's 60 s
-        # read timeout (S20: ~50-70 s), past the call budget; bound it so direct still fits.
-        remaining = envelope.deadline_at - time.time()
-        send_secs = min(self.config.sqs_send_timeout_secs, _SEND_BUDGET_SHARE * remaining)
+        send = asyncio.ensure_future(
+            task.kicker()
+            .with_task_id(sent.request_id)
+            .with_labels(**labels)
+            .kiq(sent.model_dump(mode="json"))
+        )
         try:
-            await asyncio.wait_for(
-                task.kicker()
-                .with_task_id(sent.request_id)
-                .with_labels(**labels)
-                .kiq(sent.model_dump(mode="json")),
-                max(0.0, send_secs),
-            )
+            await self._bounded_send(alias, send, envelope.deadline_at)
         except asyncio.CancelledError:  # a batched send may still go out: flag it (DS14)
+            send.cancel()
             await asyncio.shield(self._flag_cancel(state, envelope.request_id))
             raise
         except (
@@ -912,6 +911,31 @@ class LLMQueue:
             self.failover.report_sqs_failure(alias, exc)
             return await self._direct(envelope, claim=True)
         return await self._wait(state, envelope)
+
+    async def _bounded_send(
+        self, alias: str, send: asyncio.Future[Any], deadline_at: float
+    ) -> None:
+        """Await one SQS send; time out only when SQS sends stopped completing.
+
+        An unreachable SQS can hang a send on a dead pooled connection until botocore's 60 s
+        read timeout (S20), so a send gets `sqs_send_timeout_secs` and at most half the call
+        budget. But a send queued behind a burst is slow, not failed (S35b: 10K sends timed out
+        at 5 s and moved the sender to direct): while another send (any queue) completed
+        within the timeout, it keeps waiting up to the budget share. Raises `TimeoutError`.
+        """
+        limit = self.config.sqs_send_timeout_secs
+        give_up = time.monotonic() + max(0.0, _SEND_BUDGET_SHARE * (deadline_at - time.time()))
+        while True:
+            wait = max(0.0, min(limit, give_up - time.monotonic()))
+            done, _ = await asyncio.wait({send}, timeout=wait)
+            if done:
+                send.result()  # raises the send's own error
+                self._sent_at = time.monotonic()
+                return
+            now = time.monotonic()
+            if now >= give_up or now - self._sent_at >= limit:
+                send.cancel()
+                raise TimeoutError(f"SQS send for {alias} timed out")
 
     async def _wait(self, state: _Started, envelope: Envelope) -> LLMReply:
         """Await the dispatcher; on timeout or caller cancellation set the cancel flag."""

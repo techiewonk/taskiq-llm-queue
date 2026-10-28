@@ -310,13 +310,16 @@ async def test_large_params_travel_by_reference(
 
 
 async def test_fallback_when_primary_throttles(make_queue: MakeQueue, fake: str) -> None:
-    """fakellm throttles the primary region: retries, then the APAC profile serves (§8)."""
+    """fakellm throttles the primary region: retries, then the APAC profile serves (§8).
+
+    A throttled step gets `throttle_retry_attempts` tries (S35b), so 6 on the primary, 1 on APAC.
+    """
     await patch_model(fake, BIG_KEY, {"force_error": "ThrottlingException"})
     llmq = await make_queue()
     result = await llmq.converse("big", HELLO, lane="rt")
     meta = result.meta
     assert (meta.served_target, meta.fallback_used) == ("apac", True)
-    assert meta.attempts == 4
+    assert meta.attempts == llmq.config.throttle_retry_attempts + 1
 
 
 async def test_cross_instance_execution(make_queue: MakeQueue, fake: str, queues: Any) -> None:

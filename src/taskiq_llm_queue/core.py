@@ -9,6 +9,7 @@ releases the message instead of acking it, and a failed result write raises `Que
 from __future__ import annotations
 
 import asyncio
+import itertools
 import random
 import time
 from collections import OrderedDict
@@ -47,6 +48,9 @@ logger = get_logger(__name__)
 
 # DS13: a live (rt) call that can't get a slot within 2 s moves to the next fallback step.
 RT_ACQUIRE_SECS = 2.0
+# S35: one 2 s wait failed an rt call with no fallback during a burst; rt walks the chain this
+# many times (each step waiting 2 s) before giving up with `no_capacity`.
+RT_CAPACITY_PASSES = 3
 # Caps one backoff sleep; the deadline caps the total (DS10).
 MAX_BACKOFF_SECS = 20.0
 # DS4/DS10: a queued bg/bulk call waits this long per step for a slot, then the message is
@@ -623,6 +627,7 @@ async def run_call(
 ) -> LLMReply:
     """Walk the fallback steps; each step gets `retry_attempts` attempts with backoff (§8).
 
+    A step the provider throttled gets `throttle_retry_attempts` instead, when that is more.
     A limiter slot covers one attempt and is released in `finally` before any sleep (DS10).
     When no step could run: `requeue` raises `_Requeue` (bg/bulk), an all-open breaker waits
     and tries again within the deadline. Raises `_Stopped`; a Valkey error propagates.
@@ -640,7 +645,9 @@ async def run_call(
     progress = progress or _Progress()
     last = ErrorInfo(ErrorKind.RETRYABLE, "no_capacity")
     last_message = "no fallback step had capacity"
+    passes = 0
     while True:
+        passes += 1
         attempts_before = progress.attempts
         circuit_only = True
         for index, step in enumerate(steps):
@@ -652,7 +659,10 @@ async def run_call(
             target = model_cfg.targets[step.target]
             provider = deps.providers(step.alias)
             call_params = params_for_step(envelope.op, params, model_cfg.model_id)
-            for attempt in range(config.retry_attempts):
+            budget = config.retry_attempts
+            for attempt in itertools.count():
+                if attempt >= budget:
+                    break
                 lease = await _take_slot(
                     envelope,
                     step,
@@ -746,12 +756,15 @@ async def run_call(
                     await _record(deps, step, ok=False)
                 else:  # a throttle belongs to the limiter: frees a half-open probe, no count
                     await _record(deps, step, ok=None)
+                    # S35b: a random 30 % throttle storm failed calls after 3 tries (2.7 %);
+                    # a throttled step gets more tries, each after a backoff without a slot.
+                    budget = max(budget, config.throttle_retry_attempts)
                 if cap.expired():
                     if by_deadline:  # the call's deadline cut it off: expired, not a provider error
                         raise _Stopped(ClaimState.EXPIRED)
                     if index + 1 < len(steps):  # a hung target: the next one, not the same again
                         break
-                if attempt + 1 < config.retry_attempts:
+                if attempt + 1 < budget:
                     delay = backoff_secs(
                         attempt, config.retry_base_secs, deps.rng, info.retry_after_secs
                     )
@@ -766,6 +779,14 @@ async def run_call(
                 await _check_live(envelope, deps, check_cancel)
                 await deps.sleep(_IDLE_RETRY_SECS)
                 continue
+            if (
+                envelope.lane is Lane.RT
+                and not circuit_only
+                and passes < RT_CAPACITY_PASSES
+                and deps.clock() + RT_ACQUIRE_SECS < envelope.deadline_at
+            ):
+                await _check_live(envelope, deps, check_cancel)
+                continue  # every step waited RT_ACQUIRE_SECS for a slot: walk the chain again
         return error_reply(
             envelope,
             last.code or last.kind.value,

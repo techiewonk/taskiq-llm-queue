@@ -114,7 +114,8 @@ return {1, inflight + 1, limit, tostring(expires)}
 
 # KEYS: state hash, leases zset. ARGV: initial, min, max, token, throttled 0|1, ramp_window,
 # increase_every, decrease_factor, pause_secs, ramp_cap, utilisation, peak_halflife, share,
-# loss_tolerance, min_throttles, pause_ratio, window_secs, settle_ratio, probe_secs, lease_ttl.
+# loss_tolerance, min_throttles, pause_ratio, window_secs, settle_ratio, probe_secs, lease_ttl,
+# hold_ratio.
 # Reply: {limit, removed 0|1, pause remaining}.
 #
 # Decrease (S35: a 2 % random 429 rate held limits at 3-5): outcomes are counted in a sliding
@@ -126,8 +127,12 @@ return {1, inflight + 1, limit, tostring(expires)}
 # from is kept as `w_max`; from `settle_ratio x w_max` on, growth is one step per `probe_secs`
 # and only on a success at full use (S07: it saw-toothed 44-64 around a capacity of 50 with
 # ~50 leases in use); `w_max` is dropped once the limit passes `w_max / settle_ratio` without
-# a cut (capacity grew). A throttle met while probing,
-# `probe_secs` after the last cut, cuts back to the plateau (x settle_ratio), not x0.7.
+# a cut (capacity grew). A throttle met while probing, `probe_secs` after the last cut, cuts
+# back to the plateau (x settle_ratio), not x0.7.
+# Futile cuts (S35b: a 30 % random 429 storm kept cutting every second): when the throttle
+# ratio is still >= hold_ratio x the ratio at the last cut (within 10 windows of the last cut
+# or hold), cutting did not help, so the throttles do not come from our concurrency; the limit
+# is then not cut below the start value.
 # DS12: a success counts toward growth only when inflight >= utilisation x the lane's allowed
 # slots; growth is capped at 2 x the peak inflight (decaying with `peak_halflife` seconds).
 LIMITER_RELEASE = (
@@ -145,7 +150,7 @@ local throttled = ARGV[5] == '1'
 local window = tonumber(ARGV[17])
 local settle = tonumber(ARGV[18])
 local h = redis.call('HMGET', KEYS[1], 'win_start', 'win_ok', 'win_thr', 'prev_ok', 'prev_thr',
-  'last_decrease', 'w_max', 'last_increase')
+  'last_decrease', 'w_max', 'last_increase', 'cut_ratio', 'last_hold')
 local win_start = tonumber(h[1] or '0') or 0
 local win_ok = tonumber(h[2] or '0') or 0
 local win_thr = tonumber(h[3] or '0') or 0
@@ -154,6 +159,8 @@ local prev_thr = tonumber(h[5] or '0') or 0
 local last_decrease = tonumber(h[6] or '0') or 0
 local w_max = tonumber(h[7] or '0') or 0
 local last_increase = tonumber(h[8] or '0') or 0
+local cut_ratio = tonumber(h[9] or '0') or 0
+local last_hold = tonumber(h[10] or '0') or 0
 if now - win_start >= window then
   if now - win_start < 2 * window then
     prev_ok, prev_thr = win_ok, win_thr
@@ -182,10 +189,18 @@ if throttled then
         and now - last_decrease >= tonumber(ARGV[19]) then
       factor = settle  -- probing hit the known ceiling again: back to the plateau only
     end
-    redis.call('HSET', KEYS[1], 'w_max', limit, 'ramp', 0, 'ok_count', 0,
-      'last_decrease', tostring(now))
-    limit = math.max(min_l, math.floor(limit * factor))
-    redis.call('HSET', KEYS[1], 'limit', limit)
+    local target = math.max(min_l, math.floor(limit * factor))
+    if cut_ratio > 0 and now - math.max(last_decrease, last_hold) <= 10 * window
+        and ratio >= tonumber(ARGV[21]) * cut_ratio then
+      target = math.max(target, math.min(limit, tonumber(ARGV[1])))  -- futile: hold the start
+      if target >= limit then redis.call('HSET', KEYS[1], 'last_hold', tostring(now)) end
+    end
+    if target < limit then
+      redis.call('HSET', KEYS[1], 'w_max', limit, 'ramp', 0, 'ok_count', 0,
+        'last_decrease', tostring(now), 'cut_ratio', tostring(ratio))
+      limit = target
+      redis.call('HSET', KEYS[1], 'limit', limit)
+    end
     if ratio >= tonumber(ARGV[16]) then
       paused = math.max(paused, now + tonumber(ARGV[9]))
       redis.call('HSET', KEYS[1], 'paused_until', tostring(paused))

@@ -31,7 +31,7 @@ class LocalLimiter:
         *,
         bg_share: float = 0.8,
         pause_secs: float = 2.0,
-        lease_ttl_secs: float = 240.0,
+        lease_ttl_secs: float = 60.0,
         poll_secs: float = 0.05,
         min_throttles: int = 2,
         pause_ratio: float = 0.5,

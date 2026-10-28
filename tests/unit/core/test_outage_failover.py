@@ -122,6 +122,33 @@ async def test_send_gets_at_most_half_the_remaining_budget() -> None:
     assert direct == [("r-1", True)]
 
 
+async def test_slow_send_behind_a_burst_keeps_waiting_while_sqs_progresses() -> None:
+    """S35b bug: 10K sends queued behind one batching sender passed the 5 s send timeout, so the
+    sender failed SQS over and ran ~1,000 calls direct in its own process (claims left running,
+    pool errors). While other sends complete, a slow send waits on, up to the budget share.
+    """
+    q, _, direct = make_queue(sqs_send_timeout_secs=0.1)
+
+    async def progressing() -> None:  # other sends completing every 50 ms
+        for _ in range(10):
+            q._sent_at = time.monotonic()
+            await asyncio.sleep(0.05)
+
+    async def slow_send() -> None:
+        await asyncio.sleep(0.3)
+
+    ticker = asyncio.create_task(progressing())
+    await q._bounded_send("big", asyncio.ensure_future(slow_send()), time.time() + 30)
+    await ticker
+    assert direct == []
+    assert q._sent_at > 0
+    stalled = asyncio.ensure_future(asyncio.sleep(3600))
+    with pytest.raises(TimeoutError):  # no send completed within the timeout: SQS stalled
+        await q._bounded_send("big", stalled, time.time() + 30)
+    await asyncio.sleep(0)  # let the cancellation land
+    assert stalled.cancelled()
+
+
 async def test_dispatcher_read_errors_switch_new_calls_to_direct() -> None:
     """S21 bug: a send-only pod never noticed Valkey was down because the dispatcher's read
     errors did not reach FailoverState; calls kept going to SQS. Wired as the client wires it,

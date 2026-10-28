@@ -11,6 +11,7 @@ a minor release may break the public API, with a deprecation announced one minor
 - Limit overshoot: growth slows near the last cut point; settles at 57–63 instead of swinging 44–64 (S07).
 - Spurious claim takeovers under load: the heartbeat treated the worker's own just-finished claim as lost and cancelled the result publish (S35c, S27: 19 and 4 losses → 0). A real claim loss now ends the task quietly with a warning, no ERROR traceback.
 - Valkey pools are sized to worker slots + 16; a failed lease release is retried on the next limiter call instead of holding the slot for 240 s.
+- Throttle storms: a cut that does not lower the throttle ratio stops at the start value; a throttled step gets `throttle_retry_attempts` (new, default 6) tries; an rt call walks the fallback chain up to 3 times before `no_capacity`; leases live 60 s (was 240 s, renewed every 10 s) so a killed pod's slots return within a minute; a send queued behind a burst no longer counts as SQS down while other sends complete. 10K burst with 30 % random throttles and a worker kill: 16.3 → 49.7-59.3 req/s, 17.5 % → 99.2 % ok (S35b); S35 76.1 → 90.4 req/s.
 - SQS down: the send is bounded by `sqs_send_timeout_secs` and half the remaining budget, then the call runs direct; first call served in 5.7 s instead of timing out (S20).
 - Valkey down on a send-only pod: result-read errors now trip failover; waiting callers run direct; cancels are replayed on recovery (S21).
 - Target-specific errors (ResourceNotFound, AccessDenied, model not in region, 404) move to the next fallback target instead of ending the call (S38).
@@ -76,5 +77,4 @@ First pre-release. Everything listed below is new.
 - A reply that can't be stored is cached per pod; a redelivery to a different pod calls the provider again.
 - Exhausted jobs reach a dead-letter queue only if their queue has one configured.
 - Cluster-mode Valkey is covered by key-slot tests, not yet by a real cluster run.
-- A 30 % random throttle storm (S35b) still holds limits low: a throttle-counting limiter can't tell it from overload; using Retry-After as a signal is planned.
 - A call queued during a Valkey outage longer than `valkey_wait_failover_secs` can run twice if a worker takes it before its cancel flag is replayed.

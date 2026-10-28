@@ -243,7 +243,8 @@ async def test_renew_does_not_revive_expired_lease(
 async def test_throttle_ends_ramp_decreases_once_per_second(
     valkey: redis.asyncio.Redis, keys: KeySpace
 ) -> None:
-    lim = make(valkey, keys, initial={M: 10})
+    lim = make(valkey, keys, initial={M: 4})  # start 4: futile cuts may go down to it
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 1})
     await throttle(lim)
     assert await limit_of(lim) == 7
     assert await valkey.hget(keys.limiter(M, T), "ramp") == b"0"
@@ -457,7 +458,7 @@ async def test_one_cut_per_round_trip(valkey: redis.asyncio.Redis, keys: KeySpac
 
     A call started before the cut and throttled after the window is ignored; a new one counts.
     """
-    lim = make(valkey, keys, initial={M: 10})
+    lim = make(valkey, keys, initial={M: 4})
     await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 0})
     old = await lim.try_acquire(M, T, Lane.RT)
     assert old is not None
@@ -571,7 +572,7 @@ async def test_throttle_while_probing_cuts_back_to_the_plateau(
     A storm met while probing near w_max cuts x settle_ratio; a second storm soon after
     (capacity really dropped) cuts x decrease_factor again.
     """
-    lim = make(valkey, keys, initial={M: 20}, max_limit=100)
+    lim = make(valkey, keys, initial={M: 4}, max_limit=100)
     await valkey.hset(keys.limiter(M, T), mapping={"limit": 20, "ramp": 0, "w_max": 21})
     await throttle(lim)
     assert await limit_of(lim) == 18  # floor(20 x 0.9), not 14
@@ -594,3 +595,26 @@ async def test_probing_needs_every_slot_in_use(valkey: redis.asyncio.Redis, keys
     await succeed(lim, 2)  # inflight 9 of 9
     assert await limit_of(lim) == 10
     await release_all(lim, held)
+
+
+async def test_futile_cuts_stop_at_the_start_value(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Bug S35b: a 30 % random 429 storm kept cutting every second, far below the start value.
+
+    When the throttle ratio does not fall after a cut, the throttles are not ours: the limit
+    is cut no lower than the start value; a cut that did lower the ratio may go below it.
+    """
+    lim = make(valkey, keys, initial={M: 8}, max_limit=100)
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 10, "ramp": 0})
+    await throttle(lim)
+    assert await limit_of(lim) == 7
+    await asyncio.sleep(1.05)
+    await throttle(lim, 1)  # ratio still 1.0: futile, and 7 is already below the start
+    assert await limit_of(lim) == 7
+    await asyncio.sleep(2.1)  # past both windows: a fresh, lower ratio
+    for i in range(10):
+        lease = await lim.try_acquire(M, T, Lane.RT)
+        assert lease is not None
+        await lim.release(lease, throttled=i in (4, 9))  # 20 % < 0.6 x 100 %: the cut helped
+    assert await limit_of(lim) == 4

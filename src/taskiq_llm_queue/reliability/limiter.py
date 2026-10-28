@@ -55,7 +55,7 @@ class LimiterSettings:
     bg_share: float = 0.8
     utilisation: float = 0.9
     ramp_cap: int | None = None
-    lease_ttl_secs: float = 240.0
+    lease_ttl_secs: float = 60.0  # 6 pod heartbeats; a killed pod's slots return in 1 min
     poll_secs: float = 0.05
     max_poll_secs: float = 0.25
     peak_halflife_secs: float = 300.0
@@ -67,6 +67,8 @@ class LimiterSettings:
     # S07: hold the limit near `settle_ratio x` the last cut point and probe above it slowly.
     settle_ratio: float = 0.9
     probe_secs: float = 5.0
+    # S35b: throttles that do not fall after a cut are not ours; hold at the start value.
+    hold_ratio: float = 0.6
 
     def __post_init__(self) -> None:
         """Reject impossible settings at construction (boot time), never on a call path."""
@@ -86,6 +88,8 @@ class LimiterSettings:
             raise ValueError("need min_throttles >= 1, window_secs > 0 and probe_secs >= 0")
         if not 0 < self.settle_ratio <= 1:
             raise ValueError("settle_ratio must be in (0, 1]")
+        if self.hold_ratio < 0:
+            raise ValueError("hold_ratio must be >= 0")
 
     def retry_delay(self, attempt: int, paused_secs: float, rng: random.Random) -> float:
         """Sleep before the next acquire try: the pause remaining, else jittered backoff.
@@ -207,6 +211,7 @@ def _release_args(
         settings.settle_ratio,
         settings.probe_secs,
         settings.lease_ttl_secs,
+        settings.hold_ratio,
     ]
 
 
@@ -337,7 +342,7 @@ class AdaptiveLimiter:
     async def _drop_orphans(self) -> None:
         """Remove leases whose release (or acquire reply) failed; kept for a later try on error.
 
-        Bug 4 (S35 pool exhaustion): a failed release left its lease live for 240 s.
+        Bug 4 (S35 pool exhaustion): a failed release left its lease live for `lease_ttl_secs`.
         """
         orphans = list(self._orphans)
         try:

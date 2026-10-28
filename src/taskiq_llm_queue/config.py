@@ -98,7 +98,9 @@ class LimiterTuning(BaseModel):
     bg_share: float = Field(default=0.8, gt=0, le=1)
     utilisation: float = Field(default=0.9, gt=0, le=1)
     ramp_cap: int | None = Field(default=None, ge=1)
-    lease_ttl_secs: float = Field(default=240.0, gt=0)
+    # Renewed every pod heartbeat (10 s); a killed pod's slots return within it (S35b: 240 s
+    # left a killed worker's leases blocking most of the limit for 4 minutes).
+    lease_ttl_secs: float = Field(default=60.0, gt=0)
 
     @model_validator(mode="after")
     def _min_le_max(self) -> LimiterTuning:
@@ -183,6 +185,14 @@ class QueueConfig(BaseModel):
     job_queues: dict[str, str] = Field(default_factory=dict)
     retry_attempts: int = Field(default=3, ge=1, le=10)
     retry_base_secs: float = Field(default=1.0, ge=0)
+    throttle_retry_attempts: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Attempts per fallback step once the provider throttled it (instead of "
+        "`retry_attempts` when larger), each after a backoff that holds no limiter slot. "
+        "At S35b's 30 % random 429 rate a step fails 0.3^3 = 2.7 % with 3 tries, 0.07 % with 6.",
+    )
     sqs_wait_time_secs: int = Field(default=20, ge=0, le=20)
     sqs_failover_secs: float = Field(default=300.0, gt=0)
     attempt_timeout_secs: float = Field(
@@ -317,6 +327,7 @@ class QueueConfig(BaseModel):
             ("CONSUMER_DRAIN_SECS", "drain_secs", float),
             ("RETRY_ATTEMPTS", "retry_attempts", int),
             ("RETRY_BASE_SECS", "retry_base_secs", float),
+            ("THROTTLE_RETRY_ATTEMPTS", "throttle_retry_attempts", int),
             ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
             ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),
             ("ATTEMPT_TIMEOUT_SECS", "attempt_timeout_secs", float),

@@ -208,14 +208,6 @@ async def burst(
     ctx.expect(ok_ratio >= min_ok_ratio, f"ok ratio {ok_ratio:.4f} < {min_ok_ratio}: {s['errors']}")
 
 
-STORM_FLOOR = (
-    "a 30 % random throttle storm is clustered loss by any measure, so the limiter cuts once per "
-    "window and holds low limits: measured 17 req/s, ok 59.7 % (was 16.3 req/s, ok 17.5 %) with "
-    "timeouts dominating; random loss that does not fall when concurrency falls needs a "
-    "different signal than AIMD (e.g. Retry-After). Exactly-once, DLQ and leak checks pass"
-)
-
-
 @scenario(
     "S35",
     "10K burst: 1 sender, 3 workers, realistic latency, light throttle",
@@ -232,7 +224,6 @@ async def s35(ctx: Ctx) -> None:
     "10K burst under a 30 % throttle storm, one worker killed mid-run",
     tags=("slow",),
     chaos=True,
-    xfail=STORM_FLOOR,
 )
 async def s35b(ctx: Ctx) -> None:
     """Same mix with throttle_rate 0.3 everywhere; w2 is hard-killed 10 s in."""

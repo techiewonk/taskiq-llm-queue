@@ -34,6 +34,7 @@ from taskiq_llm_queue import (
 )
 from taskiq_llm_queue.core import (
     MAX_BACKOFF_SECS,
+    RT_CAPACITY_PASSES,
     CoreDeps,
     InfraError,
     backoff_secs,
@@ -271,20 +272,37 @@ async def test_result_written_before_claim_done(world: World) -> None:
 
 
 async def test_throttles_retry_then_fall_back_to_other_target(world: World) -> None:
-    """Three throttles on the primary, then the APAC target serves; slots never leak (DS10)."""
+    """Six throttles on the primary, then the APAC target serves; slots never leak (DS10)."""
     throttle = FakeError(ErrorKind.THROTTLE, "ThrottlingException")
-    world.provider.script["primary"] = [throttle, throttle, throttle]
+    world.provider.script["primary"] = [throttle] * 6
     reply = (await execute_job(envelope(), world.deps)).reply
     assert reply is not None
     assert reply.ok
     meta = reply.meta
-    assert (meta.served_target, meta.fallback_used, meta.attempts) == ("apac", True, 4)
+    assert (meta.served_target, meta.fallback_used, meta.attempts) == ("apac", True, 7)
     assert world.limiter.held == 0
     throttled = [e[3] for e in world.limiter.events if e[0] == "release"]
-    assert throttled == [True, True, True, False]
-    assert len(world.sleeps) == 2  # backoff between attempts, not after the last one
+    assert throttled == [True] * 6 + [False]
+    assert len(world.sleeps) == 5  # backoff between attempts, not after the last one
     assert ("primary", False) not in world.breaker.records  # throttles are the limiter's
-    assert world.breaker.records.count(("primary", None)) == 3
+    assert world.breaker.records.count(("primary", None)) == 6
+
+
+async def test_throttled_step_gets_more_tries_than_errors(world: World) -> None:
+    """Bug S35b: under 30 % random 429s a step gave up after 3 tries (2.7 % of calls failed).
+
+    A throttled step is retried up to `throttle_retry_attempts`; plain errors keep 3 tries.
+    """
+    throttle = FakeError(ErrorKind.THROTTLE, "ThrottlingException")
+    world.provider.script["primary"] = [throttle] * 5
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert (reply.meta.served_target, reply.meta.attempts) == ("primary", 6)
+    world.provider.script["primary"] = [FakeError(ErrorKind.RETRYABLE)] * 3
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert (reply.meta.served_target, reply.meta.attempts) == ("apac", 4)
 
 
 async def test_release_happens_before_sleep(world: World) -> None:
@@ -330,8 +348,8 @@ async def test_fatal_error_is_not_retried(world: World) -> None:
 
 async def test_exhausted_steps_give_retryable_error(world: World) -> None:
     """Every step failing gives one retryable error reply, never an exception."""
-    world.provider.script["primary"] = [FakeError(ErrorKind.THROTTLE, "Throttling")] * 3
-    world.provider.script["apac"] = [FakeError(ErrorKind.THROTTLE, "Throttling")] * 3
+    world.provider.script["primary"] = [FakeError(ErrorKind.THROTTLE, "Throttling")] * 6
+    world.provider.script["apac"] = [FakeError(ErrorKind.THROTTLE, "Throttling")] * 6
     reply = (await execute_job(envelope(), world.deps)).reply
     assert reply is not None
     assert not reply.ok
@@ -522,6 +540,35 @@ async def test_redis_error_after_an_attempt_reports_attempted(world: World) -> N
         await execute_job(envelope(), world.deps)
     assert info.value.attempted is True
     assert world.limiter.held == 0
+
+
+async def test_rt_call_walks_the_chain_again_before_no_capacity(world: World) -> None:
+    """Bug S35: an rt call failed `no_capacity` after one 2 s slot wait in a burst ramp.
+
+    rt walks the fallback chain RT_CAPACITY_PASSES times before giving up, so a slot that frees
+    up on the second pass serves it; a target that never frees up still fails retryable.
+    """
+    targets = {("big", "primary"), ("big", "apac")}
+    world.limiter.deny.update(targets)
+    original = world.limiter.acquire
+
+    async def freed_on_second_pass(*args: Any, **kwargs: Any) -> Lease | None:
+        if len(world.limiter.waits) >= 2:
+            world.limiter.deny.clear()
+        return await original(*args, **kwargs)
+
+    world.limiter.acquire = freed_on_second_pass  # type: ignore[method-assign]
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert reply.meta.served_target == "primary"
+    world.limiter.acquire = original  # type: ignore[method-assign]
+    world.limiter.deny.update(targets)
+    world.limiter.waits.clear()
+    reply = (await execute_job(envelope(lane="rt", request_id="r-2"), world.deps)).reply
+    assert reply is not None
+    assert not reply.ok
+    assert len(world.limiter.waits) == 2 * RT_CAPACITY_PASSES
 
 
 async def test_queued_bg_call_without_capacity_is_requeued(world: World) -> None:
