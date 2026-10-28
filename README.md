@@ -1,6 +1,6 @@
-# taskiq-llm-queue (draft)
+# taskiq-llm-queue
 
-> **Status:** pre-alpha (0.1.0.dev). Everything below is built and tested (512 tests on Valkey 8.1, ElasticMQ 1.7.1 and fakellm): the `LLMQueue` client, the SQS broker, limiter/claims/breaker/fallback, JSON and S3 result backends, providers, LangChain adapters, canary routing, failover and the CLI. The API is frozen for 0.x (see CHANGELOG.md and docs/DESIGN.md).
+> **Status:** pre-alpha (`0.1.0a1`). Built and tested: the `LLMQueue` client, the SQS broker, adaptive limiter, claims, circuit breaker, retry and fallback, JSON and S3 result backends, Bedrock and OpenAI-compatible providers, LangChain/LangGraph adapters, canary routing, failover and the CLI. 619 tests on Valkey 8.1, ElasticMQ 1.7.1 and a fake LLM server; CI on Python 3.11–3.14. Breaking changes are still possible before 0.1 (see [CHANGELOG](https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md)).
 
 An LLM request client with its own durable queue, built on [taskiq](https://github.com/taskiq-python/taskiq) and Amazon SQS.
 
@@ -27,16 +27,23 @@ your code ──> client / LangChain adapter ──> SQS (per model: -rt queue f
 ```bash
 uv add "taskiq-llm-queue[langchain-aws]"                     # Bedrock + LangChain
 uv add "taskiq-llm-queue[openai,langchain-openai]"           # OpenAI-compatible + LangChain
-# core: taskiq, aiobotocore, redis>=5, pydantic, xxhash
-# extras: openai, langchain-aws, langchain-openai, s3, metrics
+uv add "taskiq-llm-queue[speedups]"                          # hiredis parser for redis-py
 ```
 
-The package declares version **ranges**; pin exact versions in your app's lockfile.
+| | Packages |
+|---|---|
+| Core | `taskiq`, `aiobotocore`, `redis>=5.0.1`, `pydantic>=2.10`, `orjson`, `structlog` |
+| `openai` | `openai`, `httpx` |
+| `langchain-aws` / `langchain-openai` | LangChain **0.3 and 1.x** are both supported |
+| `metrics` | `prometheus-client` |
+| `speedups` | `hiredis` |
+
+The package declares version **ranges**; pin exact versions in your app's lockfile. `aiobotocore` pins a narrow `botocore` window, so let your resolver pick an `aiobotocore` that matches your `boto3`.
 
 ## Quickstart
 
 ```python
-from taskiq_llm_queue import LLMQueue, QueueConfig, ModelConfig, Target, request_context
+from taskiq_llm_queue import LLMQueue, ModelConfig, QueueConfig, Target, request_context
 from taskiq_llm_queue.langchain import QueuedChatBedrockConverse
 
 llmq = LLMQueue(QueueConfig(
@@ -54,7 +61,7 @@ llmq = LLMQueue(QueueConfig(
 
 async def main():
     await llmq.start(mode="both")                             # "send" | "work" | "both"
-    model = QueuedChatBedrockConverse(llmq=llmq, model="gpt120b")
+    model = QueuedChatBedrockConverse(llmq=llmq, model_alias="gpt120b")
     with request_context(lane="rt", session_id="s-1", user_id="u-1"):
         reply = await model.ainvoke("Summarise today's market in one line.")
     print(reply.content, reply.response_metadata["served_model"])
@@ -65,44 +72,68 @@ In a FastAPI app, call `start()` in the lifespan startup and `stop()` on shutdow
 
 ## Client API
 
+Every call returns a result object with `.meta`: `served_model`, `served_target`, `fallback_used`, `attempts`, `queue_wait_ms`, `provider_ms`, `worker`.
+
 ```python
 res = await llmq.converse("gpt120b", {"messages": [...], "system": [...], "toolConfig": ...},
-                          lane="rt", fallback="chain", timeout=90)
-res.response            # exact Bedrock Converse dict
-res.meta                # served_model, served_target, fallback_used, queue_wait_ms, attempts
+                          lane="rt", fallback="chain", timeout_secs=90, request_id="req-1")
+res.response                    # exact Bedrock Converse dict
 
-vectors = await llmq.embed("titan-v2", ["a", "b"], lane="bulk")         # list[list[float]]
-raw = await llmq.invoke_model("titan-v2", {"inputText": "a"})            # raw provider body
-chat = await llmq.chat("local-llama", {"messages": [{"role": "user", "content": "hi"}]})   # OpenAI-compatible
+emb = await llmq.embed("titan", ["a", "b"], lane="bulk")
+emb.vectors                     # list[list[float]]; `emb` itself also works as a list
+
+chat = await llmq.chat("llama", {"messages": [{"role": "user", "content": "hi"}]})
+chat.response                   # OpenAI-compatible chat completion dict
+
+raw = await llmq.invoke_model("titan", {"inputText": "a"}, content_type="application/json")
+raw.json(), raw.body, raw.content_type
+
+await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQueueCancelled
 ```
 
+- **Timing:** `timeout_secs` (relative) or `deadline_at` (absolute epoch seconds) on every call.
 - **Model ids** are aliases, optionally with a target: `gpt120b`, `gpt120b@apac`. Unknown aliases are rejected when the config is built.
-- **Errors:** `LLMQueueError`, with subclasses `LLMQueueTimeout`, `ProviderError(retryable, retry_after)` and `QueueUnavailable`.
-- **Sync callers:** sync methods (e.g. `embed_query`) run `direct` under the shared limiter through a small sync Redis client, and count `llmq_sync_fallback_total`. Set `strict_async=True` to raise instead.
+- **Errors:** everything derives from `LLMQueueError`: `LLMQueueTimeout`, `LLMQueueCancelled`, `ProviderError(retryable, retry_after_secs)`, `QueueUnavailable`, `ConfigError`.
+- **Sync callers:** `converse_sync`, `chat_sync`, `embed_sync`, `invoke_model_sync` run `direct` under the shared limiter (counted as sync fallbacks). Set `strict_async=True` to raise instead. `close_sync()` (or `stop()`) closes the sync runner.
+- **Jobs:** `register_job(name, fn)` on workers, `send_job(name, payload, timeout_secs=...)` anywhere; jobs run on the job queues with the same claims and DLQ rules.
 
 ## LangChain and LangGraph
 
 | Class | Based on | How |
 |---|---|---|
-| `QueuedChatBedrockConverse` | `langchain_aws.ChatBedrockConverse` | Native async `_agenerate` using the parent's own helpers; `bind_tools`, structured output via tools, cache usage, serviceTier |
+| `QueuedChatBedrockConverse` | `langchain_aws.ChatBedrockConverse` | Builds the request and parses the reply with the installed langchain-aws's own code, so `bind_tools`, structured output, cache usage and service tier match exactly |
 | `QueuedBedrockEmbeddings` | `langchain_aws.BedrockEmbeddings` | `aembed_query` / `aembed_documents` go through the queue |
-| `QueuedChatOpenAI` | `langchain_openai.ChatOpenAI` | `http_async_client` with a queued httpx transport: chat completions (incl. raw responses and tool calls) and embeddings go through the queue and LangChain parses as usual. The Responses API (`/responses`) is not supported yet |
+| `QueuedChatOpenAI` | `langchain_openai.ChatOpenAI` | `http_async_client` with a queued httpx transport: chat completions and embeddings go through the queue; queue meta lands in `response_metadata`. The Responses API (`/responses`) is not supported yet |
 | `QueuedOpenAIEmbeddings` | `langchain_openai.OpenAIEmbeddings` | Same transport; `check_embedding_ctx_length=False` by default for non-OpenAI servers |
 
+- **Model names:** pass the queue alias as `model_alias=` (plus `model_id=` or `llmq=`). Passing an alias as `model=` raises a clear error.
 - **Streaming:** all queued classes force `disable_streaming=True` / `streaming=False`. `astream()` and LangGraph `stream_mode="messages"` return one complete message, so nothing bypasses the queue.
 - **Laziness:** queued classes find the running `LLMQueue` on first use and check routing and the kill switch on every call, so you can create them at import time.
-- **Callbacks** and `RunnableConfig` behave as before.
+
+## Configuration
+
+`QueueConfig.from_env()` reads `LLMQ_*` variables (durations end in `_SECS`; older `_S` names still work with a one-time warning). Notable settings:
+
+| Setting | Default | Note |
+|---|---|---|
+| `aws_region` | `None` | Left to the AWS credential chain / IRSA |
+| `redis_url` or `redis_host`/`port`/`username`/`password`/`ssl` | localhost | `redis_password` is a `SecretStr` |
+| `redis_socket_timeout_secs` / `connect_timeout` / `health_check_interval` | 5 / 2 / 30 | Connection errors retried 3× with backoff |
+| `id_hash_salt` (`LLMQ_ID_HASH_SALT`) | library constant | **Set your own in production**; keys the BLAKE2b hash of session/user ids |
+| `timeout_secs` per lane | rt 90, bg 300, bulk 900 | |
+
+Redis keys are cluster-safe (hash-tagged per request and per model+target), so cluster-mode Valkey (e.g. ElastiCache Serverless) works.
 
 ## Providers
 
 ```python
-ModelConfig(provider="openai", model_id="llama-3.1-70b", base_url="http://vllm:8000/v1",
-            api_key_env="LOCAL_LLM_KEY")
+ModelConfig(provider="openai", model_id="llama-3.1-70b",
+            targets={"primary": Target(base_url="http://vllm:8000/v1")}, api_key_env="LOCAL_LLM_KEY")
 QueueConfig(allowed_providers={"bedrock"}, denied_hosts=["*.openai.azure.com"])   # enforced on sender and worker
 QueueConfig(providers={"myprov": "mypkg.providers:MyProvider"})                    # custom provider, loaded by every pod
 ```
 
-A custom provider implements `async call(op, params, target) -> dict` and `classify(exc) -> ErrorInfo(kind="throttle" | "retryable" | "fatal", retry_after_s)`. It can also be registered through the `taskiq_llm_queue.providers` entry point. SDK-level retries are off inside workers (botocore `max_attempts=1`, openai `max_retries=0`), so throttles reach the limiter.
+A custom provider implements `async call(op, params, target) -> dict` and `classify(exc) -> ErrorInfo(kind="throttle" | "retryable" | "fatal", retry_after_secs)`. It can also be registered through the `taskiq_llm_queue.providers` entry point. SDK-level retries are off inside workers (botocore `total_max_attempts=1`, openai `max_retries=0`), so throttles reach the limiter.
 
 ## Lanes and queues
 
@@ -112,9 +143,11 @@ A custom provider implements `async call(op, params, target) -> dict` and `class
 | `bg` | `llm-<model>` | Background work; at most 80 % of the limit |
 | `bulk` | `llm-<model>-bulk` if configured (e.g. embeddings), else base | Ingestion/batch; lowest priority |
 
+A queued `bg`/`bulk` call waits at most 15 s for a slot, then goes back to the queue with a delay instead of holding a worker.
+
 ## Results
 
-Results are stored as JSON (never pickle) under `<key_prefix>:res:<task_id>` for 5 minutes and read once (`GETDEL`). Each pod runs one result dispatcher that resolves all its waiting calls with one batched `MGET`, optionally woken by a pub/sub message, so 10K waiting calls don't mean 10K polling loops.
+Results are stored as JSON (never pickle) for 5 minutes and read once (`GETDEL`). Each pod runs one result dispatcher: a pub/sub wake reads only the announced results, and a periodic batched sweep catches the rest, so 10K waiting calls don't mean 10K polling loops.
 
 ## Fallbacks: how to check and update
 
@@ -124,18 +157,18 @@ A fallback chain is tried **inside the worker**. Each step is retried with backo
 2. same model, another target (e.g. a cross-region profile `gpt120b@apac`)
 3. another model (only when the call's policy is `chain`)
 
-Embeddings never switch model. A chat (`rt`) call that can't get capacity within 2 s moves to the next step.
+Embeddings never switch model. Throttles shrink the limiter but never trip the circuit breaker; only 5xx and timeouts do.
 
 ```bash
-uv run llm-queue fallback get                       # whole config (JSON)
+uv run llm-queue fallback get                       # whole config (JSON); starts from your app's defaults
 uv run llm-queue fallback get --model gpt120b       # resolved chain for one model
-uv run llm-queue fallback test --model gpt120b      # dry run: which target would serve now (limiter/breaker state)
+uv run llm-queue fallback test --model gpt120b      # dry run: which target would serve now
 uv run llm-queue fallback set --model gpt120b --chain "gpt20b"
-uv run llm-queue fallback set --file fallback.json
+uv run llm-queue fallback set --file fallback.json  # merges per model; --replace to overwrite all
 uv run llm-queue fallback reset                     # back to the startup default
 ```
 
-Chains are stored in `<key_prefix>:cfg:fallback`, validated, and reloaded by every pod within 30 s with no restart. An invalid config is rejected and the last good one stays. Every change is written to the `<key_prefix>:cfg:audit` stream.
+Chains are validated and reloaded by every pod within 30 s with no restart. An invalid config is rejected and the last good one stays. Every change is written to an audit stream.
 
 ```json
 { "chains": {
@@ -145,49 +178,63 @@ Chains are stored in `<key_prefix>:cfg:fallback`, validated, and reloaded by eve
   "skip_targets": { "gpt120b": ["apac"] } }
 ```
 
-Same-model targets are tried in the order of `ModelConfig.targets` (e.g. `primary`, then `apac`); `chains` lists the *other* models tried under policy `chain`; `skip_targets` turns a target off without a restart (e.g. a region not yet approved).
+**To see fallbacks happen:** `res.meta` / `response_metadata` show `served_model`, `served_target`, `fallback_used` and `attempts`, and the `llmq_fallback_total{model,step}` metric counts them. `samples/05_fallback_on_throttle.py` shows it end to end.
 
-**To see fallbacks happen:** `res.meta` / `response_metadata` show `served_model`, `served_target`, `fallback_used` and `attempts`, and the `llmq_fallback_total{model,step}` metric counts them. Locally, follow [TESTING.md §4](TESTING.md#4-verify-fallback-step-by-step).
-
-## Canary routing
+## Operating it
 
 ```bash
-uv run llm-queue routing get
-uv run llm-queue routing set --model gpt20b --lane rt --pct 10
-uv run llm-queue routing kill on                    # everything direct within 30 s
+uv run llm-queue routing set --model gpt20b --lane rt --pct 10   # canary: 10 % of sessions via SQS
+uv run llm-queue routing kill on                                 # everything direct within 30 s
+uv run llm-queue routing reset
+uv run llm-queue limiter show --model gpt120b                    # learned limit, in-flight, pause
+uv run llm-queue limiter reset --model gpt120b [--target apac]   # forget the learned limit
+uv run llm-queue breaker show | reset
+uv run llm-queue queues                                          # messages per queue and DLQ
+uv run llm-queue job send ingest --payload-file payload.json --queue jobs-ingest
 ```
-
-Routing is sticky per `session_id` and audited. Every call is tagged `path=sqs|direct`.
 
 ## Failure behaviour
 
 | Failure | What happens |
 |---|---|
 | Provider throttles | Limiter shrinks and pauses that model + target; brokers stop receiving it unless another target in the chain has headroom; work waits in SQS |
-| Provider down | Circuit breaker opens → next fallback step |
+| Provider down (5xx, timeouts) | Circuit breaker opens → next fallback step |
 | Worker killed mid-task | Message reappears after the visibility timeout; the claim prevents a second provider call |
 | Rolling deploy | Pods stop receiving at once, release unstarted work, finish running calls, then exit (90 s budget in the reference deployment) |
-| **SQS unreachable** | That model switches to `direct` (+ shared limiter) for `sqs_failover_seconds` (300), with an alarm. An ambiguous send is claimed first, so it can't run twice |
-| **Redis/Valkey unreachable** | Workers stop taking tasks; senders run `direct` with a local per-pod cap (last known limit ÷ pods); results/claims need Redis, so chat is degraded until it's back |
+| **SQS unreachable** | That model switches to `direct` (+ shared limiter) for 300 s on transient send errors only. An ambiguous send is claimed first, so it can't run twice |
+| **Redis/Valkey unreachable** | Workers release messages instead of losing them; senders run `direct` with a local per-pod cap (last known limit ÷ live pods) |
+
+## Logging
+
+The library logs with structlog's key-value API on top of stdlib `logging` and **never configures logging itself**. Records are named `taskiq_llm_queue.*`; the message reads `event key=value ...` and the fields are also on `record.llmq` (a dict). Prompts, responses and params are never logged.
+
+```python
+import logging
+logging.getLogger("taskiq_llm_queue").setLevel(logging.INFO)   # stdlib apps: that's all
+
+# loguru apps: the usual InterceptHandler picks these up like any stdlib logger.
+# structlog apps: use structlog.stdlib.ProcessorFormatter on your handler to render them.
+```
+
+The `llm-queue` CLI logs warnings and errors to stderr, so its stdout is always plain JSON.
 
 ## Security and data
 
 - Encryption is server-side on the queues (SSE-SQS or SSE-KMS); the library needs no setting for either.
-- Prompts and responses are never logged. `user_id` / `session_id` are hashed in task labels (`hash_ids=True`), and raw ids stay inside the message body.
+- Prompts and responses are never logged. `user_id` / `session_id` are hashed (keyed BLAKE2b) in task labels; raw ids stay inside the message body.
 - Nothing secret goes into messages; credentials come from the AWS chain (IRSA / Pod Identity) or env.
 - Unknown task names or newer message versions are released for another pod, never silently dropped.
 
 ## Run it locally (no AWS needed)
 
 ```bash
-make up                         # Valkey (password) + ElasticMQ + fakellm + 3 workers
-make test                       # unit (moto server) + integration against the stack
-make scenario S=S10             # fallback: profile, then model
+make up              # Valkey (password) + ElasticMQ + fakellm
+make test            # unit + integration against the stack
 make down
-# Windows without make:  uv run llmq-dev up | test | scenario S10 | down
+# Windows without make:  uv run python tools/llmq_dev.py up | test | down
 ```
 
-See [TESTING.md](TESTING.md) for the stack, scenarios and dashboards.
+Runnable examples are in [`samples/`](https://github.com/techiewonk/taskiq-llm-queue/tree/main/samples): quickstart, chat, embeddings, lanes, fallback on throttle, send-only and worker pods, LangChain, LangGraph, jobs, cancel and timeouts, sync calls, CLI, and `13_research_assistant_flow.py`, which replays a real app's flows locally or against real Bedrock (`--target aws`, settings from `.env` or AWS Secrets Manager). The stack, capability checks and test layers are described in [docs/TESTING.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/TESTING.md); delivery-safety rules in [docs/DESIGN.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/DESIGN.md).
 
 ## Credits
 

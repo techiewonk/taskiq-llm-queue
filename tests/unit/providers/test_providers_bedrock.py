@@ -190,7 +190,7 @@ async def test_read_timeout_is_retryable(fake: FakeLLM) -> None:
     fake.delay_secs = 1.0
     try:
         with pytest.raises(BotoCoreError) as caught:
-            await provider.call("converse", _converse_params(), Target())
+            await provider.call("converse", _converse_params(), Target(region="ap-south-1"))
     finally:
         await provider.aclose()
     assert provider.classify(caught.value).kind is ErrorKind.RETRYABLE
@@ -205,7 +205,7 @@ async def test_connection_refused_is_retryable() -> None:
     )
     try:
         with pytest.raises(BotoCoreError) as caught:
-            await provider.call("converse", _converse_params(), Target())
+            await provider.call("converse", _converse_params(), Target(region="ap-south-1"))
     finally:
         await provider.aclose()
     assert provider.classify(caught.value).kind is ErrorKind.RETRYABLE
