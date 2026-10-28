@@ -1,7 +1,7 @@
 """Cluster-wide adaptive concurrency limiter per (model, target), learned from throttles.
 
 State lives in Valkey (`KeySpace.limiter` hash + `KeySpace.leases` ZSET); every decision is one
-Lua call using Valkey `TIME` (D32, D47, DS10-DS12). `AdaptiveLimiter` serves asyncio workers,
+Lua call using Valkey `TIME` (DS10-DS12). `AdaptiveLimiter` serves asyncio workers,
 `SyncAdaptiveLimiter` serves sync callers on the `direct` path with the same scripts.
 """
 
@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class LimiterSettings:
-    """Tuning of the adaptive limiter (`LLMQ_AC_*`); defaults are the D93 prod start values.
+    """Tuning of the adaptive limiter (`LLMQ_AC_*`); defaults are recommended production starts.
 
     `initial` maps a model alias to its start limit (a stored learned limit always wins);
     `ramp_cap` caps ramp doubling (DS12: 2x the measured peak), defaulting to `max_limit`.

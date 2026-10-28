@@ -186,7 +186,7 @@ def test_from_env_builds_config_and_collects_errors() -> None:
 
 
 def test_config_defaults_follow_plan() -> None:
-    """Lane timeouts and TTLs match the plan (state outlives the longest deadline)."""
+    """Lane timeouts and TTLs match the design (state outlives the longest deadline)."""
     cfg = QueueConfig()
     assert cfg.timeout_secs == {Lane.RT: 90.0, Lane.BG: 300.0, Lane.BULK: 900.0}
     assert cfg.state_ttl_secs >= max(cfg.timeout_secs.values()) + 300

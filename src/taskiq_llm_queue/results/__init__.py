@@ -1,4 +1,4 @@
-"""Results: the JSON result backend and the per-pod batched result dispatcher (plan D80).
+"""Results: the JSON result backend and the per-pod batched result dispatcher.
 
 Workers write results through `LLMQResultBackend` and wake the sender's pod with
 `publish_done`; senders wait on `ResultDispatcher.wait`.

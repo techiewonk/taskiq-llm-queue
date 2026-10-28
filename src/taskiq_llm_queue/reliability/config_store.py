@@ -1,8 +1,8 @@
-"""Live JSON config in Valkey (routing, fallback chains) with last-good fallback and audit (D72).
+"""Live JSON config in Valkey (routing, fallback chains) with last-good fallback and audit.
 
 Readers validate with pydantic and keep the last good value when the stored JSON is invalid or
 Valkey is unreachable, so a bad edit never breaks live calls. Every write appends who changed
-what to `KeySpace.audit` in the same Lua call, trimmed to the retention window (D89).
+what to `KeySpace.audit` in the same Lua call, trimmed to the retention window.
 """
 
 from __future__ import annotations

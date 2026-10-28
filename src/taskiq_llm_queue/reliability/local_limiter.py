@@ -1,4 +1,4 @@
-"""In-process per-pod limiter used while Valkey is down (D73, DS18).
+"""In-process per-pod limiter used while Valkey is down (DS18).
 
 Each pod caps its own concurrency at `local_cap(...)` so all pods together stay under the last
 shared limit. Thread-safe, so the same instance serves async workers and sync `direct` callers.

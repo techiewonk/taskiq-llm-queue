@@ -25,7 +25,7 @@ _TERMINAL = frozenset({ClaimState.DONE, ClaimState.CANCELLED, ClaimState.EXPIRED
 
 @dataclass(frozen=True, slots=True)
 class ClaimSettings:
-    """Claim timing: TTLs (D60), worst-case execution and heartbeat staleness (DS3, DS5).
+    """Claim timing: TTLs, worst-case execution and heartbeat staleness (DS3, DS5).
 
     A heartbeat older than `2 x heartbeat_interval_secs` is stale and the task is reclaimed.
     """

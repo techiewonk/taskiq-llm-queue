@@ -2,7 +2,7 @@
 
 Workers store results through taskiq (`set_result`) or `put`; callers read them back through
 taskiq (`get_result`, deleted on read) or in batches through `take_many`, which the per-pod
-`ResultDispatcher` calls once per interval (plan D80). Results are JSON only, never pickle.
+`ResultDispatcher` calls once per interval. Results are JSON only, never pickle.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ DEFAULT_TAKE_BATCH = 1000  # keys per MGET; 10K waiters on one pod -> 10 MGETs p
 class LLMQResultBackend(AsyncResultBackend[Any]):
     """Stores task results as JSON under `KeySpace.result(task_id)` with a TTL.
 
-    Several brokers may share one instance (plan finding A6): `startup` counts users and
+    Several brokers may share one instance (finding A6): `startup` counts users and
     `shutdown` closes the pool only when the last of them shuts down. An injected client is
     never closed here; its creator owns it. `aclose` force-closes an owned pool.
     """
@@ -52,7 +52,7 @@ class LLMQResultBackend(AsyncResultBackend[Any]):
     ) -> None:
         """Keep settings only; the owned client is created lazily on first use (no I/O here).
 
-        `delete_on_read` makes taskiq's `get_result` use `GETDEL` (plan §9.2). `take_batch`
+        `delete_on_read` makes taskiq's `get_result` use `GETDEL`. `take_batch`
         caps the keys sent in one `MGET` by `take_many`.
         """
         if take_batch < 1:

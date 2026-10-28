@@ -138,7 +138,7 @@ async def test_invoke_model_cohere_with_string_body(
 async def test_every_bedrock_error_classifies_and_is_called_once(
     fake: FakeLLM, bedrock: BedrockProvider, code: str, kind: ErrorKind
 ) -> None:
-    """Also pins D32: SDK retries are off, so the server sees exactly one call per error."""
+    """Also pins: SDK retries are off, so the server sees exactly one call per error."""
     fake.fail_next(bedrock_error(code))
     with pytest.raises(ClientError) as caught:
         await bedrock.call("converse", _converse_params(), Target())

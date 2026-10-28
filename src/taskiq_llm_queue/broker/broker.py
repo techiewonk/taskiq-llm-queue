@@ -3,7 +3,7 @@
 Feature parity with taskiq-aio-sqs and taskiq-sqs (multi-queue routing, FIFO / fair
 queues, delay, expiry, batched send, heartbeat, metadata, declare) plus strict priority
 across queues, capacity-aware real long polls, receive gates, batched ack / heartbeat and
-release on shutdown (plan §7.2). Both upstream projects are MIT; this is our own code.
+release on shutdown (see docs/DESIGN.md). Both upstream projects are MIT; this is our own code.
 """
 
 from __future__ import annotations

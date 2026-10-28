@@ -58,7 +58,7 @@ async def test_unknown_op_raises(openai_provider: OpenAICompatProvider) -> None:
 async def test_status_classification_and_single_attempt(
     fake: FakeLLM, openai_provider: OpenAICompatProvider, status: int, kind: ErrorKind
 ) -> None:
-    """Also pins D88: `max_retries=0`, so the server sees exactly one call per error."""
+    """Also pins: `max_retries=0`, so the server sees exactly one call per error."""
     fake.fail_next(openai_error(status, code="rate_limit_exceeded" if status == 429 else ""))
     with pytest.raises(openai.APIStatusError) as caught:
         await openai_provider.call("chat", CHAT, Target())

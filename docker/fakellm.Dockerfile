@@ -1,4 +1,4 @@
-# fakellm: fake Bedrock runtime + OpenAI-compatible server for the local test stack (D71).
+# fakellm: fake Bedrock runtime + OpenAI-compatible server for the local test stack.
 # Build context is tools/fakellm (see compose.yaml), so the image holds only the fake.
 FROM python:3.12-slim
 

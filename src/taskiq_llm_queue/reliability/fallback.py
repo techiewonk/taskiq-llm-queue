@@ -1,6 +1,6 @@
 """Fallback order for one call: same model on other targets first, other models only on `chain`.
 
-Pure logic over `QueueConfig` and the live `FallbackConfig` (§8, D50, D72). Embeddings never
+Pure logic over `QueueConfig` and the live `FallbackConfig`. Embeddings never
 switch model (vectors from another model are incompatible). The worker walks the steps in order
 and checks limiter headroom itself where a step says `require_headroom`.
 """
@@ -29,10 +29,10 @@ class ChainStep(BaseModel):
 
 
 class FallbackConfig(BaseModel):
-    """Live fallback chains stored as JSON at `KeySpace.fallback` (D72).
+    """Live fallback chains stored as JSON at `KeySpace.fallback`.
 
     `chains` maps a primary alias to the other models tried under policy `chain`;
-    `skip_targets` lists targets not usable yet per alias (e.g. APAC before sign-off, T1.0b).
+    `skip_targets` lists targets not usable yet per alias (e.g. APAC before sign-off).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

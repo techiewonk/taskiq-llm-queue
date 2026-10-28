@@ -69,7 +69,7 @@ class ModelConfig(BaseModel):
 class QueueConfig(BaseModel):
     """Everything `LLMQueue` needs; immutable after construction.
 
-    Timeouts are per lane; TTLs follow the plan's rule (state keys outlive the longest lane
+    Timeouts are per lane; TTLs follow one rule (state keys outlive the longest lane
     deadline plus worst-case execution; results only until the caller reads them).
     """
 

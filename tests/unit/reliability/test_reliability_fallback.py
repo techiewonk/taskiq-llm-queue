@@ -1,4 +1,4 @@
-"""Fallback resolution matrix (§8, D50): targets first, other models only on `chain`."""
+"""Fallback resolution matrix: targets first, other models only on `chain`."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ def test_switched_model_and_headroom_flags() -> None:
 
 
 def test_skip_targets_drops_unapproved_targets() -> None:
-    """T1.0b: APAC targets are skipped until compliance sign-off, for primary and chain."""
+    """Targets listed in skip_targets (e.g. not yet approved) are skipped, for primary and chain."""
     live = LIVE.model_copy(update={"skip_targets": {"gpt120b": {"apac"}, "gpt20b": {"apac"}}})
     steps = resolve_fallback(CONFIG, "gpt120b", policy="chain", live=live)
     assert pairs(steps) == [("gpt120b", "primary"), ("gpt20b", "primary")]

@@ -1,4 +1,4 @@
-"""Check which SQS features a fake SQS endpoint supports (plan T0.1b).
+"""Check which SQS features a fake SQS endpoint supports.
 
 Runs the SQS calls our broker depends on against any endpoint (ElasticMQ, moto server, real
 SQS) using aiobotocore, and prints a capability table. The script creates its own ``cap-*``

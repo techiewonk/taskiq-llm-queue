@@ -264,7 +264,7 @@ return 0
 """
 
 # KEYS: config key, audit stream. ARGV: new JSON ('' deletes), actor, retention_ms.
-# Writes the value and its audit entry atomically, trims entries older than retention (D89).
+# Writes the value and its audit entry atomically, trims entries older than retention.
 # Reply: the previous value ('' if none).
 CONFIG_SET = (
     _NOW

@@ -1,4 +1,4 @@
-"""Per-pod result dispatcher: one batched read resolves every waiting caller (plan D80).
+"""Per-pod result dispatcher: one batched read resolves every waiting caller.
 
 Callers `await dispatcher.wait(task_id, timeout_secs, lane)`; a background loop polls all
 pending ids with one `ResultStore.take_many` per interval instead of one poll per waiter, and

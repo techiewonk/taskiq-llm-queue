@@ -2,7 +2,7 @@
 
 Payloads are provider-native and pass through unchanged, so responses are exactly what
 `ChatBedrockConverse` / `BedrockEmbeddings` parse. SDK retries are off (one attempt per call)
-so throttles reach the adaptive limiter instead of being hidden by botocore (D32).
+so throttles reach the adaptive limiter instead of being hidden by botocore.
 """
 
 from __future__ import annotations

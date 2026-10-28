@@ -77,7 +77,7 @@ services:
 ### Fake SQS: ElasticMQ queues
 
 ```hocon
-# libs/taskiq_llm_queue/docker/elasticmq.conf (planned) — same names/settings as prod §12.1
+# docker/elasticmq.conf — same queue names and settings as a typical production setup
 include classpath("application.conf")
 node-address { protocol = http, host = sqs, port = 9324, context-path = "" }
 rest-sqs { enabled = true, bind-port = 9324, bind-hostname = "0.0.0.0", sqs-limits = strict }

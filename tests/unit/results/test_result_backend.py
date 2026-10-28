@@ -133,7 +133,7 @@ async def test_inmemory_broker_end_to_end(backend: LLMQResultBackend) -> None:
 
 
 async def test_shared_owned_backend_survives_one_shutdown() -> None:
-    """Plan finding A6: two brokers share one backend; the first shutdown keeps the pool."""
+    """Shared-backend rule: two brokers share one backend; the first shutdown keeps the pool."""
     backend = LLMQResultBackend(KEYS, host="localhost", port=1, max_connections=2)
     await backend.startup()
     await backend.startup()

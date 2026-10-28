@@ -1,6 +1,6 @@
 """Embedding batching limits and Bedrock request-body builders (Titan, Cohere).
 
-An embed call is split into tasks of at most `max_batch_size` texts (D88): Titan takes one
+An embed call is split into tasks of at most `max_batch_size` texts: Titan takes one
 text per request, Cohere v3 up to 96, OpenAI `chunk_size` (2048 by default).
 """
 

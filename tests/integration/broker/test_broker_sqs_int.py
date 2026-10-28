@@ -165,7 +165,7 @@ async def make_queue(sqs: Any) -> AsyncIterator[Callable[..., Awaitable[str]]]:
     urls: list[str] = []
 
     async def create(prefix: str = "t", *, fifo: bool = False, **attributes: str) -> str:
-        name = f"llmq-ws1-{prefix}-{uuid.uuid4().hex[:8]}" + (".fifo" if fifo else "")
+        name = f"llmq-it-{prefix}-{uuid.uuid4().hex[:8]}" + (".fifo" if fifo else "")
         attrs = dict(attributes)
         if fifo:
             attrs["FifoQueue"] = "true"
@@ -185,7 +185,7 @@ async def test_kick_listen_ack_round_trip(sqs: Any, make_queue: MakeQueue) -> No
     broker = make_broker([SQSQueue(name, wait_time_secs=1)], hooks=hooks)
     done: list[int] = []
 
-    @broker.task(task_name="ws1.echo")
+    @broker.task(task_name="it.echo")
     async def echo(x: int) -> int:
         done.append(x)
         return x * 2
@@ -209,7 +209,7 @@ async def test_strict_priority_order(make_queue: MakeQueue) -> None:
     )
     order: list[str] = []
 
-    @broker.task(task_name="ws1.prio")
+    @broker.task(task_name="it.prio")
     async def prio(tag: str) -> None:
         order.append(tag)
         await asyncio.sleep(0.05)
@@ -233,7 +233,7 @@ async def test_capacity_aware_receive_never_exceeds_free_slots(
     gate = asyncio.Event()
     started: list[int] = []
 
-    @broker.task(task_name="ws1.block")
+    @broker.task(task_name="it.block")
     async def block(i: int) -> None:
         started.append(i)
         await gate.wait()
@@ -271,7 +271,7 @@ async def test_closed_gate_blocks_receive(make_queue: MakeQueue) -> None:
     broker = make_broker([SQSQueue(name, wait_time_secs=1, gate=gate)], hooks=hooks)
     ran: list[int] = []
 
-    @broker.task(task_name="ws1.gated")
+    @broker.task(task_name="it.gated")
     async def gated() -> None:
         ran.append(1)
 
@@ -294,7 +294,7 @@ async def test_real_long_poll_waits_in_one_call_and_returns_on_arrival(
     ran: list[float] = []
     loop = asyncio.get_running_loop()
 
-    @broker.task(task_name="ws1.lp")
+    @broker.task(task_name="it.lp")
     async def lp() -> None:
         ran.append(loop.time())
 
@@ -317,13 +317,13 @@ async def test_heartbeat_keeps_message_invisible_and_acks_are_batched(
     started = asyncio.Event()
     finished: list[int] = []
 
-    @broker.task(task_name="ws1.slow")
+    @broker.task(task_name="it.slow")
     async def slow() -> None:
         started.set()
         await asyncio.sleep(5)
         finished.append(1)
 
-    @broker.task(task_name="ws1.quick")
+    @broker.task(task_name="it.quick")
     async def quick(i: int) -> None:
         finished.append(i)
 
@@ -360,7 +360,7 @@ async def test_release_on_stop_and_shutdown_makes_messages_visible_now(
     hooks = Recorder()
     broker = make_broker([SQSQueue(name, wait_time_secs=1)], max_inflight=5, hooks=hooks)
 
-    @broker.task(task_name="ws1.rel")
+    @broker.task(task_name="it.rel")
     async def rel(i: int) -> None:
         return None
 
@@ -389,7 +389,7 @@ async def test_pause_receiving_releases_buffer_and_stops_polling(
         [SQSQueue(name, wait_time_secs=1)], max_inflight=4, hooks=hooks, stop_grace_secs=2
     )
 
-    @broker.task(task_name="ws1.drain")
+    @broker.task(task_name="it.drain")
     async def drain(i: int) -> None:
         return None
 
@@ -422,7 +422,7 @@ async def test_lost_handle_signals_and_metadata_labels(sqs: Any, make_queue: Mak
     seen: dict[str, Any] = {}
     release = asyncio.Event()
 
-    @broker.task(task_name="ws1.meta")
+    @broker.task(task_name="it.meta")
     async def meta(context: Context = TaskiqDepends()) -> None:  # noqa: B008  # taskiq DI
         seen.update(context.message.labels)
         await release.wait()
@@ -446,7 +446,7 @@ async def test_manual_release_of_running_message(sqs: Any, make_queue: MakeQueue
     name = await make_queue("man", VisibilityTimeout="60")
     broker = make_broker([SQSQueue(name, wait_time_secs=1)], expose_message_metadata=True)
 
-    @broker.task(task_name="ws1.man")
+    @broker.task(task_name="it.man")
     async def man() -> None:
         return None
 
@@ -470,7 +470,7 @@ async def test_delay_label_defers_delivery(make_queue: MakeQueue) -> None:
     loop = asyncio.get_running_loop()
     ran: list[float] = []
 
-    @broker.task(task_name="ws1.delayed")
+    @broker.task(task_name="it.delayed")
     async def delayed() -> None:
         ran.append(loop.time())
 
@@ -487,7 +487,7 @@ async def test_expired_messages_deleted_unrun(sqs: Any, make_queue: MakeQueue) -
     broker = make_broker([SQSQueue(name, wait_time_secs=1)], hooks=hooks)
     ran: list[str] = []
 
-    @broker.task(task_name="ws1.exp")
+    @broker.task(task_name="it.exp")
     async def exp(tag: str) -> None:
         ran.append(tag)
 
@@ -507,7 +507,7 @@ async def test_fifo_dedup_group_and_delay_rejected(sqs: Any, make_queue: MakeQue
     broker = make_broker([SQSQueue(name, wait_time_secs=1)])
     by_task_id = make_broker([SQSQueue(name, wait_time_secs=1)], use_task_id_for_deduplication=True)
 
-    @broker.task(task_name="ws1.fifo")
+    @broker.task(task_name="it.fifo")
     async def fifo(i: int) -> None:
         return None
 
@@ -545,7 +545,7 @@ async def test_byte_aware_batch_split(sqs: Any, make_queue: MakeQueue) -> None:
         [SQSQueue(name, wait_time_secs=1, batching=Batching(timeout_secs=0.2))], hooks=hooks
     )
 
-    @broker.task(task_name="ws1.big")
+    @broker.task(task_name="it.big")
     async def big(payload: str) -> None:
         return None
 
@@ -561,7 +561,7 @@ async def test_unknown_task_released_not_acked(sqs: Any, make_queue: MakeQueue) 
     name = await make_queue("unk")
     sender = make_broker([SQSQueue(name)])
 
-    @sender.task(task_name="ws1.ghost")
+    @sender.task(task_name="it.ghost")
     async def ghost() -> None:
         return None
 
@@ -572,13 +572,13 @@ async def test_unknown_task_released_not_acked(sqs: Any, make_queue: MakeQueue) 
     hooks = Recorder()
     worker = make_broker([SQSQueue(name, wait_time_secs=1)], hooks=hooks, unknown_release_secs=2)
 
-    @worker.task(task_name="ws1.known")
+    @worker.task(task_name="it.known")
     async def known() -> None:
         return None
 
     async with running(worker):
         await wait_for(lambda: bool(hooks.releases))
-        assert hooks.releases[0][2] == "unknown_task:ws1.ghost"
+        assert hooks.releases[0][2] == "unknown_task:it.ghost"
         assert await counts(sqs, name) == (0, 1)  # invisible, not deleted
         await wait_for(lambda: len(hooks.releases) >= 2, 6)  # back after 2 s, released again
     assert sum(await counts(sqs, name)) == 1
@@ -591,7 +591,7 @@ async def test_newer_envelope_released_not_run(sqs: Any, make_queue: MakeQueue) 
     broker = make_broker([SQSQueue(name, wait_time_secs=1)], hooks=hooks)
     ran: list[dict[str, Any]] = []
 
-    @broker.task(task_name="ws1.call")
+    @broker.task(task_name="it.call")
     async def call(envelope: dict[str, Any]) -> None:
         ran.append(envelope)
 
@@ -619,7 +619,7 @@ async def test_classifier_on_real_elasticmq_errors(sqs: Any, make_queue: MakeQue
 
 
 async def test_startup_missing_queue_and_declare(sqs: Any) -> None:
-    missing = f"llmq-ws1-missing-{uuid.uuid4().hex[:8]}"
+    missing = f"llmq-it-missing-{uuid.uuid4().hex[:8]}"
     broker = make_broker([SQSQueue(missing)])
     with pytest.raises(BrokerConfigError):
         await broker.startup()

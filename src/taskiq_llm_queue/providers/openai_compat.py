@@ -1,7 +1,7 @@
 """OpenAI-compatible provider: chat completions and embeddings against any base URL.
 
 Request bodies are OpenAI-native and pass through unchanged (streaming forced off). SDK
-retries are off (`max_retries=0`) so a 429 and its `Retry-After` reach the limiter (D88).
+retries are off (`max_retries=0`) so a 429 and its `Retry-After` reach the limiter.
 """
 
 from __future__ import annotations

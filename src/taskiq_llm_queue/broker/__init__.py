@@ -1,4 +1,4 @@
-"""SQS broker for taskiq with priority, capacity-aware receive and batching (plan §7.2).
+"""SQS broker for taskiq with priority, capacity-aware receive and batching (see docs/DESIGN.md).
 
 `HybridSQSBroker` plus its settings (`SQSQueue`, `Batching`, `Heartbeat`), event hooks and
 the SQS error-family classifier. Importing this package creates no client and does no I/O.

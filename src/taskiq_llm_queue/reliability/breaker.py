@@ -1,4 +1,4 @@
-"""Circuit breaker per (model, target) in Valkey (D79, §7.4).
+"""Circuit breaker per (model, target) in Valkey.
 
 Opens after `threshold` throttles/5xx within `window_secs`, lets one probe through every
 `cooldown_secs` while half-open, and closes on the probe's success. While open, the worker goes
@@ -28,7 +28,7 @@ class BreakerState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class BreakerSettings:
-    """Breaker thresholds; defaults follow §7.4 (5 failures in 30 s, half-open after 15 s)."""
+    """Breaker thresholds; defaults (5 failures in 30 s, half-open after 15 s)."""
 
     threshold: int = 5
     window_secs: float = 30.0

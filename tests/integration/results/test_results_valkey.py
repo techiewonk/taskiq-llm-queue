@@ -159,7 +159,7 @@ async def test_pubsub_wakeup_is_faster_than_poll(
 
 
 async def test_shared_owned_backend_survives_one_shutdown(keys: KeySpace) -> None:
-    """Plan finding A6: the first broker's shutdown must not close the shared pool."""
+    """Shared-backend rule: the first broker's shutdown must not close the shared pool."""
     shared = LLMQResultBackend(keys, host=HOST, port=PORT, password=PASSWORD, max_connections=4)
     await shared.startup()
     await shared.startup()

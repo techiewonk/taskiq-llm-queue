@@ -2,7 +2,7 @@
 
 Every SQS hard limit (10 messages per call, 20 s long poll, 900 s delay, 1 MiB payload,
 128-character FIFO ids) is checked here, so a bad value fails at boot instead of on the
-first send or receive (plan P3, P16).
+first send or receive (P3, P16).
 """
 
 from __future__ import annotations
