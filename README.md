@@ -86,7 +86,7 @@ chat = await llmq.chat("local-llama", {"messages": [{"role": "user", "content": 
 |---|---|---|
 | `QueuedChatBedrockConverse` | `langchain_aws.ChatBedrockConverse` | Native async `_agenerate` using the parent's own helpers; `bind_tools`, structured output via tools, cache usage, serviceTier |
 | `QueuedBedrockEmbeddings` | `langchain_aws.BedrockEmbeddings` | `aembed_query` / `aembed_documents` go through the queue |
-| `QueuedChatOpenAI` | `langchain_openai.ChatOpenAI` | `http_async_client` with a queued httpx transport, so **every** SDK path (raw response, `parse`, Responses API) is queued and LangChain parses as usual |
+| `QueuedChatOpenAI` | `langchain_openai.ChatOpenAI` | `http_async_client` with a queued httpx transport: chat completions (incl. raw responses and tool calls) and embeddings go through the queue and LangChain parses as usual. The Responses API (`/responses`) is not supported yet |
 | `QueuedOpenAIEmbeddings` | `langchain_openai.OpenAIEmbeddings` | Same transport; `check_embedding_ctx_length=False` by default for non-OpenAI servers |
 
 - **Streaming:** all queued classes force `disable_streaming=True` / `streaming=False`. `astream()` and LangGraph `stream_mode="messages"` return one complete message, so nothing bypasses the queue.
