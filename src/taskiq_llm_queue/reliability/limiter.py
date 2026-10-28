@@ -8,13 +8,13 @@ Lua call using Valkey `TIME` (DS10-DS12). `AdaptiveLimiter` serves asyncio worke
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from redis.exceptions import RedisError
 
 from taskiq_llm_queue.config import Lane
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from taskiq_llm_queue.config import QueueConfig
 
-log = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +130,7 @@ class PauseGate:
             try:
                 await self._refresh()
             except RedisError:
-                log.warning("limiter gate: Valkey unreachable, keeping receive closed")
+                logger.warning("limiter_gate_unreachable", retry_secs=self._retry_secs)
                 self.close_for(self._retry_secs)
             if self.is_open():
                 return

@@ -11,12 +11,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
-import logging
 import math
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import structlog
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
 from taskiq import AckableMessage, AsyncBroker, BrokerMessage
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from types_aiobotocore_sqs.client import SQSClient
     from types_aiobotocore_sqs.type_defs import MessageTypeDef
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 QUEUE_LABEL = "queue_name"
 DELAY_LABEL = "delay"
@@ -326,7 +326,7 @@ class HybridSQSBroker(AsyncBroker):
             )
         except Exception as exc:
             if classify_error(exc) is not ErrorFamily.INVALID_HANDLE:
-                logger.warning("release on %s failed: %s", delivery.queue.name, exc)
+                logger.warning("sqs_release_failed", queue=delivery.queue.name, error=str(exc))
             return False
         safe_call(self.hooks.on_release, delivery.queue.name, 1, reason)
         return True
@@ -412,11 +412,12 @@ class HybridSQSBroker(AsyncBroker):
                     attempt, base_secs=self._backoff_base_secs, cap_secs=self._backoff_cap_secs
                 )
                 logger.warning(
-                    "receive on %s failed (%s, %s); retrying in %.2fs",
-                    queue.name,
-                    family.value,
-                    error_code(exc),
-                    delay,
+                    "sqs_receive_failed",
+                    queue=queue.name,
+                    error_family=family.value,
+                    error_code=error_code(exc),
+                    attempt=attempt,
+                    retry_in_secs=round(delay, 2),
                 )
                 attempt += 1
                 await asyncio.sleep(delay)
@@ -460,11 +461,11 @@ class HybridSQSBroker(AsyncBroker):
         reason, body = self._screen(delivery)
         if reason is not None:
             logger.warning(
-                "releasing message %s on %s for %ss: %s",
-                delivery.message_id,
-                queue.name,
-                self._unknown_release_secs,
-                reason,
+                "sqs_message_released",
+                message_id=delivery.message_id,
+                queue=queue.name,
+                release_secs=self._unknown_release_secs,
+                reason=reason,
             )
             self._finish(delivery)
             self._require_acker().change_visibility(

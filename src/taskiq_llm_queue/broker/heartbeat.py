@@ -11,10 +11,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
-import logging
 import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING
+
+import structlog
 
 from taskiq_llm_queue.broker.acker import VisibilityResult
 from taskiq_llm_queue.broker.events import BrokerHooks, safe_call
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.broker.delivery import Delivery
     from taskiq_llm_queue.broker.queue import Heartbeat
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class HeartbeatManager:
@@ -92,9 +93,9 @@ class HeartbeatManager:
             limit = self._config.max_extensions
             if limit is not None and delivery.extensions >= limit:
                 logger.warning(
-                    "message on %s reached max_extensions=%d; it will become visible again",
-                    delivery.queue.name,
-                    limit,
+                    "sqs_heartbeat_max_extensions",
+                    queue=delivery.queue.name,
+                    max_extensions=limit,
                 )
                 self.untrack(delivery)
                 continue

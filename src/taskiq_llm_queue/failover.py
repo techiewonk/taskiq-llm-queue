@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import os
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+import structlog
 
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.metrics_names import FAILOVER_ACTIVE
@@ -25,7 +26,7 @@ from taskiq_llm_queue.reliability.local_limiter import LocalLimiter
 if TYPE_CHECKING:
     from taskiq_llm_queue.metrics import MetricsSink
 
-log = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 Probe = Callable[[], Awaitable[object]]
 
 
@@ -123,11 +124,11 @@ class FailoverState:
             entering = alias not in self._sqs_until
             self._sqs_until[alias] = self._clock() + self.settings.sqs_failover_secs
         if entering:
-            log.error(
-                "sqs_failover_active: model=%s goes direct for %.0f s after %s",
-                alias,
-                self.settings.sqs_failover_secs,
-                type(exc).__name__,
+            logger.error(
+                "sqs_failover_active",
+                model=alias,
+                failover_secs=self.settings.sqs_failover_secs,
+                error_type=type(exc).__name__,
             )
             self._gauge(1.0, {"model": alias, "kind": "sqs"})
 
@@ -141,7 +142,7 @@ class FailoverState:
             if self._clock() < until:
                 return True
             del self._sqs_until[alias]
-        log.warning("sqs_failover_ended: model=%s back on sqs", alias)
+        logger.warning("sqs_failover_ended", model=alias)
         self._gauge(0.0, {"model": alias, "kind": "sqs"})
         return False
 
@@ -160,7 +161,7 @@ class FailoverState:
             self._redis_down = True
             self._redis_retry_at = self._clock() + self._redis_backoff
         if entering:
-            log.error("valkey_local_mode_active: senders go direct (%s)", type(exc).__name__)
+            logger.error("valkey_local_mode_active", error_type=type(exc).__name__)
             self._gauge(1.0, {"kind": "redis"})
         self._start_probe()
 
@@ -172,7 +173,7 @@ class FailoverState:
             self._redis_down = False
             self._redis_backoff = self.settings.redis_retry_min_secs
             self._local.clear()
-        log.warning("valkey_local_mode_ended: Valkey reachable again")
+        logger.warning("valkey_local_mode_ended")
         self._gauge(0.0, {"kind": "redis"})
 
     def redis_down(self) -> bool:
@@ -190,7 +191,7 @@ class FailoverState:
         try:
             await self._probe()
         except Exception as exc:  # any failure of the probe means "still down"
-            log.debug("valkey probe failed: %s", type(exc).__name__)
+            logger.debug("valkey_probe_failed", error_type=type(exc).__name__)
             return False
         self.report_redis_ok()
         return True
@@ -252,4 +253,4 @@ class FailoverState:
             try:
                 self._metrics.gauge(FAILOVER_ACTIVE, value, labels)
             except Exception:  # metrics must never break failover
-                log.exception("failover metric failed")
+                logger.exception("failover_metric_failed")

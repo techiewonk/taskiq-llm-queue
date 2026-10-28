@@ -8,14 +8,15 @@ use; later calls fill missing labels with "" and drop unknown ones.
 from __future__ import annotations
 
 import importlib
-import logging
 import threading
 from collections.abc import Mapping
 from typing import Any
 
+import structlog
+
 from taskiq_llm_queue.metrics_names import LABELS
 
-log = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 INSTALL_HINT = "PrometheusMetrics needs prometheus-client: pip install 'taskiq-llm-queue[metrics]'"
 
 

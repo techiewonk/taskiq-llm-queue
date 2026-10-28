@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import heapq
-import logging
 import math
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+import structlog
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.errors import LLMQueueTimeout, QueueUnavailable
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.keys import KeySpace
     from taskiq_llm_queue.protocols import ResultStore
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Poll interval per lane; the loop polls at the fastest interval among pending waiters.
 DEFAULT_INTERVALS_MS: Mapping[Lane, int] = {Lane.RT: 100, Lane.BG: 500, Lane.BULK: 2000}
@@ -182,7 +183,9 @@ class ResultDispatcher:
         try:
             replies = await self._store.take_many(list(self._waiters))
         except Exception as exc:  # Redis blip: keep waiting, deadlines still apply
-            logger.warning("result poll failed: %s", type(exc).__name__)
+            logger.warning(
+                "result_poll_failed", pending=len(self._waiters), error_type=type(exc).__name__
+            )
             return
         for task_id, reply in replies.items():
             waiter = self._waiters.get(task_id)
@@ -213,7 +216,7 @@ class ResultDispatcher:
     def _on_loop_exit(self, task: asyncio.Task[None]) -> None:
         """A crashed loop must not leave callers hanging: fail them all."""
         if not task.cancelled() and task.exception() is not None:
-            logger.error("result dispatcher loop crashed", exc_info=task.exception())
+            logger.error("result_dispatcher_crashed", exc_info=task.exception())
             self._loop_task = None
             self._fail_all(QueueUnavailable("result dispatcher loop crashed"))
 
@@ -230,7 +233,7 @@ class ResultDispatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # reconnect; polling keeps working meanwhile
-                logger.warning("result wake-up channel failed: %s", type(exc).__name__)
+                logger.warning("result_channel_failed", error_type=type(exc).__name__)
                 await self._sleep(_PUBSUB_RETRY_SECS)
             finally:
                 with contextlib.suppress(Exception):

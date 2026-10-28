@@ -8,7 +8,6 @@ back as `LLMReply(ok=False, error=...)`, so taskiq never logs them as task failu
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -16,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import orjson
+import structlog
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.reliability.claims import RedisClaimStore
     from taskiq_llm_queue.reliability.fallback import FallbackStep
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # DS13: a live (rt) call that can't get a slot within 2 s moves to the next fallback step.
 RT_ACQUIRE_SECS = 2.0
@@ -187,7 +187,12 @@ async def execute_job(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # a bug must still release the waiter with a value
-        logger.exception("llmq call %s failed unexpectedly", envelope.request_id)
+        logger.exception(
+            "call_failed_unexpectedly",
+            request_id=envelope.request_id,
+            model=envelope.model,
+            lane=envelope.lane.value,
+        )
         reply = error_reply(envelope, "internal_error", type(exc).__name__, retryable=False)
     if store:
         await _store(reply, envelope, deps)
@@ -210,7 +215,11 @@ async def _store(reply: LLMReply, envelope: Envelope, deps: CoreDeps) -> None:
         except Exception as exc:
             if deps.clock() + _RESULT_RETRY_SECS >= envelope.deadline_at:
                 raise QueueUnavailable(f"cannot store result {envelope.request_id}") from exc
-            logger.warning("result write failed (%s); retrying", type(exc).__name__)
+            logger.warning(
+                "result_write_failed",
+                request_id=envelope.request_id,
+                error_type=type(exc).__name__,
+            )
             await deps.sleep(_RESULT_RETRY_SECS)
 
 
@@ -223,7 +232,11 @@ async def _after_store(envelope: Envelope, deps: CoreDeps) -> None:
         if envelope.params_ref:
             await deps.redis.delete(envelope.params_ref)
     except Exception as exc:  # a lost wake-up only delays the result until the next poll
-        logger.warning("post-result cleanup failed: %s", type(exc).__name__)
+        logger.warning(
+            "result_cleanup_failed",
+            request_id=envelope.request_id,
+            error_type=type(exc).__name__,
+        )
 
 
 async def _check_live(envelope: Envelope, deps: CoreDeps, check_cancel: bool) -> None:
@@ -248,7 +261,13 @@ async def _step_usable(step: FallbackStep, lane: Lane, deps: CoreDeps) -> bool:
         if deps.breaker is not None:
             return await deps.breaker.allow(step.alias, step.target)
     except Exception as exc:  # Valkey blip: try the step rather than skip everything
-        logger.warning("breaker/headroom check failed: %s", type(exc).__name__)
+        logger.warning(
+            "step_check_failed",
+            model=step.alias,
+            target=step.target,
+            lane=lane.value,
+            error_type=type(exc).__name__,
+        )
     return True
 
 
@@ -379,7 +398,12 @@ async def _release(deps: CoreDeps, lease: Lease, *, throttled: bool) -> None:
     try:
         await deps.limiter.release(lease, throttled=throttled)
     except Exception as exc:
-        logger.warning("limiter release failed: %s", type(exc).__name__)
+        logger.warning(
+            "limiter_release_failed",
+            model=lease.model,
+            target=lease.target,
+            error_type=type(exc).__name__,
+        )
 
 
 async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool) -> None:
@@ -389,4 +413,9 @@ async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool) -> None:
     try:
         await deps.breaker.record(step.alias, step.target, ok=ok)
     except Exception as exc:
-        logger.warning("breaker record failed: %s", type(exc).__name__)
+        logger.warning(
+            "breaker_record_failed",
+            model=step.alias,
+            target=step.target,
+            error_type=type(exc).__name__,
+        )

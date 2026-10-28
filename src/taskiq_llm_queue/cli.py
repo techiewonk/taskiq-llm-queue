@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import contextlib
 import getpass
+import logging
 import sys
 import time
 import uuid
@@ -20,6 +21,7 @@ from typing import Any
 
 import orjson
 import redis.asyncio
+import structlog
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
@@ -93,6 +95,18 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
     except (LLMQueueError, RedisError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def console_main() -> None:
+    """`llm-queue` console script: warnings and errors to stderr, so stdout stays pure JSON.
+
+    The library never configures structlog; this entry point is an app, so it does.
+    """
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
+        logger_factory=structlog.PrintLoggerFactory(sys.stderr),
+    )
+    sys.exit(main())
 
 
 def _actor(args: argparse.Namespace) -> str:
@@ -311,4 +325,4 @@ async def _job_send(args: argparse.Namespace, config: QueueConfig) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    console_main()

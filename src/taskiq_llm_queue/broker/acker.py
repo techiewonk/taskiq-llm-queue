@@ -9,10 +9,11 @@ elsewhere and its claim is `done`, DS7), while on a visibility change it means "
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable, Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+
+import structlog
 
 from taskiq_llm_queue.broker.batching import MicroBatcher
 from taskiq_llm_queue.broker.errors import (
@@ -28,7 +29,7 @@ from taskiq_llm_queue.broker.queue import MAX_BATCH_ENTRIES
 if TYPE_CHECKING:
     from types_aiobotocore_sqs.client import SQSClient
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class VisibilityResult(StrEnum):
@@ -131,7 +132,7 @@ class Acker:
             index = int(failed["Id"])
             family = classify_code(failed.get("Code", ""), failed.get("Message", ""))
             if family is ErrorFamily.INVALID_HANDLE:
-                logger.debug("ack of %s: receipt handle already invalid", queue)
+                logger.debug("sqs_ack_handle_invalid", queue=queue)
                 continue
             results[index] = await self._delete_one(queue, url, handles[index])
         acked = sum(results)
@@ -150,7 +151,7 @@ class Acker:
         except Exception as exc:
             if classify_error(exc) is ErrorFamily.INVALID_HANDLE:
                 return True
-            logger.warning("ack failed on %s (%s); message will be redelivered", queue, exc)
+            logger.warning("sqs_ack_failed", queue=queue, error=str(exc))
             return False
         return True
 
@@ -224,5 +225,12 @@ class Acker:
                     continue
                 if raise_final:
                     raise
-                logger.warning("%s on %s failed: %s %s", operation, queue, error_code(exc), exc)
+                logger.warning(
+                    "sqs_call_failed",
+                    operation=operation,
+                    queue=queue,
+                    error_code=error_code(exc),
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
                 return None

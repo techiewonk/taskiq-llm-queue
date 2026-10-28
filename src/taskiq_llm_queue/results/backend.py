@@ -7,10 +7,10 @@ taskiq (`get_result`, deleted on read) or in batches through `take_many`, which 
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.connection import Connection, SSLConnection
 from taskiq import AsyncResultBackend, TaskiqResult
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.config import QueueConfig
     from taskiq_llm_queue.keys import KeySpace
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 DEFAULT_TAKE_BATCH = 1000  # keys per MGET; 10K waiters on one pod -> 10 MGETs per interval
 
@@ -183,7 +183,7 @@ def decode_reply(task_id: str, raw: bytes | str) -> LLMReply:
             )
         return LLMReply.model_validate(result.return_value)
     except Exception as exc:  # any bad payload must still release the waiter
-        logger.warning("undecodable result for task %s: %s", task_id, type(exc).__name__)
+        logger.warning("result_undecodable", task_id=task_id, error_type=type(exc).__name__)
         return LLMReply(
             request_id=task_id,
             ok=False,

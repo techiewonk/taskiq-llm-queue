@@ -8,10 +8,10 @@ only ever sees small messages. Adapted from taskiq-sqs `S3OffloadMiddleware` (MI
 from __future__ import annotations
 
 import contextlib
-import logging
 from typing import TYPE_CHECKING, Any
 
 import orjson
+import structlog
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
 from botocore.exceptions import ClientError
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from taskiq import TaskiqMessage, TaskiqResult
     from types_aiobotocore_s3 import S3Client
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 OFFLOAD_LABEL = "s3_offload_key"
 DEFAULT_THRESHOLD_BYTES = 200_000  # DS15: 200 KB inline limit on the serialized taskiq message
@@ -247,7 +247,7 @@ class S3OffloadMiddleware(TaskiqMiddleware):
         await self.s3.client.put_object(
             Bucket=self.s3.bucket, Key=key, Body=payload, ContentType="application/json"
         )
-        logger.debug("offloaded task %s (%d bytes) to S3", message.task_id, len(payload))
+        logger.debug("offload_stored", task_id=message.task_id, size_bytes=len(payload))
         message.args = []
         message.kwargs = {}
         message.labels[OFFLOAD_LABEL] = key
@@ -275,7 +275,7 @@ class S3OffloadMiddleware(TaskiqMiddleware):
         try:
             await self.s3.client.delete_object(Bucket=self.s3.bucket, Key=str(key))
         except ClientError as exc:  # the result is already computed; a lifecycle rule cleans up
-            logger.warning("could not delete offloaded payload %s: %s", key, exc)
+            logger.warning("offload_delete_failed", key=key, error=str(exc))
 
 
 def encode_payload(args: list[Any], kwargs: dict[str, Any]) -> bytes:

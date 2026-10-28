@@ -7,14 +7,15 @@ imports, so implementations can depend on it freely.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+
+import structlog
 
 if TYPE_CHECKING:
     from taskiq_llm_queue.config import Lane
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 CallPath = Literal["sqs", "direct"]
 
@@ -86,4 +87,4 @@ def safe_hook(hook: Callable[..., Any], *args: Any) -> None:
     try:
         hook(*args)
     except Exception:
-        logger.exception("llmq hook %s failed", getattr(hook, "__name__", hook))
+        logger.exception("routing_hook_failed", hook=getattr(hook, "__name__", repr(hook)))

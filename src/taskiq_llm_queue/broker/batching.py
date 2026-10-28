@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -147,7 +148,9 @@ class MicroBatcher(Generic[T, R]):
         try:
             results: Sequence[R | BaseException] = await self._flush([p.item for p in batch])
         except Exception as exc:
-            logger.warning("%s flush failed: %s", self._name, exc)
+            logger.warning(
+                "batch_flush_failed", batcher=self._name, size=len(batch), error=str(exc)
+            )
             results = [exc] * len(batch)
         finally:
             self._in_flight -= len(batch)

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import logging
 import threading
 import time
 import uuid
@@ -19,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import orjson
+import structlog
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.connection import Connection, SSLConnection
 from redis.exceptions import RedisError
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.providers.registry import ProviderFactory
     from taskiq_llm_queue.routing_hooks import FailoverPolicy, PathRouter
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 Mode = Literal["send", "work", "both"]
 # HTTP status the OpenAI transport reports for an error reply, by `ErrorKind` value.
@@ -335,7 +335,7 @@ class LLMQueue:
             try:
                 await broker.shutdown()
             except Exception as exc:
-                logger.warning("broker shutdown failed: %s", type(exc).__name__)
+                logger.warning("broker_shutdown_failed", error_type=type(exc).__name__)
         await self.registry.aclose()
         if state.owns_redis:
             with contextlib.suppress(Exception):
@@ -673,7 +673,13 @@ class LLMQueue:
             QueueUnavailable,
             OSError,
         ) as exc:  # taskiq wraps kick errors
-            logger.warning("SQS send for %s failed (%s); running direct", alias, type(exc).__name__)
+            logger.warning(
+                "sqs_send_failed",
+                request_id=envelope.request_id,
+                model=alias,
+                lane=envelope.lane.value,
+                error_type=type(exc).__name__,
+            )
             self.failover.report_sqs_failure(alias, exc)
             return await self._direct(envelope, claim=True)
         return await self._wait(state, envelope)

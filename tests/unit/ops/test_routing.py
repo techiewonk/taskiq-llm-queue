@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 import uuid
 from collections.abc import Callable, Mapping
@@ -11,6 +10,7 @@ from typing import Literal, Protocol
 
 import fakeredis
 import pytest
+import structlog
 from pydantic import ValidationError
 
 from taskiq_llm_queue.config import Lane
@@ -153,7 +153,7 @@ def test_plan_json_shape_is_accepted() -> None:
     assert cfg.pct("gpt20b", Lane.BULK) == 100
 
 
-async def test_reload_keeps_last_good_and_reports_invalid(caplog: pytest.LogCaptureFixture) -> None:
+async def test_reload_keeps_last_good_and_reports_invalid() -> None:
     client = fakeredis.FakeAsyncRedis()
     metrics = Recorder()
     router = CanaryRouter(routing_store(client, KEYS), metrics=metrics)
@@ -162,11 +162,12 @@ async def test_reload_keeps_last_good_and_reports_invalid(caplog: pytest.LogCapt
     assert router.route("gpt20b", Lane.RT, "s", None) == "sqs"
 
     await client.set(KEYS.routing, b'{"models": {"gpt20b": {"rt": 500}}}')
-    with caplog.at_level(logging.WARNING):
+    with structlog.testing.capture_logs() as logs:
         await router.reload()
         await router.reload()
     assert router.route("gpt20b", Lane.RT, "s", None) == "sqs"  # last good kept
-    assert "routing_config_invalid" in caplog.text
+    invalid = [e for e in logs if e["event"] == "routing_config_invalid"]
+    assert [(e["log_level"], e["key"]) for e in invalid] == [("error", KEYS.routing)] * 2
     assert [c for c in metrics.calls if c[1] == CONFIG_INVALID_TOTAL] == [
         ("incr", CONFIG_INVALID_TOTAL, 1, {"kind": "routing"}),
         ("incr", CONFIG_INVALID_TOTAL, 1, {"kind": "routing"}),

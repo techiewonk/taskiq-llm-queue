@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import random
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Literal
 
+import structlog
 import xxhash
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.keys import KeySpace
     from taskiq_llm_queue.metrics import MetricsSink
 
-log = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 RoutePath = Literal["sqs", "direct"]
 Pct = Annotated[int, Field(ge=0, le=100)]
@@ -134,7 +134,7 @@ class CanaryRouter:
         invalid = self.store.invalid_count
         if invalid > self._seen_invalid:
             # The store warns once per bad value; this event is what the alarm (§13) keys on.
-            log.error("routing_config_invalid: keeping last good routing config")
+            logger.error("routing_config_invalid", key=self.store.key, invalid_count=invalid)
             if self._metrics is not None:
                 self._metrics.incr(
                     CONFIG_INVALID_TOTAL, invalid - self._seen_invalid, {"kind": "routing"}
@@ -148,7 +148,7 @@ class CanaryRouter:
             try:
                 await self.reload()
             except Exception:  # the loop must survive anything; route() keeps last good
-                log.exception("routing reload failed; keeping last good config")
+                logger.exception("routing_reload_failed")
             await asyncio.sleep(self._reload_secs)
 
     def start(self) -> asyncio.Task[None]:

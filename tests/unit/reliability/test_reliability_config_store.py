@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import subprocess
 import sys
 
 import fakeredis
 import pytest
+import structlog
 
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.keys import KeySpace
@@ -36,18 +36,20 @@ async def test_missing_key_gives_default(client: fakeredis.FakeAsyncRedis) -> No
 
 
 async def test_invalid_data_keeps_last_good_and_warns_once(
-    client: fakeredis.FakeAsyncRedis, caplog: pytest.LogCaptureFixture
+    client: fakeredis.FakeAsyncRedis,
 ) -> None:
     store = fallback_store(client, KEYS)
     await client.set(KEYS.fallback, GOOD)
     good = await store.load()
     assert good.chains["a"][0].model == "b"
     await client.set(KEYS.fallback, b'{"chains": {"a": ["a"]}}')
-    with caplog.at_level(logging.WARNING):
+    with structlog.testing.capture_logs() as logs:
         for _ in range(3):
             assert await store.load() == good
     assert store.invalid_count == 3
-    assert sum("invalid" in r.message for r in caplog.records) == 1
+    (event,) = logs
+    assert (event["event"], event["log_level"]) == ("live_config_invalid", "warning")
+    assert (event["key"], event["invalid_count"]) == (KEYS.fallback, 1)
 
 
 async def test_valkey_down_keeps_last_good(

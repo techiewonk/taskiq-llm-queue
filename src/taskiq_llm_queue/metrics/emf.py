@@ -14,10 +14,11 @@ from collections.abc import Callable, Mapping
 from typing import TextIO
 
 import orjson
+import structlog
 
 from taskiq_llm_queue.metrics_names import LABELS
 
-log = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 DEFAULT_NAMESPACE = "LLMQueue"
 _EMF_LOGGER = "taskiq_llm_queue.metrics.emf.lines"
 
@@ -69,7 +70,7 @@ class EmfMetrics:
                 dims[key] = str(val)
             elif key not in self._warned:
                 self._warned.add(key)
-                log.warning("EMF: dropping label %r (not in metrics_names.LABELS)", key)
+                logger.warning("emf_label_dropped", label=key)
         doc: dict[str, object] = {
             "_aws": {
                 "Timestamp": int(self._clock() * 1000),
@@ -96,4 +97,4 @@ class EmfMetrics:
                 self._stream.write(line + "\n")
                 self._stream.flush()
         except Exception:  # metrics must never break a call
-            log.exception("EMF: failed to emit %s", name)
+            logger.exception("emf_emit_failed", metric=name)

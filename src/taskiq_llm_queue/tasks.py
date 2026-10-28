@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from taskiq import AsyncResultBackend, Context, TaskiqDepends, TaskiqResult
 
 from taskiq_llm_queue.broker.broker import (
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.core import CoreDeps
     from taskiq_llm_queue.results.backend import LLMQResultBackend
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 JOB_VERSION = 1
 JobFunction = Callable[[dict[str, Any]], Awaitable[Any]]
@@ -154,7 +154,7 @@ class WorkerRuntime:
             await _release(broker, labels, _UNSUPPORTED_RELEASE_SECS)
             return
         except ValueError as exc:
-            logger.error("poison LLM task dropped: %s", type(exc).__name__)
+            logger.error("poison_task_dropped", error_type=type(exc).__name__)
             await self._reply_poison(raw)
             return
         entry = self.register(envelope.request_id, broker, labels)
@@ -163,7 +163,12 @@ class WorkerRuntime:
             if result.decision is ClaimDecision.DEFER:
                 await _release(broker, labels, self.defer_secs)  # DS2: never delete
         except QueueUnavailable:
-            logger.warning("result for %s not stored; releasing", envelope.request_id)
+            logger.warning(
+                "result_not_stored",
+                request_id=envelope.request_id,
+                model=envelope.model,
+                lane=envelope.lane.value,
+            )
             await _release(broker, labels, 0)
         except asyncio.CancelledError:
             if entry.stop_reason != "lost":
@@ -201,7 +206,7 @@ class WorkerRuntime:
         error log (DS5). Unknown names never reach here: the broker filter releases them.
         """
         if not isinstance(raw, dict) or not isinstance(raw.get("request_id"), str):
-            logger.error("poison job dropped")
+            logger.error("poison_job_dropped")
             return
         job_id: str = raw["request_id"]
         function = self.jobs.get(str(raw.get("job")))
@@ -225,7 +230,7 @@ class WorkerRuntime:
                 await asyncio.shield(self._hand_back(job_id, broker, labels))
             raise
         except Exception:
-            logger.exception("job %s (%s) failed", raw.get("job"), job_id)
+            logger.exception("job_failed", job=str(raw.get("job")), request_id=job_id)
             if claims is not None:
                 failures = await claims.record_failure(job_id)
                 if not failures.exhausted:

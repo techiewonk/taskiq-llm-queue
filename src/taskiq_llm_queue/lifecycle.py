@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from redis.exceptions import RedisError
 from taskiq.acks import AcknowledgeType
 from taskiq.receiver import Receiver
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.protocols import ReceiveGate
     from taskiq_llm_queue.routing_hooks import FailoverPolicy
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 DEFAULT_WORKER_SLOTS = 50
 DEFAULT_JOB_SLOTS = 4
@@ -363,7 +363,7 @@ class Workers:
             await asyncio.gather(*self._listeners, return_exceptions=True)
         leftovers = self._runtime.stop_running("drain")
         if leftovers:
-            logger.info("drain: handing back %d running tasks", len(leftovers))
+            logger.info("drain_hand_back", running=len(leftovers))
             await asyncio.wait(leftovers, timeout=_FLUSH_SECS)
         if self._heartbeat is not None:
             self._heartbeat.cancel()
@@ -384,9 +384,9 @@ class Workers:
                 if claims is not None and ids:
                     lost = await claims.heartbeat_owned(ids, worker=deps.worker)
                     if lost:
-                        logger.warning("claims lost for %d running tasks", len(lost))
+                        logger.warning("claims_lost", running=len(lost))
                         self._runtime.stop_running("lost", lost)
                 if isinstance(deps.limiter, AdaptiveLimiter) and deps.leases:
                     await deps.limiter.renew(list(deps.leases))
             except Exception as exc:  # keep beating; a blip must not stop the loop
-                logger.warning("claim heartbeat failed: %s", type(exc).__name__)
+                logger.warning("claim_heartbeat_failed", error_type=type(exc).__name__)

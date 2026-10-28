@@ -7,11 +7,12 @@ Queue names are the `SQSQueue.name` routing keys, safe to use as a `queue` metri
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import Any
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 class BrokerHooks:
@@ -47,4 +48,4 @@ def safe_call(hook: Callable[..., Any], *args: Any) -> None:
     try:
         hook(*args)
     except Exception:
-        logger.exception("broker hook %s failed", getattr(hook, "__name__", hook))
+        logger.exception("broker_hook_failed", hook=getattr(hook, "__name__", repr(hook)))
