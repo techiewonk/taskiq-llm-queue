@@ -40,8 +40,8 @@ s3 = []  # S3 offload / result backend use aiobotocore (core); kept as a marker 
 metrics = ["prometheus-client>=0.20"]
 
 [project.urls]
-Documentation = "https://github.com/<org>/taskiq-llm-queue#readme"
-Source = "https://github.com/<org>/taskiq-llm-queue"
+Documentation = "https://github.com/techiewonk/taskiq-llm-queue#readme"
+Source = "https://github.com/techiewonk/taskiq-llm-queue"
 
 [dependency-groups]
 dev = [
