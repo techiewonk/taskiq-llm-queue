@@ -32,9 +32,12 @@ a minor release may break the public API, with a deprecation announced one minor
 - `fakellm`: a fake Bedrock + OpenAI server with real error shapes, SigV4 region detection, scenarios, timed phases and an admin API, plus a Docker service.
 - `docs/DESIGN.md`: the delivery-safety rules (DS1–DS19) and broker features (P1–P17, A1–A9) that the code refers to.
 - Makefile and `tools/llmq_dev.py` task runner.
-- 365 tests (unit + integration on Valkey 8.1, ElasticMQ 1.7.1 and fakellm); ruff and mypy strict are clean.
+- S3 offload for large messages (P9) and an S3 result backend (P10).
+- LangChain adapters: `QueuedChatBedrockConverse` (native `_agenerate`), `QueuedChatOpenAI` via a queued httpx transport, and queued embeddings; LangGraph compatible.
+- Ops: canary router (sticky session hash, kill switch, live config), failover to the direct path when SQS or Valkey is down, `llm-queue` CLI, metrics hooks.
+- `LLMQueue` client: `converse`, `chat`, `embed`, `invoke_model` (+ `_sync` variants), `cancel`, jobs (`register_job` / `send_job`); `start(mode)` / `stop(drain_secs)` with an ordered drain; worker core (claim, limiter, breaker, retry, fallback, result before done).
+- 512 tests (unit + integration on Valkey 8.1, ElasticMQ 1.7.1 and fakellm); ruff and mypy strict are clean.
 
-### Not yet built
-- `LLMQueue` client API, LangChain adapters, task/receiver wiring and lifecycle (`start`/`stop`/drain).
-- Canary routing, failover modes, CLI, metrics exporters.
-- S3 offload (P9) and the S3 result backend (P10).
+### Known gaps
+- If the result write fails until the deadline, the released message may call the provider again on another pod (the write itself is retried).
+- Locust load tests and the Prometheus/Grafana stack are not in `docker/compose.yaml` yet.

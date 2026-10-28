@@ -1,6 +1,6 @@
 # taskiq-llm-queue (draft)
 
-> **Status:** pre-alpha (0.1.0.dev). Built and tested so far: the SQS broker, limiter/claims/breaker/fallback, the JSON result backend + dispatcher, the providers and `fakellm`. Not built yet: the `LLMQueue` client API and the LangChain adapters shown below. The API below is the target design, frozen for 0.x (see CHANGELOG.md and docs/DESIGN.md).
+> **Status:** pre-alpha (0.1.0.dev). Everything below is built and tested (512 tests on Valkey 8.1, ElasticMQ 1.7.1 and fakellm): the `LLMQueue` client, the SQS broker, limiter/claims/breaker/fallback, JSON and S3 result backends, providers, LangChain adapters, canary routing, failover and the CLI. The API is frozen for 0.x (see CHANGELOG.md and docs/DESIGN.md).
 
 An LLM request client with its own durable queue, built on [taskiq](https://github.com/taskiq-python/taskiq) and Amazon SQS.
 
