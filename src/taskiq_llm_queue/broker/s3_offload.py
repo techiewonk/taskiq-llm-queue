@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from taskiq import TaskiqMessage, TaskiqResult
     from types_aiobotocore_s3 import S3Client
 
+    from taskiq_llm_queue.broker.broker import HybridSQSBroker
+
 logger = structlog.get_logger(__name__)
 
 OFFLOAD_LABEL = "s3_offload_key"
@@ -38,8 +40,9 @@ class S3OffloadError(LLMQueueError):
 class OffloadedPayloadMissingError(S3OffloadError):
     """The S3 object a message refers to is gone (deleted, expired or never written).
 
-    Raised from `pre_execute`; the message is then not acked and ends in the DLQ after
-    `maxReceiveCount`, instead of running the task with empty arguments.
+    Raised from `pre_execute` so the task never runs with empty arguments. On a
+    `HybridSQSBroker` the message is acked (discarded as poison) first, since taskiq's
+    Receiver would otherwise leave the delivery unfinished; elsewhere it is not acked.
     """
 
 
@@ -175,10 +178,11 @@ class S3OffloadMiddleware(TaskiqMiddleware):
     """Moves args/kwargs of oversized messages to `s3://bucket/<base_path>/<task_id>.json`.
 
     `pre_send` (client) offloads when the formatted message exceeds `threshold_bytes` and puts
-    the object key in the `s3_offload_key` label; `pre_execute` (worker) restores them;
-    `post_execute` deletes the object after a successful run when `delete_after_execute`.
-    A failed run keeps the object so a redelivery can still read it; add an S3 lifecycle
-    rule on the prefix to expire leftovers. Payloads are JSON only, never pickle.
+    the object key in the `s3_offload_key` label; `pre_execute` (worker) restores them.
+    After a successful run the object is deleted when `delete_after_execute`; on a
+    `HybridSQSBroker` only once SQS confirmed the message's ack, never when the task released
+    it (defer, drain), so a redelivery can still read it. A failed run keeps the object; add
+    an S3 lifecycle rule on the prefix to expire leftovers. Payloads are JSON only.
     """
 
     def __init__(
@@ -253,27 +257,68 @@ class S3OffloadMiddleware(TaskiqMiddleware):
         message.labels[OFFLOAD_LABEL] = key
         return message
 
+    def _sqs_broker(self) -> HybridSQSBroker | None:
+        from taskiq_llm_queue.broker.broker import HybridSQSBroker
+
+        broker = getattr(self, "broker", None)
+        return broker if isinstance(broker, HybridSQSBroker) else None
+
     async def pre_execute(self, message: TaskiqMessage) -> TaskiqMessage:
-        """Restore offloaded args/kwargs; raises `OffloadedPayloadMissingError` if gone."""
+        """Restore offloaded args/kwargs; raises `OffloadedPayloadMissingError` if gone.
+
+        taskiq calls this outside its ack path, so on a `HybridSQSBroker` the delivery is
+        finished before raising: acked when the object is gone, released when S3 failed.
+        """
         key = message.labels.get(OFFLOAD_LABEL)
         if not key:
             return message
-        body = await self.s3.get_bytes(str(key))
-        if body is None:
-            raise OffloadedPayloadMissingError(
-                f"offloaded payload of task {message.task_id} not found at "
-                f"s3://{self.s3.bucket}/{key}"
-            )
-        message.args, message.kwargs = decode_payload(body)
+        sqs = self._sqs_broker()
+        try:
+            body = await self.s3.get_bytes(str(key))
+            if body is None:
+                raise OffloadedPayloadMissingError(
+                    f"offloaded payload of task {message.task_id} not found at "
+                    f"s3://{self.s3.bucket}/{key}"
+                )
+            message.args, message.kwargs = decode_payload(body)
+        except Exception as exc:
+            delivery = sqs.delivery_for_task(message.task_id) if sqs is not None else None
+            if sqs is not None and delivery is not None:
+                logger.error(
+                    "offload_restore_failed",
+                    task_id=message.task_id,
+                    key=key,
+                    error_type=type(exc).__name__,
+                )
+                if isinstance(exc, S3OffloadError):  # gone or corrupt
+                    await sqs.discard(delivery, reason="offload_unreadable")  # never runnable
+                else:
+                    await sqs.release(delivery, visibility_secs=30, reason="offload_read_failed")
+            raise
         return message
 
     async def post_execute(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> None:
-        """Delete the offloaded object after a successful run when `delete_after_execute`."""
+        """Delete the offloaded object after a successful run when `delete_after_execute`.
+
+        On a `HybridSQSBroker` the delete waits for the message's ack and is skipped when the
+        task released it instead, since the redelivery still needs the payload.
+        """
         key = message.labels.get(OFFLOAD_LABEL)
         if not key or not self.delete_after_execute or result.is_err:
             return
+        sqs = self._sqs_broker()
+        if sqs is None:
+            await self._delete(str(key))
+            return
+        delivery = sqs.delivery_for_task(message.task_id)
+        if delivery is None:  # released (defer, drain, unknown job) or already finished
+            logger.debug("offload_kept", task_id=message.task_id, key=key)
+            return
+        delivery.after_ack.append(lambda: self._delete(str(key)))
+
+    async def _delete(self, key: str) -> None:
         try:
-            await self.s3.client.delete_object(Bucket=self.s3.bucket, Key=str(key))
+            await self.s3.client.delete_object(Bucket=self.s3.bucket, Key=key)
         except ClientError as exc:  # the result is already computed; a lifecycle rule cleans up
             logger.warning("offload_delete_failed", key=key, error=str(exc))
 

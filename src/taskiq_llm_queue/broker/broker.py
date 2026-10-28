@@ -182,6 +182,8 @@ class HybridSQSBroker(AsyncBroker):
         self._heartbeat: HeartbeatManager | None = None
         self._senders: dict[str, MicroBatcher[_SendItem, str]] = {}
         self._active: dict[str, Delivery] = {}
+        self._by_task: dict[str, Delivery] = {}
+        self._after_ack_tasks: set[asyncio.Task[None]] = set()
         self._buffer: asyncio.Queue[Delivery] | None = None
         self._pollers: dict[str, asyncio.Task[None]] = {}
         self._in_receive: set[str] = set()
@@ -212,8 +214,12 @@ class HybridSQSBroker(AsyncBroker):
             return
         await super().startup()
         stack = contextlib.AsyncExitStack()
+        # One retry layer, not two (DS16): botocore makes at most one quick retry (standard
+        # mode, no client-side rate limiter that would also delay heartbeats), and the Acker /
+        # poller backoff, which counts errors in metrics, owns throttle and 5xx retries.
+        # Adaptive x 5 under the Acker's 3 meant ~15 calls per ack while visibility lapsed.
         base = AioConfig(
-            retries={"mode": "adaptive", "max_attempts": 5},
+            retries={"mode": "standard", "total_max_attempts": 2},
             max_pool_connections=4 * len(self._queues) + 10,
             read_timeout=60,
         )
@@ -272,6 +278,8 @@ class HybridSQSBroker(AsyncBroker):
         await asyncio.gather(*(s.close() for s in self._senders.values()))
         if self._acker is not None:
             await self._acker.close()
+        if self._after_ack_tasks:
+            await asyncio.gather(*self._after_ack_tasks, return_exceptions=True)
         if self._stack is not None:
             await self._stack.aclose()
         self._senders.clear()
@@ -299,6 +307,28 @@ class HybridSQSBroker(AsyncBroker):
         """The active delivery for an SQS message id (e.g. to await `lost`), if any."""
         return next((d for d in self._active.values() if d.message_id == message_id), None)
 
+    def delivery_for_task(self, task_id: str) -> Delivery | None:
+        """The active (not yet acked or released) delivery carrying taskiq task `task_id`."""
+        return self._by_task.get(task_id)
+
+    async def discard(self, target: Delivery | str, *, reason: str = "poison") -> bool:
+        """Ack (delete) a received message without running it, e.g. one that can never run.
+
+        `target` is a `Delivery`, an SQS message id or a receipt handle. Returns False if it
+        was already acked or released.
+        """
+        delivery = target if isinstance(target, Delivery) else self._find(target)
+        if delivery is None or delivery.done:
+            return False
+        logger.warning(
+            "sqs_message_discarded",
+            queue=delivery.queue.name,
+            message_id=delivery.message_id,
+            reason=reason,
+        )
+        await self._ack(delivery)
+        return True
+
     async def release(
         self, target: Delivery | str, *, visibility_secs: int = 0, reason: str = "manual"
     ) -> bool:
@@ -310,7 +340,7 @@ class HybridSQSBroker(AsyncBroker):
         if not 0 <= visibility_secs <= MAX_VISIBILITY_SECS:
             raise BrokerConfigError(f"visibility_secs must be 0..{MAX_VISIBILITY_SECS}")
         delivery = target if isinstance(target, Delivery) else self._find(target)
-        if delivery is None or not self._finish(delivery):
+        if delivery is None or not self._finish(delivery, "released"):
             return False
         client, acker = self._require_client(), self._require_acker()
         try:
@@ -365,72 +395,120 @@ class HybridSQSBroker(AsyncBroker):
                     await self._release_where(lambda d: not d.started, "stopped")
 
     async def _poll(self, queue: SQSQueue) -> None:
-        """Receive loop for one queue: gate, budget, slots, long poll, accept."""
+        """Receive loop for one queue; survives any error except cancellation (logs, backs off)."""
         url = self._urls[queue.name]
-        attempt = 0
+        state = _PollState()
+        while not self._stopping:
+            try:
+                await self._poll_once(queue, url, state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a dead poller would silently stop this queue
+                safe_call(self.hooks.on_error, queue.name, "poll", classify_error(exc).value)
+                delay = backoff_delay(
+                    state.attempt,
+                    base_secs=self._backoff_base_secs,
+                    cap_secs=self._backoff_cap_secs,
+                )
+                logger.error(
+                    "sqs_poller_error",
+                    queue=queue.name,
+                    error_type=type(exc).__name__,
+                    attempt=state.attempt,
+                    retry_in_secs=round(delay, 2),
+                    exc_info=exc,
+                )
+                state.attempt += 1
+                await asyncio.sleep(delay)
+
+    async def _poll_once(self, queue: SQSQueue, url: str, state: _PollState) -> None:
+        """One iteration: gate, budget, slots, long poll, accept."""
+        if not self._receiving.is_set():
+            await self._receiving.wait()
+            return
+        if queue.gate is not None and not queue.gate.is_open():
+            await queue.gate.wait_open()
+            return
         # After an empty poll, ask for one message: an idle long poll then holds one slot,
         # not ten, and still returns on the first arrival (A2).
-        idle = False
-        while not self._stopping:
-            if not self._receiving.is_set():
-                await self._receiving.wait()
-                continue
-            if queue.gate is not None and not queue.gate.is_open():
-                await queue.gate.wait_open()
-                continue
-            want = 1 if idle else queue.max_messages
-            if self._receive_budget is not None:
-                headroom = self._receive_budget(queue)
-                if not isinstance(headroom, int):
-                    headroom = await headroom
-                if headroom <= 0:
-                    await asyncio.sleep(0.25)
-                    continue
-                want = min(want, headroom)
-            reserved = await self._scheduler.acquire(queue.priority, want)
-            gate_closed = queue.gate is not None and not queue.gate.is_open()
-            if self._stopping or not self._receiving.is_set() or gate_closed:
-                self._scheduler.release(queue.priority, reserved)
-                continue
-            self._in_receive.add(queue.name)
+        want = 1 if state.idle else queue.max_messages
+        if self._receive_budget is not None:
+            headroom = self._receive_budget(queue)
+            if not isinstance(headroom, int):
+                headroom = await headroom
+            # DS4: messages received but not yet handed to a task will take limiter capacity
+            # soon, though the limiter does not count them yet.
+            headroom -= self._buffer.qsize() if self._buffer is not None else 0
+            if headroom <= 0:
+                await asyncio.sleep(0.25)
+                return
+            want = min(want, headroom)
+        reserved = await self._scheduler.acquire(queue.priority, want)
+        gate_closed = queue.gate is not None and not queue.gate.is_open()
+        if self._stopping or not self._receiving.is_set() or gate_closed:
+            self._scheduler.release(queue.priority, reserved)
+            return
+        self._in_receive.add(queue.name)
+        try:
+            resp = await self._require_client().receive_message(
+                QueueUrl=url,
+                MaxNumberOfMessages=reserved,
+                WaitTimeSeconds=queue.wait_time_secs,
+                MessageSystemAttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
+                MessageAttributeNames=["All"],
+            )
+        except asyncio.CancelledError:
+            self._scheduler.release(queue.priority, reserved)
+            raise
+        except Exception as exc:
+            self._scheduler.release(queue.priority, reserved)
+            family = classify_error(exc)
+            safe_call(self.hooks.on_error, queue.name, "receive", family.value)
+            delay = backoff_delay(
+                state.attempt, base_secs=self._backoff_base_secs, cap_secs=self._backoff_cap_secs
+            )
+            logger.warning(
+                "sqs_receive_failed",
+                queue=queue.name,
+                error_family=family.value,
+                error_code=error_code(exc),
+                attempt=state.attempt,
+                retry_in_secs=round(delay, 2),
+            )
+            state.attempt += 1
+            await asyncio.sleep(delay)
+            return
+        finally:
+            self._in_receive.discard(queue.name)
+        state.attempt = 0
+        messages = resp.get("Messages", [])
+        state.idle = not messages
+        self._scheduler.release(queue.priority, reserved - len(messages))
+        safe_call(self.hooks.on_receive, queue.name, len(messages))
+        for message in messages:
             try:
-                resp = await self._require_client().receive_message(
-                    QueueUrl=url,
-                    MaxNumberOfMessages=reserved,
-                    WaitTimeSeconds=queue.wait_time_secs,
-                    MessageSystemAttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
-                    MessageAttributeNames=["All"],
-                )
-            except asyncio.CancelledError:
-                self._scheduler.release(queue.priority, reserved)
-                raise
-            except Exception as exc:
-                self._scheduler.release(queue.priority, reserved)
-                family = classify_error(exc)
-                safe_call(self.hooks.on_error, queue.name, "receive", family.value)
-                delay = backoff_delay(
-                    attempt, base_secs=self._backoff_base_secs, cap_secs=self._backoff_cap_secs
-                )
-                logger.warning(
-                    "sqs_receive_failed",
-                    queue=queue.name,
-                    error_family=family.value,
-                    error_code=error_code(exc),
-                    attempt=attempt,
-                    retry_in_secs=round(delay, 2),
-                )
-                attempt += 1
-                await asyncio.sleep(delay)
-                continue
-            finally:
-                self._in_receive.discard(queue.name)
-            attempt = 0
-            messages = resp.get("Messages", [])
-            idle = not messages
-            self._scheduler.release(queue.priority, reserved - len(messages))
-            safe_call(self.hooks.on_receive, queue.name, len(messages))
-            for message in messages:
                 self._accept(queue, url, message)
+            except Exception as exc:
+                self._reject(queue, url, message, exc)
+
+    def _reject(self, queue: SQSQueue, url: str, message: MessageTypeDef, exc: Exception) -> None:
+        """`_accept` failed: free the message's slot and make it visible again, never leak it."""
+        handle = message.get("ReceiptHandle", "")
+        logger.error(
+            "sqs_accept_failed",
+            queue=queue.name,
+            message_id=message.get("MessageId", ""),
+            error_type=type(exc).__name__,
+            exc_info=exc,
+        )
+        delivery = self._active.get(handle)
+        if delivery is not None:
+            if not self._finish(delivery, "released"):
+                return
+        else:
+            self._scheduler.release(queue.priority, 1)
+        if handle and self._acker is not None:
+            self._acker.change_visibility(queue.name, url, handle, 0)
 
     def _accept(self, queue: SQSQueue, url: str, message: MessageTypeDef) -> None:
         """Turn one received message into a buffered delivery, or expire / release it."""
@@ -453,8 +531,9 @@ class HybridSQSBroker(AsyncBroker):
             safe_call(self.hooks.on_queue_wait, queue.name, max(0.0, time.time() - sent_at))
         expiry_attr = message.get("MessageAttributes", {}).get(EXPIRY_ATTRIBUTE)
         expiry = expiry_attr.get("StringValue") if expiry_attr is not None else None
-        if expiry is not None and _is_expired(expiry):
-            self._finish(delivery)
+        delivery.expires_at = _epoch(expiry) if expiry is not None else None
+        if delivery.expires_at is not None and delivery.expires_at < time.time():
+            self._finish(delivery, "acked")
             self._require_acker().delete(queue.name, url, delivery.receipt_handle)
             safe_call(self.hooks.on_expired, queue.name, 1)
             return
@@ -467,7 +546,7 @@ class HybridSQSBroker(AsyncBroker):
                 release_secs=self._unknown_release_secs,
                 reason=reason,
             )
-            self._finish(delivery)
+            self._finish(delivery, "released")
             self._require_acker().change_visibility(
                 queue.name, url, delivery.receipt_handle, self._unknown_release_secs
             )
@@ -475,10 +554,12 @@ class HybridSQSBroker(AsyncBroker):
             return
         delivery.body = body
         if self._stopping or not self._receiving.is_set() or self._buffer is None:
-            self._finish(delivery)
+            self._finish(delivery, "released")
             self._require_acker().change_visibility(queue.name, url, delivery.receipt_handle, 0)
             safe_call(self.hooks.on_release, queue.name, 1, "drain")
             return
+        if delivery.task_id is not None:
+            self._by_task[delivery.task_id] = delivery
         if self._heartbeat is not None:
             self._heartbeat.track(delivery)
         self._buffer.put_nowait(delivery)
@@ -489,6 +570,7 @@ class HybridSQSBroker(AsyncBroker):
             parsed = self.formatter.loads(delivery.body.encode("utf-8"))
         except Exception:
             return "unparseable", delivery.body
+        delivery.task_id = parsed.task_id
         if self.find_task(parsed.task_name) is None:
             return f"unknown_task:{parsed.task_name}", delivery.body
         if not envelope_supported(parsed):
@@ -509,15 +591,33 @@ class HybridSQSBroker(AsyncBroker):
 
     async def _ack(self, delivery: Delivery) -> None:
         """Taskiq ack: free the slot, stop the heartbeat, queue a batched delete."""
-        if self._finish(delivery) and self._acker is not None:
-            self._acker.delete(delivery.queue.name, delivery.queue_url, delivery.receipt_handle)
+        if self._finish(delivery, "acked") and self._acker is not None:
+            future = self._acker.delete(
+                delivery.queue.name, delivery.queue_url, delivery.receipt_handle
+            )
+            if delivery.after_ack:
+                future.add_done_callback(functools.partial(self._run_after_ack, delivery))
 
-    def _finish(self, delivery: Delivery) -> bool:
+    def _run_after_ack(self, delivery: Delivery, future: asyncio.Future[bool]) -> None:
+        """Run `after_ack` callbacks once SQS confirmed the delete (and the handle wasn't lost)."""
+        callbacks, delivery.after_ack = delivery.after_ack, []
+        deleted = not future.cancelled() and future.exception() is None and future.result()
+        if not deleted or delivery.lost.is_set():
+            return
+        for callback in callbacks:
+            task = asyncio.ensure_future(_run_callback(callback, delivery.queue.name))
+            self._after_ack_tasks.add(task)
+            task.add_done_callback(self._after_ack_tasks.discard)
+
+    def _finish(self, delivery: Delivery, outcome: str = "released") -> bool:
         """Mark a delivery done exactly once and free its slot; False if already done."""
         if delivery.done:
             return False
         delivery.done = True
+        delivery.outcome = outcome
         self._active.pop(delivery.receipt_handle, None)
+        if delivery.task_id is not None and self._by_task.get(delivery.task_id) is delivery:
+            del self._by_task[delivery.task_id]
         if self._heartbeat is not None:
             self._heartbeat.untrack(delivery)
         self._scheduler.release(delivery.queue.priority, 1)
@@ -739,11 +839,32 @@ class HybridSQSBroker(AsyncBroker):
         return self._acker
 
 
-def _is_expired(raw: str) -> bool:
+class _PollState:
+    """Per-poller retry counter and idle flag, kept across `_poll_once` iterations."""
+
+    __slots__ = ("attempt", "idle")
+
+    def __init__(self) -> None:
+        """Start with no failures and a full-size first receive."""
+        self.attempt = 0
+        self.idle = False
+
+
+async def _run_callback(callback: Callable[[], Awaitable[None]], queue: str) -> None:
+    """Run one after-ack callback, logging (not raising) what it throws."""
     try:
-        return float(raw) < time.time()
+        await callback()
+    except Exception as exc:
+        logger.warning("sqs_after_ack_failed", queue=queue, error_type=type(exc).__name__)
+
+
+def _epoch(raw: str) -> float | None:
+    """Parse an `expiry` attribute; None when it is not a finite number."""
+    try:
+        value = float(raw)
     except ValueError:
-        return False
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _truthy(value: object) -> bool:

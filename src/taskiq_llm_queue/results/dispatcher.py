@@ -34,15 +34,22 @@ logger = structlog.get_logger(__name__)
 # Poll interval per lane; the loop polls at the fastest interval among pending waiters.
 DEFAULT_INTERVALS_MS: Mapping[Lane, int] = {Lane.RT: 100, Lane.BG: 500, Lane.BULK: 2000}
 _PUBSUB_RETRY_SECS = 1.0
+# Rebuild the deadline heap once it holds this many entries and more stale than live ones.
+_COMPACT_MIN_ENTRIES = 64
 
 
 @dataclass(eq=False, slots=True)
 class _Waiter:
-    """One caller waiting for one task id; identity tells a stale heap entry from a live one."""
+    """One caller waiting for one task id; `seq` tells a stale heap entry from a live one.
+
+    Heap entries hold only `(deadline, seq, task_id)`, never the waiter: a resolved waiter's
+    future (and the reply in it) must be collectable as soon as the caller has it.
+    """
 
     future: asyncio.Future[LLMReply]
     lane: Lane
     deadline: float = field(default=0.0)
+    seq: int = 0
 
 
 class ResultDispatcher:
@@ -72,7 +79,7 @@ class ResultDispatcher:
         self._sleep = sleep
         self._waiters: dict[str, _Waiter] = {}
         self._lanes: Counter[Lane] = Counter()
-        self._deadlines: list[tuple[float, int, str, _Waiter]] = []
+        self._deadlines: list[tuple[float, int, str]] = []
         self._seq = 0
         self._wake = asyncio.Event()  # poll now
         self._work = asyncio.Event()  # first waiter arrived while idle
@@ -118,12 +125,17 @@ class ResultDispatcher:
         if task_id in self._waiters:
             raise ValueError(f"already waiting for task {task_id!r}")
         await self.start()
-        waiter = _Waiter(asyncio.get_running_loop().create_future(), lane)
-        waiter.deadline = self._clock() + timeout_secs
+        self._seq += 1
+        waiter = _Waiter(
+            asyncio.get_running_loop().create_future(),
+            lane,
+            deadline=self._clock() + timeout_secs,
+            seq=self._seq,
+        )
         self._waiters[task_id] = waiter
         self._lanes[lane] += 1
-        self._seq += 1
-        heapq.heappush(self._deadlines, (waiter.deadline, self._seq, task_id, waiter))
+        heapq.heappush(self._deadlines, (waiter.deadline, waiter.seq, task_id))
+        self._maybe_compact()
         if math.isinf(self._nap_secs):
             self._work.set()
         elif (
@@ -135,6 +147,7 @@ class ResultDispatcher:
             return await waiter.future
         finally:
             self._discard(task_id, waiter)
+            self._maybe_compact()
 
     def _discard(self, task_id: str, waiter: _Waiter) -> _Waiter | None:
         """Remove `waiter` if it is still the one registered for `task_id`."""
@@ -192,20 +205,34 @@ class ResultDispatcher:
             if waiter is not None and self._discard(task_id, waiter) and not waiter.future.done():
                 waiter.future.set_result(reply)
 
+    def _live(self, entry: tuple[float, int, str]) -> _Waiter | None:
+        """The waiter a heap entry still stands for, or None when the entry is stale."""
+        waiter = self._waiters.get(entry[2])
+        return waiter if waiter is not None and waiter.seq == entry[1] else None
+
     def _drop_stale_deadlines(self) -> None:
-        while (
-            self._deadlines
-            and self._waiters.get(self._deadlines[0][2]) is not (self._deadlines[0][3])
-        ):
+        while self._deadlines and self._live(self._deadlines[0]) is None:
             heapq.heappop(self._deadlines)
+
+    def _maybe_compact(self) -> None:
+        """Rebuild the heap from live waiters once stale entries outnumber them.
+
+        Resolved waiters leave their entry behind until its deadline; without this a pod
+        serving many fast calls with long timeouts would grow the heap without bound.
+        """
+        size = len(self._deadlines)
+        if size >= _COMPACT_MIN_ENTRIES and size > 2 * len(self._waiters):
+            self._deadlines = [e for e in self._deadlines if self._live(e) is not None]
+            heapq.heapify(self._deadlines)
 
     def _expire(self) -> None:
         """Fail every waiter whose deadline has passed with `LLMQueueTimeout`."""
         now = self._clock()
         while self._deadlines and self._deadlines[0][0] <= now:
-            _, _, task_id, waiter = heapq.heappop(self._deadlines)
-            if self._discard(task_id, waiter) and not waiter.future.done():
-                waiter.future.set_exception(LLMQueueTimeout(f"no result for task {task_id}"))
+            entry = heapq.heappop(self._deadlines)
+            waiter = self._live(entry)
+            if waiter is not None and self._discard(entry[2], waiter) and not waiter.future.done():
+                waiter.future.set_exception(LLMQueueTimeout(f"no result for task {entry[2]}"))
 
     def _fail_all(self, exc: Exception) -> None:
         for task_id, waiter in list(self._waiters.items()):

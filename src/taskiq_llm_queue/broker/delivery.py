@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,8 @@ class Delivery:
 
     `lost` is set when a heartbeat finds the receipt handle invalid (another consumer may
     now own the message), so the running task can stop without writing a result (DS6).
+    `outcome` is "acked" or "released" once `done`; `after_ack` callbacks run only after
+    SQS confirmed the delete. `expires_at` is the `expiry` attribute (epoch seconds).
     """
 
     queue: SQSQueue
@@ -37,3 +40,7 @@ class Delivery:
     extensions: int = 0
     next_heartbeat_at: float = math.inf
     lost: asyncio.Event = field(default_factory=asyncio.Event)
+    task_id: str | None = None
+    expires_at: float | None = None
+    outcome: str | None = None
+    after_ack: list[Callable[[], Awaitable[None]]] = field(default_factory=list)

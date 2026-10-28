@@ -2,8 +2,9 @@
 
 One loop serves every tracked delivery: each is extended by its queue's visibility timeout
 every `interval` (≤ visibility / 3), so two missed beats still leave margin. Tracking stops
-on ack or release, after `max_extensions`, or when SQS says the receipt handle is invalid;
-the last case sets `Delivery.lost` and calls `on_lost` so the task can be cancelled.
+on ack or release, after `max_extensions`, once the message's `expiry` (deadline) plus a grace
+has passed, or when SQS says the receipt handle is invalid; the last case sets
+`Delivery.lost` and calls `on_lost` so the task can be cancelled.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import asyncio
 import contextlib
 import functools
 import math
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -38,9 +40,14 @@ class HeartbeatManager:
         *,
         hooks: BrokerHooks,
         on_lost: Callable[[Delivery], None] | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
-        """Nothing runs until `start()`; `track` before `start` is allowed."""
+        """Nothing runs until `start()`; `track` before `start` is allowed.
+
+        `wall_clock` (epoch seconds) is compared with `Delivery.expires_at`; injectable for tests.
+        """
         self._acker = acker
+        self._wall_clock = wall_clock
         self._config = config
         self._hooks = hooks
         self._on_lost = on_lost
@@ -96,6 +103,20 @@ class HeartbeatManager:
                     "sqs_heartbeat_max_extensions",
                     queue=delivery.queue.name,
                     max_extensions=limit,
+                )
+                self.untrack(delivery)
+                continue
+            if (
+                delivery.expires_at is not None
+                and self._wall_clock() > delivery.expires_at + self._config.deadline_grace_secs
+            ):
+                # DS6: a delivery stuck past its deadline must not stay invisible forever; once
+                # it reappears the broker deletes it as expired (P11).
+                logger.warning(
+                    "sqs_heartbeat_deadline_passed",
+                    queue=delivery.queue.name,
+                    message_id=delivery.message_id,
+                    extensions=delivery.extensions,
                 )
                 self.untrack(delivery)
                 continue

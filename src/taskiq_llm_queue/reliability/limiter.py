@@ -8,6 +8,7 @@ Lua call using Valkey `TIME` (DS10-DS12). `AdaptiveLimiter` serves asyncio worke
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -35,8 +36,9 @@ logger = structlog.get_logger(__name__)
 class LimiterSettings:
     """Tuning of the adaptive limiter (`LLMQ_AC_*`); defaults are recommended production starts.
 
-    `initial` maps a model alias to its start limit (a stored learned limit always wins);
-    `ramp_cap` caps ramp doubling (DS12: 2x the measured peak), defaulting to `max_limit`.
+    `initial` maps a model alias to its start limit (a stored learned limit always wins).
+    DS12: growth needs `inflight >= utilisation x allowed` and stops at 2x the peak inflight,
+    which decays with `peak_halflife_secs`; `ramp_cap` is an extra hard cap on ramp doubling.
     """
 
     initial: Mapping[str, int] | None = None
@@ -52,6 +54,8 @@ class LimiterSettings:
     ramp_cap: int | None = None
     lease_ttl_secs: float = 240.0
     poll_secs: float = 0.05
+    max_poll_secs: float = 0.25
+    peak_halflife_secs: float = 300.0
 
     def __post_init__(self) -> None:
         """Reject impossible settings at construction (boot time), never on a call path."""
@@ -61,6 +65,20 @@ class LimiterSettings:
             raise ValueError("decrease_factor must be in (0, 1) and bg_share in (0, 1]")
         if self.ramp_window < 1 or self.increase_every < 1 or self.lease_ttl_secs <= 0:
             raise ValueError("ramp_window, increase_every and lease_ttl_secs must be positive")
+        if not 0 < self.utilisation <= 1:
+            raise ValueError("utilisation must be in (0, 1]")
+        if self.poll_secs <= 0 or self.max_poll_secs < self.poll_secs:
+            raise ValueError("need 0 < poll_secs <= max_poll_secs")
+
+    def retry_delay(self, attempt: int, paused_secs: float, rng: random.Random) -> float:
+        """Sleep before the next acquire try: the pause remaining, else jittered backoff.
+
+        Backoff doubles from `poll_secs` to `max_poll_secs`; jitter spreads waiting pods.
+        """
+        if paused_secs > 0:
+            return paused_secs + rng.uniform(0, self.poll_secs)
+        base = min(self.max_poll_secs, self.poll_secs * 2 ** min(attempt, 16))
+        return rng.uniform(base / 2, base)
 
     def start_for(self, model: str) -> int:
         """Start limit for a model alias before anything was learned."""
@@ -148,7 +166,9 @@ def _acquire_args(settings: LimiterSettings, model: str, lane: Lane, token: str)
     ]
 
 
-def _release_args(settings: LimiterSettings, lease: Lease, throttled: bool) -> list[Any]:
+def _release_args(
+    settings: LimiterSettings, lease: Lease, throttled: bool, share: float = 1.0
+) -> list[Any]:
     return [
         settings.start_for(lease.model),
         settings.min_limit,
@@ -161,6 +181,8 @@ def _release_args(settings: LimiterSettings, lease: Lease, throttled: bool) -> l
         settings.pause_secs,
         min(settings.ramp_cap or settings.max_limit, settings.max_limit),
         settings.utilisation,
+        settings.peak_halflife_secs,
+        share,
     ]
 
 
@@ -200,6 +222,8 @@ class AdaptiveLimiter:
         self._peek = client.register_script(_lua.LIMITER_PEEK)
         self._renew = client.register_script(_lua.LEASE_RENEW)
         self._gates: dict[tuple[str, str], PauseGate] = {}
+        self._shares: dict[str, float] = {}  # lease token -> lane share, for DS12 at release
+        self._rng = random.Random()
         self.last_limits: dict[tuple[str, str], int] = {}
 
     def _key_pair(self, model: str, target: str) -> list[str]:
@@ -210,36 +234,55 @@ class AdaptiveLimiter:
             self.last_limits[(model, target)] = limit
         self.gate(model, target).close_for(paused_secs)
 
-    async def try_acquire(self, model: str, target: str, lane: Lane) -> Lease | None:
-        """One non-blocking attempt to take a slot."""
+    async def _attempt(self, model: str, target: str, lane: Lane) -> tuple[Lease | None, float]:
         token = uuid.uuid4().hex
         args = _acquire_args(self.settings, model, lane, token)
         granted, _inflight, limit, extra = await self._acquire(self._key_pair(model, target), args)
         if int(granted):
             self._note(model, target, int(limit), 0.0)
-            return Lease(model, target, token, float(_lua.as_text(extra)))
-        self._note(model, target, int(limit), float(_lua.as_text(extra)))
-        return None
+            self._shares[token] = self.settings.share_for(lane)
+            return Lease(model, target, token, float(_lua.as_text(extra))), 0.0
+        paused = float(_lua.as_text(extra))
+        self._note(model, target, int(limit), paused)
+        return None, paused
+
+    async def try_acquire(self, model: str, target: str, lane: Lane) -> Lease | None:
+        """One non-blocking attempt to take a slot."""
+        return (await self._attempt(model, target, lane))[0]
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
-        """Take a slot, polling until one frees up or `timeout_secs` passes (then None)."""
+        """Take a slot, waiting until one frees up or `timeout_secs` passes (then None).
+
+        Sleeps out a pause, else backs off with jitter; `should_abort` (e.g. the cancel flag)
+        is checked before every sleep and returning True gives up with None.
+        """
         deadline = self._clock() + max(0.0, timeout_secs)
+        attempt = 0
         while True:
-            lease = await self.try_acquire(model, target, lane)
+            lease, paused = await self._attempt(model, target, lane)
             if lease is not None:
                 return lease
             remaining = deadline - self._clock()
-            if remaining <= 0:
+            if remaining <= 0 or (should_abort is not None and await should_abort()):
                 return None
-            await self._sleep(min(self.settings.poll_secs, remaining))
+            delay = self.settings.retry_delay(attempt, paused, self._rng)
+            await self._sleep(min(delay, remaining))
+            attempt += 1
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
         """Return the slot and grow or shrink the limit, in one Lua call."""
+        share = self._shares.pop(lease.token, 1.0)
         limit, _removed, paused = await self._release(
             self._key_pair(lease.model, lease.target),
-            _release_args(self.settings, lease, throttled),
+            _release_args(self.settings, lease, throttled, share),
         )
         self._note(lease.model, lease.target, int(limit), float(_lua.as_text(paused)))
 
@@ -303,22 +346,39 @@ class SyncAdaptiveLimiter:
         self._sleep = sleep
         self._acquire = client.register_script(_lua.LIMITER_ACQUIRE)
         self._release = client.register_script(_lua.LIMITER_RELEASE)
+        self._shares: dict[str, float] = {}
+        self._rng = random.Random()
 
-    def acquire(self, model: str, target: str, lane: Lane, timeout_secs: float) -> Lease | None:
-        """Take a slot, polling until one frees up or `timeout_secs` passes (then None)."""
+    def acquire(
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> Lease | None:
+        """Take a slot, waiting until one frees up or `timeout_secs` passes (then None).
+
+        Same pause-aware jittered wait as `AdaptiveLimiter.acquire`, with a sync `should_abort`.
+        """
         keys = [self._keys.limiter(model, target), self._keys.leases(model, target)]
         deadline = self._clock() + max(0.0, timeout_secs)
+        attempt = 0
         while True:
             token = uuid.uuid4().hex
             granted, _, _, extra = self._acquire(
                 keys, _acquire_args(self.settings, model, lane, token)
             )
             if int(granted):
+                self._shares[token] = self.settings.share_for(lane)
                 return Lease(model, target, token, float(_lua.as_text(extra)))
             remaining = deadline - self._clock()
-            if remaining <= 0:
+            if remaining <= 0 or (should_abort is not None and should_abort()):
                 return None
-            self._sleep(min(self.settings.poll_secs, remaining))
+            delay = self.settings.retry_delay(attempt, float(_lua.as_text(extra)), self._rng)
+            self._sleep(min(delay, remaining))
+            attempt += 1
 
     def release(self, lease: Lease, *, throttled: bool) -> None:
         """Return the slot and grow or shrink the limit, in one Lua call."""
@@ -327,5 +387,5 @@ class SyncAdaptiveLimiter:
                 self._keys.limiter(lease.model, lease.target),
                 self._keys.leases(lease.model, lease.target),
             ],
-            _release_args(self.settings, lease, throttled),
+            _release_args(self.settings, lease, throttled, self._shares.pop(lease.token, 1.0)),
         )

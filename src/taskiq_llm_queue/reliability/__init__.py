@@ -7,7 +7,12 @@ local limiter covers Valkey outages. Clients are injected, so importing this doe
 from __future__ import annotations
 
 from taskiq_llm_queue.reliability.breaker import BreakerSettings, BreakerState, CircuitBreaker
-from taskiq_llm_queue.reliability.claims import ClaimSettings, FailureCount, RedisClaimStore
+from taskiq_llm_queue.reliability.claims import (
+    ClaimOutcome,
+    ClaimSettings,
+    FailureCount,
+    RedisClaimStore,
+)
 from taskiq_llm_queue.reliability.config_store import (
     AUDIT_RETENTION_SECS,
     LiveConfigStore,
@@ -36,6 +41,7 @@ __all__ = [
     "BreakerState",
     "ChainStep",
     "CircuitBreaker",
+    "ClaimOutcome",
     "ClaimSettings",
     "FailureCount",
     "FallbackConfig",

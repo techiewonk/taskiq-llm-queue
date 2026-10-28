@@ -13,7 +13,7 @@ import contextlib
 import threading
 import time
 import uuid
-from collections.abc import Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
@@ -25,11 +25,11 @@ from redis.exceptions import RedisError
 from taskiq.exceptions import SendTaskError
 
 from taskiq_llm_queue import metrics_names as mn
-from taskiq_llm_queue.broker.errors import SQSSendError
+from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.context import current_context
-from taskiq_llm_queue.core import CoreDeps, execute_job
+from taskiq_llm_queue.core import CoreDeps, InfraError, JobResult, execute_job
 from taskiq_llm_queue.envelope import (
     TASK_CALL,
     TASK_EMBED,
@@ -50,7 +50,10 @@ from taskiq_llm_queue.failover import FailoverSettings, FailoverState
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.lifecycle import (
     BrokerSet,
+    ClaimGroup,
     MetricsHooks,
+    PodHeartbeat,
+    PodRegistry,
     Workers,
     breaker_settings,
     build_brokers,
@@ -60,7 +63,7 @@ from taskiq_llm_queue.lifecycle import (
     queue_name,
 )
 from taskiq_llm_queue.metrics import MetricsSink, NullMetrics
-from taskiq_llm_queue.protocols import ClaimDecision
+from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.embeddings import (
     batches,
     embedding_body,
@@ -121,6 +124,7 @@ class _Started:
     brokers: BrokerSet
     runtime: WorkerRuntime
     workers: Workers | None
+    pods: PodRegistry | None = None
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
 
 
@@ -167,6 +171,10 @@ class LLMQueue:
         self._injected_redis = redis
         self._state: _Started | None = None
         self._direct_tasks: dict[str, asyncio.Task[Any]] = {}
+        # DS17 claims held as `direct:<pod>` (request id -> holders) and every in-flight lease
+        # of this pod (worker, direct and sync paths): both kept alive by the pod heartbeat.
+        self._direct_claims: dict[str, int] = {}
+        self._leases: set[Lease] = set()
         self._local_limiter = _LocalLimiters(self.failover, config)
         self._jobs: dict[str, JobFunction] = {}
         self._sync: _SyncRunner | None = None
@@ -244,9 +252,13 @@ class LLMQueue:
             fallback=lambda: fallback.current,
             worker=self.pod_id,
             hooks=self.hooks,
+            leases=self._leases,
         )
         runtime = WorkerRuntime(
-            deps, jobs=self._jobs, defer_secs=round(2 * claims.settings.heartbeat_interval_secs)
+            deps,
+            jobs=self._jobs,
+            defer_secs=round(2 * claims.settings.heartbeat_interval_secs),
+            failover=self.failover,
         )
         broker_hooks = self.hooks if isinstance(self.hooks, BrokerHooks) else None
         brokers = build_brokers(
@@ -271,6 +283,8 @@ class LLMQueue:
                 await client.aclose()
             raise
         workers = Workers(brokers, runtime) if mode in ("work", "both") else None
+        interval = claims.settings.heartbeat_interval_secs
+        pods = PodRegistry(client, f"{self.keys.prefix}:pods", self.pod_id, ttl_secs=3 * interval)
         state = _Started(
             mode,
             client,
@@ -284,10 +298,13 @@ class LLMQueue:
             brokers,
             runtime,
             workers,
+            pods,
         )
+        heartbeat = self._pod_heartbeat(state, interval)
         state.tasks.append(
             asyncio.create_task(fallback.run_reload(config.cfg_reload_secs), name="llmq-fallback")
         )
+        state.tasks.append(asyncio.create_task(heartbeat.run(), name="llmq-pod-heartbeat"))
         state.tasks.append(asyncio.create_task(self._watch_limits(limiter), name="llmq-limits"))
         if self.router is None and config.routing_enabled:
             default = RoutingConfig.model_validate(config.routing_default)
@@ -304,6 +321,30 @@ class LLMQueue:
             workers.start()
         self._state = state
         _set_default_queue(self)
+
+    def _pod_heartbeat(self, state: _Started, interval: float) -> PodHeartbeat:
+        """One heartbeat for every mode: worker claims, DS17 direct claims, all leases (DS11)."""
+        runtime = state.runtime
+
+        def worker_lost(lost: list[str]) -> None:
+            runtime.stop_running("claim_lost", lost)
+
+        def direct_lost(lost: list[str]) -> None:
+            logger.warning("direct_claims_lost", count=len(lost))
+
+        set_live = getattr(self.failover, "set_live_pods", None)
+        return PodHeartbeat(
+            claims=state.claims,
+            limiter=state.limiter,
+            leases=self._leases,
+            groups=[
+                ClaimGroup(self.pod_id, runtime.running_ids, worker_lost),
+                ClaimGroup(f"direct:{self.pod_id}", lambda: list(self._direct_claims), direct_lost),
+            ],
+            interval_secs=interval,
+            pods=state.pods,
+            on_live_pods=set_live if callable(set_live) else None,
+        )
 
     async def stop(self, drain_secs: float | None = None) -> None:
         """Ordered shutdown (§7.4): pause → drain running tasks → hand back leftovers → close.
@@ -337,6 +378,9 @@ class LLMQueue:
             except Exception as exc:
                 logger.warning("broker_shutdown_failed", error_type=type(exc).__name__)
         await self.registry.aclose()
+        if state.pods is not None:
+            with contextlib.suppress(Exception):
+                await state.pods.leave()
         if state.owns_redis:
             with contextlib.suppress(Exception):
                 await state.redis.aclose()
@@ -667,12 +711,26 @@ class LLMQueue:
                 .with_labels(**labels)
                 .kiq(sent.model_dump(mode="json"))
             )
+        except asyncio.CancelledError:  # a batched send may still go out: flag it (DS14)
+            await asyncio.shield(self._flag_cancel(state, envelope.request_id))
+            raise
         except (
             SendTaskError,
             SQSSendError,
             QueueUnavailable,
             OSError,
         ) as exc:  # taskiq wraps kick errors
+            rejected = _deterministic_send_error(exc)
+            if rejected is not None:  # the same message would fail again: no failover
+                logger.warning(
+                    "sqs_send_rejected",
+                    request_id=envelope.request_id,
+                    model=alias,
+                    error_type=type(rejected).__name__,
+                )
+                if isinstance(rejected, LLMQueueError):
+                    raise rejected from exc
+                raise LLMQueueError(f"send rejected: {type(rejected).__name__}") from exc
             logger.warning(
                 "sqs_send_failed",
                 request_id=envelope.request_id,
@@ -737,30 +795,72 @@ class LLMQueue:
             fallback=lambda: state.fallback.current,
             worker=f"direct:{self.pod_id}",
             hooks=self.hooks,
+            leases=self._leases,
         )
 
     async def _direct(self, envelope: Envelope, *, claim: bool = False) -> LLMReply:
-        """Run in-process; with `claim` (DS17) a queued copy that already runs is awaited."""
+        """Run in-process; with `claim` (DS17) a queued copy that already runs is awaited.
+
+        The DS17 claim is heartbeated by the pod heartbeat while the call runs. If Valkey fails
+        before any provider attempt the call runs again under the local cap; after one started,
+        the caller gets `QueueUnavailable` (never a second provider call).
+        """
         deps = self._direct_deps()
+        rid = envelope.request_id
+        held = claim and deps.claims is not None
         task = asyncio.current_task()
         if task is not None:
-            self._direct_tasks[envelope.request_id] = task
+            self._direct_tasks[rid] = task
+        if held:
+            self._direct_claims[rid] = self._direct_claims.get(rid, 0) + 1
         try:
-            result = await execute_job(
-                envelope, deps, claim=claim and deps.claims is not None, store=False
-            )
-        except RedisError as exc:
-            self._report_redis(exc)
-            deps = self._direct_deps()
-            result = await execute_job(envelope, deps, claim=False, store=False)
+            try:
+                result = await execute_job(envelope, deps, claim=held, store=False)
+            except InfraError as exc:
+                self._report_redis(exc.__cause__ or exc)
+                if exc.attempted:
+                    raise QueueUnavailable(f"Valkey failed during call {rid}") from exc
+                result = await self._direct_again(envelope)
+                if held:
+                    await self._finish_direct_claim(rid, result.reply)
         finally:
-            self._direct_tasks.pop(envelope.request_id, None)
+            self._direct_tasks.pop(rid, None)
+            if held:
+                self._drop_direct_claim(rid)
         if result.reply is not None:
             return result.reply
         if result.decision is ClaimDecision.ACK_CANCELLED:
             raise LLMQueueError(f"call {envelope.request_id} was cancelled")
         state = self._require_started()
         return await self._wait(state, envelope)  # the queued copy runs elsewhere
+
+    async def _direct_again(self, envelope: Envelope) -> JobResult:
+        """Second, unclaimed run after Valkey failed before any attempt (local cap, DS18)."""
+        try:
+            return await execute_job(envelope, self._direct_deps(), claim=False, store=False)
+        except InfraError as exc:
+            self._report_redis(exc.__cause__ or exc)
+            raise QueueUnavailable(f"Valkey failed during call {envelope.request_id}") from exc
+
+    async def _finish_direct_claim(self, request_id: str, reply: LLMReply | None) -> None:
+        """Best effort: mark a DS17 claim terminal after the local re-run answered the caller."""
+        state = self._state
+        if state is None or reply is None:
+            return
+        final = ClaimState.CANCELLED if reply.cancelled else ClaimState.DONE
+        try:
+            await state.claims.complete(request_id, final, worker=f"direct:{self.pod_id}")
+        except Exception as exc:
+            logger.warning(
+                "claim_complete_failed", request_id=request_id, error_type=type(exc).__name__
+            )
+
+    def _drop_direct_claim(self, request_id: str) -> None:
+        left = self._direct_claims.get(request_id, 0) - 1
+        if left > 0:
+            self._direct_claims[request_id] = left
+        else:
+            self._direct_claims.pop(request_id, None)
 
     def _run_sync(
         self,
@@ -793,7 +893,8 @@ class _LocalLimiters:
     """`Limiter` for Valkey-down mode (DS18): the failover policy's per-target local caps.
 
     Uses `FailoverState.local_limiter(model, target)` when the policy has it, else one
-    `LocalLimiter` capped at `local_limit_cap`.
+    `LocalLimiter` capped at `local_limit_cap`. A lease goes back to the limiter that issued it,
+    even after the policy rebuilt its limiters.
     """
 
     def __init__(self, failover: FailoverPolicy, config: QueueConfig) -> None:
@@ -803,6 +904,7 @@ class _LocalLimiters:
             bg_share=config.limiter.bg_share,
             pause_secs=config.limiter.pause_secs,
         )
+        self._issued: dict[str, LocalLimiter] = {}
 
     def _for(self, model: str, target: str) -> LocalLimiter:
         factory = getattr(self._failover, "local_limiter", None)
@@ -810,12 +912,23 @@ class _LocalLimiters:
         return limiter if isinstance(limiter, LocalLimiter) else self._fallback
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
-        return await self._for(model, target).acquire(model, target, lane, timeout_secs)
+        limiter = self._for(model, target)
+        lease = await limiter.acquire(model, target, lane, timeout_secs, should_abort=should_abort)
+        if lease is not None:
+            self._issued[lease.token] = limiter
+        return lease
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
-        await self._for(lease.model, lease.target).release(lease, throttled=throttled)
+        limiter = self._issued.pop(lease.token, None) or self._for(lease.model, lease.target)
+        await limiter.release(lease, throttled=throttled)
 
     def gate(self, model: str, target: str) -> Any:
         return self._for(model, target).gate(model, target)
@@ -826,17 +939,63 @@ class _SyncLimiter:
 
     def __init__(self, inner: SyncAdaptiveLimiter) -> None:
         self._inner = inner
+        self._orphans: set[asyncio.Future[None]] = set()
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
-        return await asyncio.to_thread(self._inner.acquire, model, target, lane, timeout_secs)
+        """Take a slot in a thread; a lease granted after the caller gave up is released."""
+        abort = _sync_abort(should_abort, asyncio.get_running_loop())
+        future = asyncio.ensure_future(
+            asyncio.to_thread(
+                self._inner.acquire, model, target, lane, timeout_secs, should_abort=abort
+            )
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:  # sync timeout: the thread may still win a slot
+            future.add_done_callback(self._release_orphan)
+            raise
+
+    def _release_orphan(self, future: asyncio.Future[Lease | None]) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        lease = future.result()
+        if lease is not None:
+            self._orphans.add(asyncio.ensure_future(self.release(lease, throttled=False)))
+            for done in [f for f in self._orphans if f.done()]:
+                self._orphans.discard(done)
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
         await asyncio.to_thread(self._inner.release, lease, throttled=throttled)
 
     def gate(self, model: str, target: str) -> Any:
         raise NotImplementedError("sync limiter has no receive gate")
+
+
+def _sync_abort(
+    should_abort: Callable[[], Awaitable[bool]] | None, loop: asyncio.AbstractEventLoop
+) -> Callable[[], bool] | None:
+    """Run an async `should_abort` on `loop` from the limiter's thread (False on any error)."""
+    if should_abort is None:
+        return None
+
+    async def call() -> bool:
+        return await should_abort()
+
+    def check() -> bool:
+        try:
+            return asyncio.run_coroutine_threadsafe(call(), loop).result(5)
+        except Exception:
+            return False
+
+    return check
 
 
 class _SyncRunner:
@@ -892,11 +1051,14 @@ class _SyncRunner:
             limiter=self._limiter(),
             worker=f"sync:{owner.pod_id}",
             hooks=owner.hooks,
+            leases=owner._leases,  # renewed by the pod heartbeat (DS11)
         )
         try:
             result = await execute_job(envelope, deps, claim=False, store=False)
-        except RedisError as exc:
-            owner._report_redis(exc)
+        except InfraError as exc:
+            owner._report_redis(exc.__cause__ or exc)
+            if exc.attempted:  # never a second provider call
+                raise QueueUnavailable(f"Valkey failed during call {envelope.request_id}") from exc
             deps.limiter = owner._local_limiter
             result = await execute_job(envelope, deps, claim=False, store=False)
         assert result.reply is not None
@@ -927,6 +1089,23 @@ def _vectors(op: Op, reply: LLMReply) -> list[list[float]]:
         return parse_embeddings(orjson.loads(decode_invoke(response)["body"]))
     data = sorted(response.get("data", []), key=lambda item: item.get("index", 0))
     return [list(item["embedding"]) for item in data]
+
+
+def _deterministic_send_error(exc: BaseException) -> BaseException | None:
+    """The cause of a send that would fail again (bad label, too large, config), else None.
+
+    Only infrastructure failures (SQS down, throttled, timeouts) open the SQS failover window.
+    """
+    seen: BaseException | None = exc
+    for _ in range(5):
+        if seen is None:
+            return None
+        if isinstance(seen, SQSSendError):
+            return seen if seen.family is ErrorFamily.SIZE_LIMIT else None
+        if isinstance(seen, ValueError | TypeError | ConfigError):
+            return seen
+        seen = seen.__cause__
+    return None
 
 
 def _unwrap(reply: LLMReply) -> LLMReply:

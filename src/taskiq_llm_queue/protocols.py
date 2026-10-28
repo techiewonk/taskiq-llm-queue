@@ -6,7 +6,7 @@ and tested in parallel with in-memory fakes before the real implementations land
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -81,9 +81,18 @@ class Limiter(Protocol):
     """Cluster-wide adaptive concurrency limit per model target, learned from throttles."""
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
-        """Take a slot for one attempt, or None if none frees up within the timeout."""
+        """Take a slot for one attempt, or None if none frees up within the timeout.
+
+        `should_abort` (e.g. the cancel flag, DS14) is checked while waiting; True gives up.
+        """
         ...
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
@@ -107,12 +116,14 @@ class ClaimStore(Protocol):
         """Refresh heartbeats and TTLs for running tasks."""
         ...
 
-    async def complete(self, request_id: str, state: ClaimState) -> None:
-        """Mark a task done, cancelled or expired after its result is stored."""
+    async def complete(
+        self, request_id: str, state: ClaimState, *, worker: str | None = None
+    ) -> None:
+        """Mark a task done, cancelled or expired after its result is stored (owner `worker`)."""
         ...
 
-    async def release(self, request_id: str) -> None:
-        """Hand a running task back so another pod can start it at once."""
+    async def release(self, request_id: str, *, worker: str | None = None) -> None:
+        """Hand a running task back so another pod can start it at once (owner `worker`)."""
         ...
 
 

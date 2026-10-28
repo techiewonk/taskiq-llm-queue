@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import random
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import fakeredis
 import pytest
+import redis.exceptions as redis_exceptions
 
 from taskiq_llm_queue import (
     ClaimDecision,
@@ -30,7 +31,14 @@ from taskiq_llm_queue import (
     QueueConfig,
     Target,
 )
-from taskiq_llm_queue.core import MAX_BACKOFF_SECS, CoreDeps, backoff_secs, execute_job
+from taskiq_llm_queue.core import (
+    MAX_BACKOFF_SECS,
+    CoreDeps,
+    InfraError,
+    backoff_secs,
+    execute_job,
+)
+from taskiq_llm_queue.errors import QueueUnavailable
 from taskiq_llm_queue.reliability.claims import FailureCount
 from taskiq_llm_queue.reliability.fallback import FallbackConfig
 
@@ -71,10 +79,24 @@ class FakeLimiter:
     deny: set[tuple[str, str]] = field(default_factory=set)
     events: list[tuple[str, str, str, bool]] = field(default_factory=list)
     held: int = 0
+    waits: list[float] = field(default_factory=list)
+    aborts: list[bool] = field(default_factory=list)
+    on_acquire: Callable[[], Awaitable[None]] | None = None
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
+        self.waits.append(timeout_secs)
+        if should_abort is not None:
+            self.aborts.append(await should_abort())
+        if self.on_acquire is not None:
+            await self.on_acquire()
         if (model, target) in self.deny:
             return None
         self.held += 1
@@ -101,13 +123,15 @@ class FakeClaims:
         self.log.append(f"claim:{worker}")
         return self.decision
 
-    async def complete(self, request_id: str, state: ClaimState) -> None:
+    async def complete(
+        self, request_id: str, state: ClaimState, *, worker: str | None = None
+    ) -> None:
         self.log.append(f"complete:{state.value}")
 
     async def is_cancelled(self, request_id: str) -> bool:
         return request_id in self.cancelled
 
-    async def release(self, request_id: str) -> None:
+    async def release(self, request_id: str, *, worker: str | None = None) -> None:
         self.log.append("release")
 
     async def record_failure(self, request_id: str) -> FailureCount:
@@ -137,13 +161,16 @@ class FakeBreaker:
     """Breaker that blocks targets listed in `open_targets` and records outcomes."""
 
     open_targets: set[str] = field(default_factory=set)
-    records: list[tuple[str, bool]] = field(default_factory=list)
+    records: list[tuple[str, bool | None]] = field(default_factory=list)
 
     async def allow(self, model: str, target: str) -> bool:
         return target not in self.open_targets
 
     async def record(self, model: str, target: str, *, ok: bool) -> None:
         self.records.append((target, ok))
+
+    async def record_neutral(self, model: str, target: str) -> None:
+        self.records.append((target, None))
 
 
 def config(**overrides: Any) -> QueueConfig:
@@ -255,7 +282,8 @@ async def test_throttles_retry_then_fall_back_to_other_target(world: World) -> N
     throttled = [e[3] for e in world.limiter.events if e[0] == "release"]
     assert throttled == [True, True, True, False]
     assert len(world.sleeps) == 2  # backoff between attempts, not after the last one
-    assert ("primary", False) in world.breaker.records
+    assert ("primary", False) not in world.breaker.records  # throttles are the limiter's
+    assert world.breaker.records.count(("primary", None)) == 3
 
 
 async def test_release_happens_before_sleep(world: World) -> None:
@@ -397,3 +425,144 @@ def test_backoff_grows_and_honours_retry_after() -> None:
     assert 4 <= backoff_secs(2, 1.0, rng, None) < 5
     assert backoff_secs(0, 1.0, rng, 7.0) == 7.0
     assert backoff_secs(10, 1.0, rng, None) == MAX_BACKOFF_SECS
+
+
+# ---------------------------------------------------------------- reliability regressions
+
+
+@dataclass
+class FlakyResults:
+    """Result store whose first `failures` puts raise (Valkey down while storing)."""
+
+    log: list[str]
+    failures: int = 0
+    replies: dict[str, LLMReply] = field(default_factory=dict)
+
+    async def put(self, reply: LLMReply, *, ttl_secs: int) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise redis_exceptions.ConnectionError("down")
+        self.log.append("put")
+        self.replies[reply.request_id] = reply
+
+    async def take_many(self, task_ids: Sequence[str]) -> dict[str, LLMReply]:
+        return {}
+
+
+async def test_claim_complete_failure_after_store_is_logged_only(world: World) -> None:
+    """Bug #1: a RedisError in `claims.complete` after the reply was stored must not escape
+    (taskiq would ack and overwrite the good reply with `task_error`)."""
+
+    async def broken_complete(
+        request_id: str, state: ClaimState, *, worker: str | None = None
+    ) -> None:
+        raise redis_exceptions.ConnectionError("down")
+
+    world.claims.complete = broken_complete  # type: ignore[method-assign]
+    result = await execute_job(envelope(), world.deps)
+    assert result.reply is not None
+    assert result.reply.ok
+    assert world.claims.log == ["claim:pod-1", "put"]
+
+
+async def test_throttles_do_not_trip_the_breaker(world: World) -> None:
+    """Bug #5: throttles are neutral for the breaker; only 5xx/timeouts count as failures."""
+    world.provider.script["primary"] = [
+        FakeError(ErrorKind.THROTTLE, "ThrottlingException"),
+        FakeError(ErrorKind.RETRYABLE, "ServiceUnavailable"),
+    ]
+    await execute_job(envelope(), world.deps)
+    assert world.breaker.records == [("primary", None), ("primary", False), ("primary", True)]
+
+
+async def test_all_circuits_open_waits_within_deadline(world: World) -> None:
+    """Bug #5: with every step's breaker open, an rt call waits and retries before its
+    deadline instead of failing at once with `circuit_open`."""
+    world.breaker.open_targets.update({"primary", "apac"})
+
+    async def sleep(secs: float) -> None:
+        world.sleeps.append(secs)
+        world.breaker.open_targets.clear()  # cooldown passed
+
+    world.deps.sleep = sleep
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert world.sleeps == [1.0]
+
+
+async def test_redis_error_on_acquire_raises_infra_error(world: World) -> None:
+    """Bug #6: a Valkey blip in `limiter.acquire` is infrastructure (InfraError, nothing
+    stored, claim not completed), not a stored non-retryable `internal_error`."""
+
+    async def boom() -> None:
+        raise redis_exceptions.ConnectionError("down")
+
+    world.limiter.on_acquire = boom
+    with pytest.raises(InfraError) as info:
+        await execute_job(envelope(), world.deps)
+    assert info.value.attempted is False
+    assert world.claims.log == ["claim:pod-1"]
+
+
+async def test_redis_error_after_an_attempt_reports_attempted(world: World) -> None:
+    """Bug #3/#6: an InfraError after a provider attempt says so, so `direct` never re-runs."""
+    world.provider.script["primary"] = [FakeError(ErrorKind.RETRYABLE)]
+    calls = 0
+
+    async def second_fails() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise redis_exceptions.ConnectionError("down")
+
+    world.limiter.on_acquire = second_fails
+    with pytest.raises(InfraError) as info:
+        await execute_job(envelope(), world.deps)
+    assert info.value.attempted is True
+    assert world.limiter.held == 0
+
+
+async def test_queued_bg_call_without_capacity_is_requeued(world: World) -> None:
+    """Bug #7: a queued bg call waits a bounded time per step, then releases its claim and
+    asks for a delayed release (DS4) instead of holding a worker slot until its deadline."""
+    world.limiter.deny.update({("big", "primary"), ("big", "apac")})
+    result = await execute_job(envelope(lane="bg", deadline_at=time.time() + 300), world.deps)
+    assert result.reply is None
+    assert result.requeue_secs is not None
+    assert 60 <= result.requeue_secs <= 80
+    assert world.limiter.waits == [15.0, 15.0]
+    assert world.claims.log == ["claim:pod-1", "release"]
+    assert world.limiter.aborts == [False, False]  # the cancel flag is checked while waiting
+
+
+async def test_cancel_checked_right_after_acquire(world: World) -> None:
+    """Bug #7 (DS14): a cancel that lands while waiting for a slot releases the slot and
+    never calls the provider."""
+
+    async def cancel_now() -> None:
+        world.claims.cancelled.add("r-1")
+
+    world.limiter.on_acquire = cancel_now
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.cancelled
+    assert world.provider.calls == []
+    assert world.limiter.held == 0
+
+
+async def test_unstored_reply_is_cached_and_reused_on_redelivery(world: World) -> None:
+    """Bug #15 (DS8): a reply whose write failed is cached on the pod; the redelivery stores
+    it without a second provider call."""
+    results = FlakyResults(world.claims.log, failures=1)
+    world.deps.results = results
+    world.deps.store_retry_secs = 0.0
+    with pytest.raises(QueueUnavailable):
+        await execute_job(envelope(), world.deps)
+    assert len(world.deps.reply_cache) == 1
+    assert "complete:done" not in world.claims.log  # claim left running
+    result = await execute_job(envelope(), world.deps)
+    assert result.reply is not None
+    assert result.reply.ok
+    assert len(world.provider.calls) == 1
+    assert "r-1" in results.replies

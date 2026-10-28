@@ -57,12 +57,14 @@ class Heartbeat:
     """Visibility extension for received messages (P13, DS6), sent in batches.
 
     `interval_secs` defaults to (and is capped at) a third of the queue's visibility timeout;
-    `max_extensions=None` extends until the message is acked or released.
+    `max_extensions=None` extends until the message is acked or released, but never past the
+    message's `expiry` (its `deadline_at`) plus `deadline_grace_secs` (DS6).
     """
 
     interval_secs: float | None = None
     max_extensions: int | None = None
     flush_secs: float = 0.5
+    deadline_grace_secs: float = 60.0
 
     def __post_init__(self) -> None:
         """Reject non-positive intervals and negative extension counts."""
@@ -72,6 +74,8 @@ class Heartbeat:
             raise BrokerConfigError("heartbeat.max_extensions must be >= 0")
         if not 0 < self.flush_secs <= 1:
             raise BrokerConfigError("heartbeat.flush_secs must be in (0, 1] (DS6)")
+        if self.deadline_grace_secs < 0:
+            raise BrokerConfigError("heartbeat.deadline_grace_secs must be >= 0")
 
     def interval_for(self, visibility_secs: int) -> float:
         """Seconds between extensions for a queue with this visibility timeout (≤ visibility/3)."""

@@ -58,7 +58,11 @@ class Acker:
         backoff_base_secs: float = 0.2,
         backoff_cap_secs: float = 2.0,
     ) -> None:
-        """Create no batchers yet; one pair is made per queue on first use."""
+        """Create no batchers yet; one pair is made per queue on first use.
+
+        `retry_attempts` is the only throttle/5xx retry layer: the broker's SQS client makes at
+        most one quick botocore retry (standard mode), so one call costs <= 2 x this many.
+        """
         self._client = client
         self._hooks = hooks
         self._ack_flush_secs = ack_flush_secs

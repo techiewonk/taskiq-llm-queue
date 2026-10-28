@@ -39,10 +39,15 @@ async def take(lim: AdaptiveLimiter, n: int, lane: Lane = Lane.RT) -> list[Lease
     return [lease for lease in leases if lease is not None]
 
 
-async def succeed(lim: AdaptiveLimiter, n: int) -> None:
+async def succeed(lim: AdaptiveLimiter, n: int, lane: Lane = Lane.RT) -> None:
     for _ in range(n):
-        lease = await lim.try_acquire(M, T, Lane.RT)
+        lease = await lim.try_acquire(M, T, lane)
         assert lease is not None
+        await lim.release(lease, throttled=False)
+
+
+async def release_all(lim: AdaptiveLimiter, leases: list[Lease]) -> None:
+    for lease in leases:
         await lim.release(lease, throttled=False)
 
 
@@ -91,21 +96,142 @@ async def test_stored_value_is_clamped_to_min_max(
 async def test_ramp_doubles_per_window_until_cap(
     valkey: redis.asyncio.Redis, keys: KeySpace
 ) -> None:
+    """Ramp doubles per window of busy successes (inflight >= 0.9 x limit), up to `ramp_cap`."""
     lim = make(valkey, keys, ramp_cap=20)
-    await succeed(lim, 3)
+    held = await take(lim, 3)
+    await succeed(lim, 3)  # each at inflight 4 of 4
     assert await limit_of(lim) == 8
-    await succeed(lim, 3)
+    held += await take(lim, 4)
+    await succeed(lim, 3)  # inflight 8 of 8
     assert await limit_of(lim) == 16
-    await succeed(lim, 3)
+    held += await take(lim, 8)
+    await succeed(lim, 3)  # inflight 16 of 16, peak cap 32
     assert await limit_of(lim) == 20  # DS12: ramp capped
+    held += await take(lim, 4)
     await succeed(lim, 3)
     assert await limit_of(lim) == 20
+    await release_all(lim, held)
 
 
 async def test_ramp_never_exceeds_max(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
     lim = make(valkey, keys, initial={M: 30})
+    held = await take(lim, 29)
     await succeed(lim, 3)
     assert await limit_of(lim) == 50
+    await release_all(lim, held)
+
+
+async def test_idle_traffic_does_not_ramp(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 4 (DS12): sequential calls at concurrency 1 ramped 20 -> 2000; limit must hold."""
+    lim = make(valkey, keys, initial={M: 20}, max_limit=2000)
+    for _ in range(100):
+        lease = await lim.acquire(M, T, Lane.RT, timeout_secs=1)
+        assert lease is not None
+        await lim.release(lease, throttled=False)
+    assert await limit_of(lim) == 20
+
+
+async def test_growth_capped_at_twice_peak(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 4 (DS12): ramp stops at 2 x the measured peak inflight, not at `max_limit`."""
+    lim = make(valkey, keys, initial={M: 4}, utilisation=0.5)
+    held = await take(lim, 2)
+    await succeed(lim, 3)  # busy at inflight 3 >= 2; peak 3
+    assert await limit_of(lim) == 6, "doubling to 8 would exceed 2 x peak"
+    await release_all(lim, held)
+
+
+async def test_bg_only_traffic_can_grow(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 4: utilisation is measured against the lane's share, so a saturated bg grows."""
+    lim = make(valkey, keys, initial={M: 10})
+    held = await take(lim, 7, Lane.BG)
+    await succeed(lim, 3, Lane.BG)  # inflight 8 of the 8 bg slots
+    assert await limit_of(lim) == 16  # min(2 x 10, 2 x peak 8)
+    await release_all(lim, held)
+
+
+async def test_refused_acquire_writes_nothing(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 7: a refused acquire did HSET + ZREMRANGEBYSCORE on every 50 ms poll (hot key)."""
+    lim = make(valkey, keys, initial={M: 2})
+    held = await take(lim, 2)
+    await valkey.zadd(keys.leases(M, T), {"expired": 1.0})
+    async with valkey.pipeline(transaction=True) as pipe:
+        await pipe.watch(keys.limiter(M, T), keys.leases(M, T))
+        for _ in range(5):
+            assert await lim.try_acquire(M, T, Lane.RT) is None
+        pipe.multi()  # type: ignore[no-untyped-call]
+        pipe.ping()
+        await pipe.execute()  # WatchError if any refused call wrote either key
+    assert await valkey.zscore(keys.leases(M, T), "expired") == 1.0
+    await release_all(lim, held)
+    assert await lim.try_acquire(M, T, Lane.RT) is not None
+    assert await valkey.zscore(keys.leases(M, T), "expired") is None, "pruned on grant"
+
+
+async def test_acquire_sleeps_out_the_pause(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 7: a paused acquire polled every 50 ms; it now sleeps the pause remaining."""
+    delays: list[float] = []
+
+    async def sleep(secs: float) -> None:
+        delays.append(secs)
+        await asyncio.sleep(secs)
+
+    lim = AdaptiveLimiter(
+        valkey, keys, LimiterSettings(initial={M: 4}, pause_secs=0.3, poll_secs=0.01), sleep=sleep
+    )
+    await throttle(lim)
+    assert await lim.acquire(M, T, Lane.RT, timeout_secs=5) is not None
+    assert delays, "acquire must have waited"
+    assert delays[0] >= 0.2
+    assert len(delays) <= 2
+
+
+async def test_acquire_backoff_is_bounded(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    """Finding 7: waiting at the limit backs off with jitter instead of a fixed 50 ms poll."""
+    delays: list[float] = []
+
+    async def sleep(secs: float) -> None:
+        delays.append(secs)
+        await asyncio.sleep(secs)
+
+    settings = LimiterSettings(initial={M: 2}, min_limit=2, poll_secs=0.01, max_poll_secs=0.08)
+    lim = AdaptiveLimiter(valkey, keys, settings, sleep=sleep)
+    held = await take(lim, 2)
+    assert await lim.acquire(M, T, Lane.RT, timeout_secs=0.5) is None
+    assert len(delays) < 0.5 / 0.01 / 2, "backoff must grow beyond poll_secs"
+    assert max(delays) <= 0.08
+    await release_all(lim, held)
+
+
+async def test_acquire_should_abort_stops_waiting(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Finding 7: a cancelled caller kept waiting for a slot until its timeout."""
+    lim = make(valkey, keys, initial={M: 2})
+    held = await take(lim, 2)
+    calls = 0
+
+    async def cancelled() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 2
+
+    started = time.monotonic()
+    assert await lim.acquire(M, T, Lane.RT, timeout_secs=10, should_abort=cancelled) is None
+    assert time.monotonic() - started < 1
+    assert calls == 2
+    await release_all(lim, held)
+
+
+async def test_renew_does_not_revive_expired_lease(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """DS11: an expired lease's slot may already be reused, so renew must not bring it back."""
+    lim = make(valkey, keys, initial={M: 2}, lease_ttl_secs=0.1)
+    lease = await lim.try_acquire(M, T, Lane.RT)
+    assert lease is not None
+    await asyncio.sleep(0.2)
+    await lim.renew([lease])
+    assert (await lim.state(M, T)).inflight == 0
 
 
 async def test_throttle_ends_ramp_decreases_once_per_second(
@@ -238,6 +364,7 @@ async def test_sync_limiter_shares_state(
     lease = sync.acquire(M, T, Lane.RT, timeout_secs=0)
     assert lease is not None
     assert sync.acquire(M, T, Lane.RT, timeout_secs=0.05) is None
+    assert sync.acquire(M, T, Lane.RT, timeout_secs=10, should_abort=lambda: True) is None
     sync.release(lease, throttled=True)
     assert (await lim.state(M, T)).paused_secs > 0
     await lim.release(held[0], throttled=False)

@@ -10,7 +10,7 @@ import redis.asyncio
 
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState, ClaimStore
-from taskiq_llm_queue.reliability import ClaimSettings, RedisClaimStore
+from taskiq_llm_queue.reliability import ClaimOutcome, ClaimSettings, RedisClaimStore
 
 pytestmark = pytest.mark.integration
 
@@ -143,11 +143,11 @@ async def test_cancel_flag_with_live_owner_keeps_running(
 
 
 async def test_stale_heartbeat_is_reclaimed(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
-    """A heartbeat older than 2 x interval means the owner died: another pod runs it."""
+    """A heartbeat older than 3 x interval means the owner died: another pod runs it."""
     store = make(valkey, keys, heartbeat_interval_secs=0.1)
     await store.claim(RID, deadline_at=later(), worker="a")
     assert await store.claim(RID, deadline_at=later(), worker="b") is ClaimDecision.DEFER
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.45)
     assert await store.claim(RID, deadline_at=later(), worker="b") is ClaimDecision.RUN
     record = await valkey.hgetall(keys.job(RID))
     assert record[b"worker"] == b"b"
@@ -158,7 +158,7 @@ async def test_stale_past_deadline_expires(valkey: redis.asyncio.Redis, keys: Ke
     store = make(valkey, keys, heartbeat_interval_secs=0.1)
     deadline = await server_now(valkey) + 0.2
     assert await store.claim(RID, deadline_at=deadline, worker="a") is ClaimDecision.RUN
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.45)
     decision = await store.claim(RID, deadline_at=deadline, worker="b")
     assert decision is ClaimDecision.ACK_EXPIRED
 
@@ -204,3 +204,61 @@ async def test_concurrent_claims_pick_one_runner(
     )
     assert decisions.count(ClaimDecision.RUN) == 1
     assert decisions.count(ClaimDecision.DEFER) == 19
+
+
+async def take_over(valkey: redis.asyncio.Redis, keys: KeySpace) -> RedisClaimStore:
+    """`a` runs the task, misses its heartbeats, and `b` reclaims it."""
+    store = make(valkey, keys, heartbeat_interval_secs=0.1)
+    assert await store.claim(RID, deadline_at=later(), worker="a") is ClaimDecision.RUN
+    await asyncio.sleep(0.45)
+    assert await store.claim(RID, deadline_at=later(), worker="b") is ClaimDecision.RUN
+    return store
+
+
+async def test_stale_owner_cannot_complete_new_owners_claim(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Finding 12: CLAIM_COMPLETE ignored `worker`, so a stale owner marked b's run done."""
+    store = await take_over(valkey, keys)
+    outcome = await store.complete_owned(RID, ClaimState.DONE, worker="a")
+    assert outcome is ClaimOutcome.NOT_OWNER
+    await store.complete(RID, ClaimState.CANCELLED, worker="a")  # protocol form: no-op too
+    assert await store.state(RID) is ClaimState.RUNNING
+    assert await valkey.hget(keys.job(RID), "worker") == b"b"
+    assert await store.complete_owned(RID, ClaimState.DONE, worker="b") is ClaimOutcome.APPLIED
+    assert await store.state(RID) is ClaimState.DONE
+
+
+async def test_stale_owner_cannot_release_new_owners_claim(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Finding 12: CLAIM_RELEASE ignored `worker`, so a stale owner released b's running claim."""
+    store = await take_over(valkey, keys)
+    assert await store.release_owned(RID, worker="a") is ClaimOutcome.NOT_OWNER
+    await store.release(RID, worker="a")
+    assert await store.state(RID) is ClaimState.RUNNING
+    assert await valkey.hget(keys.job(RID), "worker") == b"b"
+    assert await store.release_owned(RID, worker="b") is ClaimOutcome.APPLIED
+    assert await store.state(RID) is ClaimState.RELEASED
+    assert await store.release_owned(RID, worker="b") is ClaimOutcome.NOT_RUNNING
+
+
+async def test_complete_after_own_release_is_allowed(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """A record with no owner (released) can still be completed by the worker that ran it."""
+    store = make(valkey, keys)
+    await store.claim(RID, deadline_at=later(), worker="a")
+    await store.release(RID, worker="a")
+    assert await store.complete_owned(RID, ClaimState.DONE, worker="a") is ClaimOutcome.APPLIED
+    assert await store.state(RID) is ClaimState.DONE
+
+
+async def test_one_missed_heartbeat_is_not_stale(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Finding 12: staleness was 2 x interval, so one missed beat let another pod take over."""
+    store = make(valkey, keys, heartbeat_interval_secs=0.1)
+    await store.claim(RID, deadline_at=later(), worker="a")
+    await asyncio.sleep(0.22)  # one beat missed, the next one late
+    assert await store.claim(RID, deadline_at=later(), worker="b") is ClaimDecision.DEFER

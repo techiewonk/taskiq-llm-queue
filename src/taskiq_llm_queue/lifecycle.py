@@ -2,14 +2,16 @@
 
 `build_brokers` creates one `HybridSQSBroker` per distinct queue set (rt priority 0, default 1,
 bulk 2) with limiter-aware gates and receive budgets (DS4, DS13). `Workers` runs taskiq
-`Receiver`s in-process and stops them in the ordered drain of §7.4.
+`Receiver`s in-process and stops them in the ordered drain of §7.4. `PodHeartbeat` keeps every
+claim and lease this pod holds alive, in every mode (DS3, DS6, DS11, DS17).
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-from collections.abc import Callable, Mapping
+import math
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -30,11 +32,13 @@ from taskiq_llm_queue.routing_hooks import QueueHooks
 from taskiq_llm_queue.tasks import WorkerRuntime, job_filter, register_tasks
 
 if TYPE_CHECKING:
+    from redis.asyncio import Redis
     from taskiq import AsyncResultBackend
 
     from taskiq_llm_queue.config import ModelConfig, QueueConfig
     from taskiq_llm_queue.metrics import MetricsSink
-    from taskiq_llm_queue.protocols import ReceiveGate
+    from taskiq_llm_queue.protocols import Lease, ReceiveGate
+    from taskiq_llm_queue.reliability.claims import RedisClaimStore
     from taskiq_llm_queue.routing_hooks import FailoverPolicy
 
 logger = structlog.get_logger(__name__)
@@ -309,10 +313,10 @@ def build_brokers(
 
 
 class Workers:
-    """In-process taskiq receivers for every broker, the claim/lease heartbeat and the drain.
+    """In-process taskiq receivers for every broker and their drain.
 
     `start` launches one `Receiver.listen` per broker (`ack_type=WHEN_SAVED`, `max_async_tasks`
-    = the broker's slots). `drain` is steps 1-4 of §7.4; closing the brokers is the caller's.
+    = the broker's slots). `drain` is steps 1-4 of §7.4; claims are kept alive by `PodHeartbeat`.
     """
 
     def __init__(self, brokers: BrokerSet, runtime: WorkerRuntime) -> None:
@@ -322,10 +326,9 @@ class Workers:
         self._finish = asyncio.Event()
         self._receivers: list[Receiver] = []
         self._listeners: list[asyncio.Task[None]] = []
-        self._heartbeat: asyncio.Task[None] | None = None
 
     def start(self) -> None:
-        """Start receivers and the heartbeat; brokers must already be started."""
+        """Start receivers; brokers must already be started."""
         self._finish = asyncio.Event()
         for broker in self._brokers.all():
             receiver = Receiver(
@@ -339,7 +342,6 @@ class Workers:
             self._listeners.append(
                 asyncio.create_task(receiver.listen(self._finish), name="llmq-receiver")
             )
-        self._heartbeat = asyncio.create_task(self._beat(), name="llmq-claim-heartbeat")
 
     async def pause(self) -> None:
         """§7.4 step 1: stop receiving and release buffered, unstarted messages."""
@@ -365,28 +367,141 @@ class Workers:
         if leftovers:
             logger.info("drain_hand_back", running=len(leftovers))
             await asyncio.wait(leftovers, timeout=_FLUSH_SECS)
-        if self._heartbeat is not None:
-            self._heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat
         self._listeners.clear()
         self._receivers.clear()
 
-    async def _beat(self) -> None:
-        """Refresh claims of running tasks and renew in-flight leases (DS3, DS6, DS11)."""
-        deps = self._runtime.deps
-        claims = deps.claims
-        interval = claims.settings.heartbeat_interval_secs if claims is not None else 10.0
+
+@dataclass(frozen=True, slots=True)
+class ClaimGroup:
+    """Claims held under one worker identity: `ids()` lists them, `on_lost` hears lost ones.
+
+    A pod has two: its worker tasks (`pod_id`) and its DS17 direct calls (`direct:<pod_id>`).
+    """
+
+    worker: str
+    ids: Callable[[], Sequence[str]]
+    on_lost: Callable[[list[str]], None]
+
+
+class PodRegistry:
+    """Live pods of one key prefix: a sorted set `<prefix>:pods` scored by expiry.
+
+    Each heartbeat re-adds this pod and drops expired ones; the count is the `live_pods` that
+    splits the last known limit into a per-pod local cap while Valkey is down (DS18).
+    """
+
+    def __init__(
+        self,
+        client: Redis,
+        key: str,
+        pod_id: str,
+        *,
+        ttl_secs: float,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        """Keep the client, the set's key, this pod's id and how long an entry lives."""
+        self._client = client
+        self._key = key
+        self._pod = pod_id
+        self._ttl = ttl_secs
+        self._clock = clock
+
+    async def beat(self) -> int:
+        """Mark this pod alive and return how many pods are."""
+        now = self._clock()
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.zadd(self._key, {self._pod: now + self._ttl})
+            pipe.zremrangebyscore(self._key, "-inf", now)
+            pipe.zcard(self._key)
+            pipe.expire(self._key, math.ceil(2 * self._ttl))
+            _, _, count, _ = await pipe.execute()
+        return int(count)
+
+    async def leave(self) -> None:
+        """Remove this pod (clean shutdown); expiry covers a crash."""
+        await self._client.zrem(self._key, self._pod)
+
+
+class PodHeartbeat:
+    """One loop per pod, in every mode: claims, leases and the live-pod count (DS3, DS6, DS11).
+
+    Covers worker tasks and DS17 direct claims, and renews every lease of the worker, direct
+    and sync paths (one shared set). A Valkey blip is logged; the loop never stops.
+    """
+
+    def __init__(
+        self,
+        *,
+        claims: RedisClaimStore | None,
+        limiter: AdaptiveLimiter | None,
+        leases: set[Lease],
+        groups: Sequence[ClaimGroup],
+        interval_secs: float,
+        pods: PodRegistry | None = None,
+        on_live_pods: Callable[[int], None] | None = None,
+    ) -> None:
+        """Keep what to refresh; nothing starts until `run()`."""
+        self._claims = claims
+        self._limiter = limiter
+        self._leases = leases
+        self._groups = list(groups)
+        self.interval_secs = interval_secs
+        self._pods = pods
+        self._on_live_pods = on_live_pods
+
+    async def run(self) -> None:
+        """Beat every `interval_secs` until cancelled."""
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(self.interval_secs)
+            await self.beat_once()
+
+    async def beat_once(self) -> None:
+        """Refresh claims, renew leases and the pod registry once; errors are logged."""
+        for group in self._groups:
+            await self._beat_claims(group)
+        leases = self._lease_snapshot()
+        if self._limiter is not None and leases:
             try:
-                ids = list(self._runtime.running)
-                if claims is not None and ids:
-                    lost = await claims.heartbeat_owned(ids, worker=deps.worker)
-                    if lost:
-                        logger.warning("claims_lost", running=len(lost))
-                        self._runtime.stop_running("lost", lost)
-                if isinstance(deps.limiter, AdaptiveLimiter) and deps.leases:
-                    await deps.limiter.renew(list(deps.leases))
-            except Exception as exc:  # keep beating; a blip must not stop the loop
-                logger.warning("claim_heartbeat_failed", error_type=type(exc).__name__)
+                await self._limiter.renew(leases)
+            except Exception as exc:
+                logger.warning(
+                    "lease_renew_failed", leases=len(leases), error_type=type(exc).__name__
+                )
+        if self._pods is not None:
+            try:
+                live = await self._pods.beat()
+            except Exception as exc:
+                logger.warning("pod_registry_failed", error_type=type(exc).__name__)
+            else:
+                if self._on_live_pods is not None:
+                    safe_call(self._on_live_pods, live)
+
+    async def _beat_claims(self, group: ClaimGroup) -> None:
+        ids = list(dict.fromkeys(group.ids()))
+        if self._claims is None or not ids:
+            return
+        try:
+            lost = await self._claims.heartbeat_owned(ids, worker=group.worker)
+        except Exception as exc:  # keep beating; a blip must not stop the loop
+            logger.warning("claim_heartbeat_failed", error_type=type(exc).__name__)
+            return
+        if lost:
+            logger.warning("claims_lost", worker=group.worker, running=len(lost))
+            safe_call(group.on_lost, lost)
+
+    def _lease_snapshot(self) -> list[Lease]:
+        """Copy the shared lease set; sync callers add to it from their own thread."""
+        for _ in range(3):
+            try:
+                return list(self._leases)
+            except RuntimeError:  # changed size during iteration
+                continue
+        return []
+
+
+def safe_call(callback: Callable[..., object], *args: object) -> None:
+    """Run a heartbeat callback, logging (never raising) whatever it throws."""
+    try:
+        callback(*args)
+    except Exception:
+        logger.exception("heartbeat_callback_failed")

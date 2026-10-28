@@ -33,7 +33,7 @@ from taskiq_llm_queue import (
     Target,
     request_context,
 )
-from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
+from taskiq_llm_queue.broker.errors import ErrorFamily, InvalidLabelError, SQSSendError
 from taskiq_llm_queue.client import LLMQueue
 from taskiq_llm_queue.providers import BedrockProvider, OpenAICompatProvider
 from taskiq_llm_queue.routing import RoutingConfig
@@ -441,3 +441,42 @@ async def test_sync_converse_runs_direct(make_queue: MakeQueue) -> None:
     vectors = await asyncio.to_thread(llmq.embed_sync, "titan", ["a", "b"])
     assert len(vectors) == 2
     assert llmq.sync_fallback_count == 3
+
+
+async def test_caller_cancel_during_pending_send_sets_cancel_flag(
+    make_queue: MakeQueue, redis: Redis
+) -> None:
+    """Bug #19: a caller cancelled while its (batched) send is still pending sets the cancel
+    flag, so a message that still goes out is acked as cancelled instead of run."""
+    llmq = await make_queue("send")
+    state = llmq._state
+    assert state is not None
+    sending = asyncio.Event()
+
+    async def hang(message: Any) -> None:
+        sending.set()
+        await asyncio.sleep(30)
+
+    state.brokers.by_alias["big"].kick = hang  # type: ignore[method-assign]
+    call = asyncio.create_task(llmq.converse("big", HELLO, request_id="cancel-in-send"))
+    await asyncio.wait_for(sending.wait(), 5)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert await redis.exists(llmq.keys.cancel("cancel-in-send"))
+
+
+async def test_deterministic_send_error_raises_without_failover(make_queue: MakeQueue) -> None:
+    """Bug #20: a send rejected for a deterministic reason (bad label) raises to the caller
+    and does not move the model to `direct` for the failover window."""
+    llmq = await make_queue()
+    state = llmq._state
+    assert state is not None
+
+    async def rejected(message: Any) -> None:
+        raise InvalidLabelError("delay must be 0..900 seconds")
+
+    state.brokers.by_alias["big"].kick = rejected  # type: ignore[method-assign]
+    with pytest.raises(InvalidLabelError):
+        await llmq.converse("big", HELLO)
+    assert llmq.failover.path_override("big") is None

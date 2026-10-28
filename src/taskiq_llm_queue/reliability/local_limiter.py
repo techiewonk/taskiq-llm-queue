@@ -71,25 +71,40 @@ class LocalLimiter:
         return Lease(model, target, token, self._clock() + self._lease_ttl)
 
     async def acquire(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], Awaitable[bool]] | None = None,
     ) -> Lease | None:
-        """Take a slot, polling until one frees up or `timeout_secs` passes (then None)."""
+        """Take a slot, polling until one frees up or `timeout_secs` passes (then None).
+
+        `should_abort` is checked before every sleep; True gives up with None.
+        """
         deadline = self._clock() + max(0.0, timeout_secs)
         while (lease := self.try_acquire(model, target, lane)) is None:
             remaining = deadline - self._clock()
-            if remaining <= 0:
+            if remaining <= 0 or (should_abort is not None and await should_abort()):
                 return None
             await self._sleep(min(self._poll, remaining))
         return lease
 
     def acquire_sync(
-        self, model: str, target: str, lane: Lane, timeout_secs: float
+        self,
+        model: str,
+        target: str,
+        lane: Lane,
+        timeout_secs: float,
+        *,
+        should_abort: Callable[[], bool] | None = None,
     ) -> Lease | None:
         """Blocking `acquire` for sync callers."""
         deadline = self._clock() + max(0.0, timeout_secs)
         while (lease := self.try_acquire(model, target, lane)) is None:
             remaining = deadline - self._clock()
-            if remaining <= 0:
+            if remaining <= 0 or (should_abort is not None and should_abort()):
                 return None
             self._sync_sleep(min(self._poll, remaining))
         return lease

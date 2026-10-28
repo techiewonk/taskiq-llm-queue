@@ -1,8 +1,8 @@
 """Circuit breaker per (model, target) in Valkey.
 
-Opens after `threshold` throttles/5xx within `window_secs`, lets one probe through every
-`cooldown_secs` while half-open, and closes on the probe's success. While open, the worker goes
-to the next fallback step instead of calling the target.
+Opens after `threshold` counted failures within `window_secs` (callers decide what counts, e.g.
+5xx but not throttles, which the limiter handles); half-open lets `half_open_probes` calls through
+and closes on a probe's success. While open, the worker goes to the next fallback step.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 class BreakerState(StrEnum):
-    """Breaker position: closed (normal), open (skip target), half-open (one probe)."""
+    """Breaker position: closed (normal), open (skip target), half-open (probing)."""
 
     CLOSED = "closed"
     OPEN = "open"
@@ -28,11 +28,20 @@ class BreakerState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class BreakerSettings:
-    """Breaker thresholds; defaults (5 failures in 30 s, half-open after 15 s)."""
+    """Breaker thresholds; defaults (5 failures in 30 s, half-open after 15 s, one probe).
+
+    `half_open_probes` probes may run at once; a probe that never reports frees after cooldown.
+    """
 
     threshold: int = 5
     window_secs: float = 30.0
     cooldown_secs: float = 15.0
+    half_open_probes: int = 1
+
+    def __post_init__(self) -> None:
+        """Reject impossible settings at construction (boot time)."""
+        if self.threshold < 1 or self.half_open_probes < 1:
+            raise ValueError("threshold and half_open_probes must be >= 1")
 
 
 class CircuitBreaker:
@@ -52,7 +61,8 @@ class CircuitBreaker:
     async def _run(self, op: str, model: str, target: str) -> tuple[BreakerState, bool]:
         s = self.settings
         state, allowed = await self._script(
-            [self._keys.breaker(model, target)], [op, s.threshold, s.window_secs, s.cooldown_secs]
+            [self._keys.breaker(model, target)],
+            [op, s.threshold, s.window_secs, s.cooldown_secs, s.half_open_probes],
         )
         return BreakerState(_lua.as_text(state)), bool(int(allowed))
 
@@ -61,8 +71,15 @@ class CircuitBreaker:
         return (await self._run("allow", model, target))[1]
 
     async def record(self, model: str, target: str, *, ok: bool) -> BreakerState:
-        """Feed one outcome: a throttle/5xx counts as failure, a success closes a half-open one."""
+        """Feed one outcome: `ok=False` counts a failure, a success closes a half-open breaker.
+
+        Call it only for outcomes that count; use `record_neutral` for the rest (e.g. throttles).
+        """
         return (await self._run("success" if ok else "failure", model, target))[0]
+
+    async def record_neutral(self, model: str, target: str) -> BreakerState:
+        """Report an attempt that counts neither way; frees its half-open probe slot, if any."""
+        return (await self._run("neutral", model, target))[0]
 
     async def state(self, model: str, target: str) -> BreakerState:
         """Current position without taking the probe slot."""

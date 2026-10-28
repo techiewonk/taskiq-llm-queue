@@ -1,8 +1,9 @@
 """Execution of one LLM call: claim, limiter, breaker, provider, retry, fallback, result.
 
 `execute_job` is what a worker runs for every received envelope and what the `direct` path runs
-in-process (without the claim and the stored result). Errors never raise out of it: they come
-back as `LLMReply(ok=False, error=...)`, so taskiq never logs them as task failures (§8, §9.2).
+in-process (without the claim and the stored result). Provider errors come back as
+`LLMReply(ok=False, error=...)` (§8, §9.2); a Valkey failure raises `InfraError` so the caller
+releases the message instead of acking it, and a failed result write raises `QueueUnavailable`.
 """
 
 from __future__ import annotations
@@ -10,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import orjson
 import structlog
+from redis.exceptions import RedisError
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
@@ -42,7 +45,76 @@ logger = structlog.get_logger(__name__)
 RT_ACQUIRE_SECS = 2.0
 # Caps one backoff sleep; the deadline caps the total (DS10).
 MAX_BACKOFF_SECS = 20.0
+# DS4/DS10: a queued bg/bulk call waits this long per step for a slot, then the message is
+# released with a delay instead of holding a worker slot until its deadline.
+QUEUED_ACQUIRE_SECS = 15.0
+# Longest a result write is retried before the message is released (DS8).
+STORE_RETRY_SECS = 30.0
 _RESULT_RETRY_SECS = 0.5
+# Pause between passes when every fallback step is skipped by an open breaker.
+_IDLE_RETRY_SECS = 1.0
+_MIN_REQUEUE_SECS = 10
+_MAX_REQUEUE_SECS = 900
+_CACHE_ENTRIES = 1024
+
+
+class InfraError(QueueUnavailable):
+    """Valkey failed while running a call; the message must be released, never acked.
+
+    `attempted` is True when a provider attempt had already started, so a caller must not
+    simply run the call again elsewhere (the cause is the `RedisError`).
+    """
+
+    def __init__(self, request_id: str, *, attempted: bool) -> None:
+        """Keep the request id and whether a provider attempt had started."""
+        super().__init__(f"Valkey failed while running {request_id}")
+        self.request_id = request_id
+        self.attempted = attempted
+
+
+class _Requeue(Exception):
+    """Internal: no capacity for a queued bg/bulk call; release the message with a delay."""
+
+    def __init__(self, secs: int) -> None:
+        super().__init__(secs)
+        self.secs = secs
+
+
+@dataclass(slots=True)
+class _Progress:
+    """Provider attempts started so far for one call (tells `InfraError` what happened)."""
+
+    attempts: int = 0
+
+
+class ReplyCache:
+    """Bounded per-pod cache of replies whose result write failed (DS8 "cached response").
+
+    A redelivery of the same request to this pod stores the cached reply instead of calling
+    the provider again. Other pods cannot see it, so a redelivery there calls once more.
+    """
+
+    def __init__(self, max_entries: int = _CACHE_ENTRIES) -> None:
+        """Hold at most `max_entries` replies."""
+        self._max = max_entries
+        self._items: OrderedDict[str, tuple[float, LLMReply]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def put(self, reply: LLMReply, *, expires_at: float) -> None:
+        """Keep `reply` until `expires_at` (the call's deadline); evicts the oldest when full."""
+        self._items[reply.request_id] = (expires_at, reply)
+        self._items.move_to_end(reply.request_id)
+        while len(self._items) > self._max:
+            self._items.popitem(last=False)
+
+    def pop(self, request_id: str, now: float) -> LLMReply | None:
+        """Take the cached reply for `request_id` if it has not expired."""
+        item = self._items.pop(request_id, None)
+        if item is None or item[0] <= now:
+            return None
+        return item[1]
 
 
 class _Stopped(Exception):
@@ -60,7 +132,7 @@ class CoreDeps:
     `providers(alias)` returns the provider for a model alias; `fallback()` returns the live
     fallback config without I/O. `claims`, `breaker`, `results` and `redis` may be None on the
     `direct` path or while Valkey is down. `leases` holds this pod's in-flight leases for the
-    heartbeat to renew (DS11).
+    pod heartbeat to renew (DS11); every path on a pod shares one set.
     """
 
     config: QueueConfig
@@ -78,6 +150,9 @@ class CoreDeps:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     rng: random.Random = field(default_factory=random.Random)
     leases: set[Lease] = field(default_factory=set)
+    acquire_wait_secs: float = QUEUED_ACQUIRE_SECS
+    store_retry_secs: float = STORE_RETRY_SECS
+    reply_cache: ReplyCache = field(default_factory=ReplyCache)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +160,13 @@ class JobResult:
     """Outcome of `execute_job`: the claim decision and the reply (None unless it ran).
 
     `decision` other than RUN means the worker must not call the provider: DEFER releases the
-    message with the heartbeat window, the ACK_* decisions ack it.
+    message with the heartbeat window, the ACK_* decisions ack it. `requeue_secs` set means no
+    capacity: release the message with that delay (DS4); the claim was already released.
     """
 
     decision: ClaimDecision
     reply: LLMReply | None = None
+    requeue_secs: int | None = None
 
 
 def error_reply(
@@ -153,39 +230,69 @@ async def load_params(envelope: Envelope, deps: CoreDeps) -> dict[str, Any] | No
 
 
 async def execute_job(
-    envelope: Envelope, deps: CoreDeps, *, claim: bool = True, store: bool = True
+    envelope: Envelope,
+    deps: CoreDeps,
+    *,
+    claim: bool = True,
+    store: bool = True,
+    on_run: Callable[[], None] | None = None,
 ) -> JobResult:
     """Run one envelope end to end (§6.1, §8): claim → call with retry/fallback → result.
 
-    With `claim`, the Lua claim decides first (DS1-DS3) and the record is completed after the
-    result is stored (DS8: result → `done` → ack by taskiq). With `store`, the reply is written
-    to the result store and the sender's pod is woken. A `CancelledError` (drain, lost message)
-    propagates with nothing written; the caller releases the claim and the message.
+    With `claim`, the Lua claim decides first (DS1-DS3) and the record is completed (best
+    effort) after the result is stored (DS8). `on_run` is called once the claim says RUN. A
+    Valkey failure raises `InfraError`; a `CancelledError` propagates with nothing written.
     """
     claims = deps.claims if claim else None
     if claims is not None:
-        decision = await claims.claim(
-            envelope.request_id, deadline_at=envelope.deadline_at, worker=deps.worker
-        )
+        try:
+            decision = await claims.claim(
+                envelope.request_id, deadline_at=envelope.deadline_at, worker=deps.worker
+            )
+        except RedisError as exc:
+            raise InfraError(envelope.request_id, attempted=False) from exc
         if decision is not ClaimDecision.RUN:
             if decision is ClaimDecision.ACK_CANCELLED and store:
                 reply = error_reply(envelope, "cancelled", "cancelled", retryable=False)
                 await _store(reply.model_copy(update={"cancelled": True}), envelope, deps)
             return JobResult(decision)
+    if on_run is not None:
+        on_run()
     state = ClaimState.DONE
+    progress = _Progress()
+    cached = deps.reply_cache.pop(envelope.request_id, deps.clock()) if store else None
     try:
-        params = await load_params(envelope, deps)
-        if params is None:
+        if cached is not None:  # DS8: an earlier delivery ran it but could not store the reply
+            logger.info("cached_reply_reused", request_id=envelope.request_id)
+            reply = cached
+        elif (params := await load_params(envelope, deps)) is None:
             reply = error_reply(envelope, "params_missing", "params_ref not found", retryable=False)
         else:
-            reply = await run_call(envelope, params, deps, check_cancel=claims is not None)
+            reply = await run_call(
+                envelope,
+                params,
+                deps,
+                check_cancel=claims is not None,
+                requeue=claims is not None and store,
+                progress=progress,
+            )
     except _Stopped as stop:
         state = stop.state
         cancelled = stop.state is ClaimState.CANCELLED
         code = "cancelled" if cancelled else "deadline_exceeded"
         reply = error_reply(envelope, code, code, retryable=False, cancelled=cancelled)
+    except _Requeue as requeue:
+        if claims is not None:
+            await _quietly(
+                claims.release(envelope.request_id, worker=deps.worker),
+                "claim_release_failed",
+                envelope,
+            )
+        return JobResult(ClaimDecision.RUN, requeue_secs=requeue.secs)
     except asyncio.CancelledError:
         raise
+    except RedisError as exc:  # infrastructure, not the call: release for redelivery
+        raise InfraError(envelope.request_id, attempted=progress.attempts > 0) from exc
     except Exception as exc:  # a bug must still release the waiter with a value
         logger.exception(
             "call_failed_unexpectedly",
@@ -195,25 +302,45 @@ async def execute_job(
         )
         reply = error_reply(envelope, "internal_error", type(exc).__name__, retryable=False)
     if store:
-        await _store(reply, envelope, deps)
-    if claims is not None:
-        await claims.complete(envelope.request_id, state)
+        try:
+            await _store(reply, envelope, deps)
+        except QueueUnavailable:
+            deps.reply_cache.put(reply, expires_at=envelope.deadline_at)
+            raise
+    if claims is not None:  # the reply is out; a failed CAS only lets a duplicate re-ack
+        await _quietly(
+            claims.complete(envelope.request_id, state, worker=deps.worker),
+            "claim_complete_failed",
+            envelope,
+        )
     if store and deps.redis is not None:
         await _after_store(envelope, deps)
     return JobResult(ClaimDecision.RUN, reply)
 
 
+async def _quietly(call: Awaitable[Any], event: str, envelope: Envelope) -> None:
+    """Await a best-effort claim update; a Valkey error is logged, never raised."""
+    try:
+        await call
+    except Exception as exc:
+        logger.warning(event, request_id=envelope.request_id, error_type=type(exc).__name__)
+
+
 async def _store(reply: LLMReply, envelope: Envelope, deps: CoreDeps) -> None:
-    """Write the reply, retrying until the deadline (DS8); then `QueueUnavailable`."""
+    """Write the reply, retrying until the deadline or `store_retry_secs` (DS8).
+
+    Then raises `QueueUnavailable`; `execute_job` keeps the reply in the pod's `ReplyCache`.
+    """
     if deps.results is None:
         return
     ttl = deps.config.result_ttl_secs
+    give_up_at = min(envelope.deadline_at, deps.clock() + deps.store_retry_secs)
     while True:
         try:
             await deps.results.put(reply, ttl_secs=ttl)
             return
         except Exception as exc:
-            if deps.clock() + _RESULT_RETRY_SECS >= envelope.deadline_at:
+            if deps.clock() + _RESULT_RETRY_SECS >= give_up_at:
                 raise QueueUnavailable(f"cannot store result {envelope.request_id}") from exc
             logger.warning(
                 "result_write_failed",
@@ -281,17 +408,76 @@ def _classify(provider: Provider, exc: BaseException) -> ErrorInfo:
         return ErrorInfo(ErrorKind.RETRYABLE, type(exc).__name__)
 
 
+def _acquire_wait(envelope: Envelope, deps: CoreDeps, *, bounded: bool) -> float:
+    """Slot wait for one attempt: rt 2 s (DS13); queued bg/bulk bounded (DS4); else the deadline."""
+    remaining = envelope.deadline_at - deps.clock()
+    if envelope.lane is Lane.RT:
+        return min(RT_ACQUIRE_SECS, remaining)
+    if bounded and remaining > 2 * deps.acquire_wait_secs:
+        return deps.acquire_wait_secs
+    return remaining
+
+
+def _requeue_secs(envelope: Envelope, deps: CoreDeps) -> int | None:
+    """Delay before a queued bg/bulk call with no capacity is redelivered; None near deadline.
+
+    A quarter of the remaining time (10-900 s) keeps receives per message low (DS5).
+    """
+    remaining = envelope.deadline_at - deps.clock()
+    if envelope.lane is Lane.RT or remaining <= 2 * deps.acquire_wait_secs:
+        return None
+    return int(min(_MAX_REQUEUE_SECS, max(_MIN_REQUEUE_SECS, remaining / 4)))
+
+
+async def _take_slot(
+    envelope: Envelope, step: FallbackStep, deps: CoreDeps, *, check_cancel: bool, bounded: bool
+) -> Lease | None:
+    """Acquire one slot; cancel and deadline are checked before and right after (DS14)."""
+    await _check_live(envelope, deps, check_cancel)
+    wait = _acquire_wait(envelope, deps, bounded=bounded)
+    abort = _cancel_probe(envelope, deps) if check_cancel else None
+    lease = await deps.limiter.acquire(
+        step.alias, step.target, envelope.lane, wait, should_abort=abort
+    )
+    if lease is None:
+        return None
+    try:
+        await _check_live(envelope, deps, check_cancel)
+    except BaseException:
+        await _release(deps, lease, throttled=False)
+        raise
+    return lease
+
+
+def _cancel_probe(envelope: Envelope, deps: CoreDeps) -> Callable[[], Awaitable[bool]] | None:
+    """`should_abort` for a slot wait: the cancel flag (DS14); a Valkey blip reads as no."""
+    claims = deps.claims
+    if claims is None:
+        return None
+
+    async def cancelled() -> bool:
+        try:
+            return await claims.is_cancelled(envelope.request_id)
+        except RedisError:
+            return False
+
+    return cancelled
+
+
 async def run_call(
     envelope: Envelope,
     params: Mapping[str, Any],
     deps: CoreDeps,
     *,
     check_cancel: bool = False,
+    requeue: bool = False,
+    progress: _Progress | None = None,
 ) -> LLMReply:
     """Walk the fallback steps; each step gets `retry_attempts` attempts with backoff (§8).
 
     A limiter slot covers one attempt and is released in `finally` before any sleep (DS10).
-    Fatal errors stop at once; exhausted steps give a retryable error reply. Raises `_Stopped`.
+    When no step could run: `requeue` raises `_Requeue` (bg/bulk), an all-open breaker waits
+    and tries again within the deadline. Raises `_Stopped`; a Valkey error propagates.
     """
     config = deps.config
     steps = resolve_fallback(
@@ -300,97 +486,113 @@ async def run_call(
     started = deps.clock()
     queue_wait_ms = max(0, round((started - envelope.enqueued_at) * 1000))
     safe_hook(deps.hooks.on_queue_wait_ms, envelope.model, envelope.lane.value, queue_wait_ms)
-    attempts = 0
+    progress = progress or _Progress()
     last = ErrorInfo(ErrorKind.RETRYABLE, "no_capacity")
     last_message = "no fallback step had capacity"
-    for index, step in enumerate(steps):
-        if not await _step_usable(step, envelope.lane, deps):
-            last, last_message = ErrorInfo(ErrorKind.RETRYABLE, "circuit_open"), "circuit open"
-            continue
-        _, model_cfg, _ = config.resolve(f"{step.alias}@{step.target}")
-        target = model_cfg.targets[step.target]
-        provider = deps.providers(step.alias)
-        call_params = params_for_step(envelope.op, params, model_cfg.model_id)
-        for attempt in range(config.retry_attempts):
-            await _check_live(envelope, deps, check_cancel)
-            remaining = envelope.deadline_at - deps.clock()
-            wait = min(RT_ACQUIRE_SECS, remaining) if envelope.lane is Lane.RT else remaining
-            lease = await deps.limiter.acquire(step.alias, step.target, envelope.lane, wait)
-            if lease is None:
-                last, last_message = ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"), "no capacity"
-                break  # DS13: next step
-            attempts += 1
-            deps.leases.add(lease)
-            info: ErrorInfo | None = None
-            t0 = time.monotonic()
-            try:
-                timeout = max(0.1, envelope.deadline_at - deps.clock())
-                response = await asyncio.wait_for(
-                    provider.call(envelope.op, call_params, target), timeout
+    while True:
+        attempts_before = progress.attempts
+        circuit_only = True
+        for index, step in enumerate(steps):
+            if not await _step_usable(step, envelope.lane, deps):
+                last, last_message = ErrorInfo(ErrorKind.RETRYABLE, "circuit_open"), "circuit open"
+                continue
+            circuit_only = False
+            _, model_cfg, _ = config.resolve(f"{step.alias}@{step.target}")
+            target = model_cfg.targets[step.target]
+            provider = deps.providers(step.alias)
+            call_params = params_for_step(envelope.op, params, model_cfg.model_id)
+            for attempt in range(config.retry_attempts):
+                lease = await _take_slot(
+                    envelope, step, deps, check_cancel=check_cancel, bounded=requeue
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                info = _classify(provider, exc)
-                last, last_message = info, f"{type(exc).__name__}: {info.code or info.kind}"
-            finally:
-                deps.leases.discard(lease)
-                await _release(
-                    deps, lease, throttled=info is not None and info.kind is ErrorKind.THROTTLE
-                )
-            secs = time.monotonic() - t0
-            key = f"{step.alias}@{step.target}"
-            safe_hook(
-                deps.hooks.on_attempt, step.alias, step.target, info.kind if info else "ok", secs
-            )
-            if info is None:
-                await _record(deps, step, ok=True)
-                if index:
-                    safe_hook(deps.hooks.on_fallback, envelope.model, key)
-                meta = CallMeta(
-                    served_model=step.alias,
-                    served_target=step.target,
-                    fallback_used=index > 0,
-                    queue_wait_ms=queue_wait_ms,
-                    provider_ms=round(secs * 1000),
-                    attempts=attempts,
-                    worker=deps.worker,
-                )
-                return LLMReply(
-                    request_id=envelope.request_id, ok=True, response=response, meta=meta
-                )
-            if info.kind is ErrorKind.FATAL:
-                return error_reply(
-                    envelope,
-                    info.code or "fatal",
-                    last_message,
-                    retryable=False,
-                    kind=info.kind.value,
-                    meta=CallMeta(
+                if lease is None:
+                    last, last_message = (
+                        ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"),
+                        "no capacity",
+                    )
+                    break  # DS13: next step
+                progress.attempts += 1
+                deps.leases.add(lease)
+                info: ErrorInfo | None = None
+                t0 = time.monotonic()
+                try:
+                    timeout = max(0.1, envelope.deadline_at - deps.clock())
+                    response = await asyncio.wait_for(
+                        provider.call(envelope.op, call_params, target), timeout
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    info = _classify(provider, exc)
+                    last, last_message = info, f"{type(exc).__name__}: {info.code or info.kind}"
+                finally:
+                    deps.leases.discard(lease)
+                    await _release(
+                        deps, lease, throttled=info is not None and info.kind is ErrorKind.THROTTLE
+                    )
+                secs = time.monotonic() - t0
+                kind = info.kind if info else "ok"
+                safe_hook(deps.hooks.on_attempt, step.alias, step.target, kind, secs)
+                if info is None:
+                    await _record(deps, step, ok=True)
+                    if index:
+                        safe_hook(
+                            deps.hooks.on_fallback, envelope.model, f"{step.alias}@{step.target}"
+                        )
+                    meta = CallMeta(
                         served_model=step.alias,
                         served_target=step.target,
-                        attempts=attempts,
+                        fallback_used=index > 0,
+                        queue_wait_ms=queue_wait_ms,
+                        provider_ms=round(secs * 1000),
+                        attempts=progress.attempts,
                         worker=deps.worker,
-                    ),
-                )
-            await _record(deps, step, ok=False)
-            if attempt + 1 < config.retry_attempts:
-                delay = backoff_secs(
-                    attempt, config.retry_base_secs, deps.rng, info.retry_after_secs
-                )
-                if deps.clock() + delay >= envelope.deadline_at:
-                    break
+                    )
+                    return LLMReply(
+                        request_id=envelope.request_id, ok=True, response=response, meta=meta
+                    )
+                if info.kind is ErrorKind.FATAL:
+                    return error_reply(
+                        envelope,
+                        info.code or "fatal",
+                        last_message,
+                        retryable=False,
+                        kind=info.kind.value,
+                        meta=CallMeta(
+                            served_model=step.alias,
+                            served_target=step.target,
+                            attempts=progress.attempts,
+                            worker=deps.worker,
+                        ),
+                    )
+                if info.kind is ErrorKind.RETRYABLE:
+                    await _record(deps, step, ok=False)
+                else:  # a throttle belongs to the limiter: frees a half-open probe, no count
+                    await _record(deps, step, ok=None)
+                if attempt + 1 < config.retry_attempts:
+                    delay = backoff_secs(
+                        attempt, config.retry_base_secs, deps.rng, info.retry_after_secs
+                    )
+                    if deps.clock() + delay >= envelope.deadline_at:
+                        break
+                    await _check_live(envelope, deps, check_cancel)
+                    await deps.sleep(delay)
+        if progress.attempts == attempts_before:  # no step could run in this pass
+            if requeue and (secs_to_requeue := _requeue_secs(envelope, deps)) is not None:
+                raise _Requeue(secs_to_requeue)
+            if circuit_only and deps.clock() + _IDLE_RETRY_SECS < envelope.deadline_at:
                 await _check_live(envelope, deps, check_cancel)
-                await deps.sleep(delay)
-    return error_reply(
-        envelope,
-        last.code or last.kind.value,
-        last_message,
-        retryable=True,
-        kind=last.kind.value,
-        retry_after_secs=last.retry_after_secs,
-        meta=CallMeta(attempts=attempts, worker=deps.worker),
-    )
+                await deps.sleep(_IDLE_RETRY_SECS)
+                continue
+        return error_reply(
+            envelope,
+            last.code or last.kind.value,
+            last_message,
+            retryable=True,
+            kind=last.kind.value,
+            retry_after_secs=last.retry_after_secs,
+            meta=CallMeta(attempts=progress.attempts, worker=deps.worker),
+        )
 
 
 async def _release(deps: CoreDeps, lease: Lease, *, throttled: bool) -> None:
@@ -406,12 +608,18 @@ async def _release(deps: CoreDeps, lease: Lease, *, throttled: bool) -> None:
         )
 
 
-async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool) -> None:
-    """Feed one outcome into the breaker (best effort)."""
+async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool | None) -> None:
+    """Feed one outcome into the breaker (best effort); `ok=None` is a neutral throttle.
+
+    Only 5xx/timeouts count as failures: throttles are the limiter's job (AIMD, pause).
+    """
     if deps.breaker is None:
         return
     try:
-        await deps.breaker.record(step.alias, step.target, ok=ok)
+        if ok is None:
+            await deps.breaker.record_neutral(step.alias, step.target)
+        else:
+            await deps.breaker.record(step.alias, step.target, ok=ok)
     except Exception as exc:
         logger.warning(
             "breaker_record_failed",

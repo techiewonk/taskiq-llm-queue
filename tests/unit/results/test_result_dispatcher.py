@@ -256,3 +256,43 @@ async def test_pubsub_wakeup_beats_poll_interval() -> None:
     finally:
         await dispatcher.stop()
         await redis.aclose()
+
+
+async def test_resolved_reply_is_not_retained_until_deadline(
+    store_dispatcher: tuple[DictStore, ResultDispatcher], clock: ManualClock
+) -> None:
+    """Finding 10: the deadline heap kept each resolved waiter (and its reply) until timeout."""
+    import gc
+    import weakref
+
+    store, dispatcher = store_dispatcher
+    wait = asyncio.create_task(dispatcher.wait("big", 1e6, Lane.RT))
+    await settle()
+    store.data["big"] = reply("big", "x" * 100_000)
+    await clock.advance(0.1)
+    got = await wait
+    ref = weakref.ref(got)
+    del got, wait
+    gc.collect()
+    assert ref() is None
+
+
+async def test_deadline_heap_is_compacted_under_fast_traffic(
+    store_dispatcher: tuple[DictStore, ResultDispatcher], clock: ManualClock
+) -> None:
+    """Finding 10: stale heap entries for resolved waiters grew as rps x timeout."""
+    store, dispatcher = store_dispatcher
+    keeper = asyncio.create_task(dispatcher.wait("keeper", 1e6, Lane.RT))
+    await settle()
+    for i in range(150):
+        task_id = f"fast{i}"
+        wait = asyncio.create_task(dispatcher.wait(task_id, 1e6, Lane.RT))
+        await asyncio.sleep(0)
+        store.data[task_id] = reply(task_id)
+        await clock.advance(0.1)
+        assert (await wait).request_id == task_id
+    assert dispatcher.pending == 1
+    assert len(dispatcher._deadlines) <= 64  # compacted, not 151
+    store.data["keeper"] = reply("keeper")
+    await clock.advance(0.1)
+    assert (await keeper).request_id == "keeper"

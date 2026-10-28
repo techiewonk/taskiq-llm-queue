@@ -36,6 +36,7 @@ class FailoverSettings:
 
     `live_pods` < 1 means unknown: the local cap is then `local_cap_fallback`, never
     `last_known_limit` per pod, so an unknown pod count cannot overshoot the provider limit.
+    A running `LLMQueue` replaces it with the pod-registry count (`FailoverState.set_live_pods`).
     """
 
     sqs_failover_secs: float = 300.0
@@ -108,6 +109,10 @@ class FailoverState:
         self._probe_task: asyncio.Task[None] | None = None
         self._limits: dict[tuple[str, str], int] = {}
         self._local: dict[tuple[str, str], LocalLimiter] = {}
+        # Local limiters with calls still in flight when Valkey came back; reused if it fails
+        # again before they finish, so a flap never starts a fresh cap on top of busy slots.
+        self._busy: dict[tuple[str, str], LocalLimiter] = {}
+        self._live_pods: int | None = None
 
     # ------------------------------------------------------------------ SQS
 
@@ -166,12 +171,17 @@ class FailoverState:
         self._start_probe()
 
     def report_redis_ok(self) -> None:
-        """Leave Valkey-down mode (a probe or a real call succeeded); drops local limiters."""
+        """Leave Valkey-down mode (a probe or a real call succeeded).
+
+        Idle local limiters are dropped (rebuilt per outage); busy ones are kept aside so the
+        in-flight calls stay counted if Valkey fails again before they finish.
+        """
         with self._lock:
             if not self._redis_down:
                 return
             self._redis_down = False
             self._redis_backoff = self.settings.redis_retry_min_secs
+            self._busy = {k: lim for k, lim in self._local.items() if lim.inflight(*k) > 0}
             self._local.clear()
         logger.warning("valkey_local_mode_ended")
         self._gauge(0.0, {"kind": "redis"})
@@ -223,21 +233,38 @@ class FailoverState:
             with self._lock:
                 self._limits[(model, target)] = limit
 
+    def set_live_pods(self, count: int) -> None:
+        """Live pod count from the pod registry; feeds the next local cap (DS18)."""
+        if count >= 1:
+            with self._lock:
+                self._live_pods = count
+
+    @property
+    def live_pods(self) -> int:
+        """Pods sharing the provider limit: the registry count, else `settings.live_pods`."""
+        with self._lock:
+            live = self._live_pods
+        return self.settings.live_pods if live is None else live
+
     def local_cap(self, model: str, target: str) -> int:
         """Per-pod cap while Valkey is down: last known limit / live pods, else the fallback."""
         with self._lock:
             last = self._limits.get((model, target))
-        s = self.settings
-        return local_cap(last, s.live_pods, s.local_cap_fallback)
+        return local_cap(last, self.live_pods, self.settings.local_cap_fallback)
 
     def local_limiter(self, model: str, target: str) -> LocalLimiter:
         """The pod's `LocalLimiter` for a model target, built once per Valkey outage."""
+        key = (model, target)
         with self._lock:
-            limiter = self._local.get((model, target))
+            limiter = self._local.get(key)
+            if limiter is None and self._redis_down:
+                busy = self._busy.pop(key, None)
+                if busy is not None and busy.inflight(model, target) > 0:
+                    limiter = self._local[key] = busy
         if limiter is None:
             limiter = LocalLimiter(self.local_cap(model, target), sleep=self._sleep)
             with self._lock:
-                limiter = self._local.setdefault((model, target), limiter)
+                limiter = self._local.setdefault(key, limiter)
         return limiter
 
     async def aclose(self) -> None:

@@ -15,10 +15,11 @@ pytestmark = pytest.mark.integration
 M, T = "m", "primary"
 
 
-def make(valkey: redis.asyncio.Redis, keys: KeySpace) -> CircuitBreaker:
-    return CircuitBreaker(
-        valkey, keys, BreakerSettings(threshold=3, window_secs=0.5, cooldown_secs=0.3)
+def make(valkey: redis.asyncio.Redis, keys: KeySpace, probes: int = 1) -> CircuitBreaker:
+    settings = BreakerSettings(
+        threshold=3, window_secs=0.5, cooldown_secs=0.3, half_open_probes=probes
     )
+    return CircuitBreaker(valkey, keys, settings)
 
 
 async def fail(cb: CircuitBreaker, n: int) -> BreakerState:
@@ -69,3 +70,40 @@ async def test_targets_are_independent(valkey: redis.asyncio.Redis, keys: KeySpa
     cb = make(valkey, keys)
     await fail(cb, 3)
     assert await cb.allow(M, "apac")
+
+
+async def test_half_open_allows_configured_probes(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Breaker review: half-open let only one probe per cooldown cluster-wide; now configurable."""
+    cb = make(valkey, keys, probes=3)
+    await fail(cb, 3)
+    await asyncio.sleep(0.35)
+    assert [await cb.allow(M, T) for _ in range(4)] == [True, True, True, False]
+    assert await cb.record(M, T, ok=True) is BreakerState.CLOSED
+
+
+async def test_neutral_outcome_frees_probe_without_counting(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Breaker review: an uncounted outcome (e.g. a throttle) held the probe slot until cooldown."""
+    cb = make(valkey, keys)
+    assert await cb.record_neutral(M, T) is BreakerState.CLOSED
+    await fail(cb, 3)
+    assert await cb.record_neutral(M, T) is BreakerState.OPEN
+    await asyncio.sleep(0.35)
+    assert await cb.allow(M, T)
+    assert not await cb.allow(M, T)
+    assert await cb.record_neutral(M, T) is BreakerState.HALF_OPEN
+    assert await cb.allow(M, T), "the probe slot came back"
+
+
+async def test_lost_probe_frees_after_cooldown(valkey: redis.asyncio.Redis, keys: KeySpace) -> None:
+    cb = make(valkey, keys, probes=2)
+    await fail(cb, 3)
+    await asyncio.sleep(0.35)
+    assert await cb.allow(M, T)
+    assert await cb.allow(M, T)
+    assert not await cb.allow(M, T)
+    await asyncio.sleep(0.35)
+    assert await cb.allow(M, T), "probes that never reported free after cooldown"

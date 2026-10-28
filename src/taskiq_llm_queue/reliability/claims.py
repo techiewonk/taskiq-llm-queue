@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
+
+import structlog
 
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
@@ -20,20 +23,45 @@ if TYPE_CHECKING:
 
     from taskiq_llm_queue.config import QueueConfig
 
+logger = structlog.get_logger(__name__)
+
 _TERMINAL = frozenset({ClaimState.DONE, ClaimState.CANCELLED, ClaimState.EXPIRED})
+
+
+class ClaimOutcome(StrEnum):
+    """Result of an owner-checked `complete_owned` / `release_owned` call.
+
+    `NOT_OWNER` means another worker holds the claim now, so nothing was written.
+    """
+
+    APPLIED = "applied"
+    NOT_RUNNING = "not_running"  # release only: the record was not running
+    NOT_OWNER = "not_owner"
 
 
 @dataclass(frozen=True, slots=True)
 class ClaimSettings:
     """Claim timing: TTLs, worst-case execution and heartbeat staleness (DS3, DS5).
 
-    A heartbeat older than `2 x heartbeat_interval_secs` is stale and the task is reclaimed.
+    A heartbeat older than `stale_after_beats x heartbeat_interval_secs` is stale and the task
+    is reclaimed; at least 3 beats, so one missed or late beat never hands a live task over.
     """
 
     state_ttl_secs: int = 1800
     exec_max_secs: int = 300
     heartbeat_interval_secs: float = 10.0
     max_failures: int = 3
+    stale_after_beats: float = 3.0
+
+    def __post_init__(self) -> None:
+        """Reject a staleness window that a single missed heartbeat could exceed."""
+        if self.stale_after_beats < 3:
+            raise ValueError("stale_after_beats must be >= 3 heartbeat intervals")
+
+    @property
+    def stale_after_secs(self) -> float:
+        """Heartbeat age after which a running claim may be taken over."""
+        return self.stale_after_beats * self.heartbeat_interval_secs
 
     @classmethod
     def from_config(cls, config: QueueConfig, **overrides: Any) -> ClaimSettings:
@@ -81,7 +109,7 @@ class RedisClaimStore:
                 worker,
                 s.state_ttl_secs,
                 s.exec_max_secs,
-                2 * s.heartbeat_interval_secs,
+                s.stale_after_secs,
             ],
         )
         return ClaimDecision(_lua.as_text(decision))
@@ -101,17 +129,49 @@ class RedisClaimStore:
         """Refresh heartbeats and TTLs for running tasks."""
         await self.heartbeat_owned(request_ids, worker=worker)
 
-    async def complete(self, request_id: str, state: ClaimState) -> None:
-        """Mark a task done, cancelled or expired after its result is stored (DS8)."""
+    async def complete(
+        self, request_id: str, state: ClaimState, *, worker: str | None = None
+    ) -> None:
+        """Mark a task done, cancelled or expired after its result is stored (DS8).
+
+        With `worker`, only the current owner may complete it (see `complete_owned`).
+        """
+        await self.complete_owned(request_id, state, worker=worker)
+
+    async def complete_owned(
+        self, request_id: str, state: ClaimState, *, worker: str | None
+    ) -> ClaimOutcome:
+        """Owner-checked `complete`: NOT_OWNER when another worker holds the claim now.
+
+        A record without an owner (released, or missing) is written; `worker=None` skips the check.
+        """
         if state not in _TERMINAL:
             raise ValueError(f"complete() needs a terminal state, got {state!r}")
-        await self._complete(
-            [self._keys.job(request_id)], [state.value, self.settings.state_ttl_secs]
+        reply = await self._complete(
+            [self._keys.job(request_id)], [state.value, self.settings.state_ttl_secs, worker or ""]
         )
+        if int(reply) < 0:
+            logger.warning("claim_complete_not_owner", request_id=request_id, worker=worker)
+            return ClaimOutcome.NOT_OWNER
+        return ClaimOutcome.APPLIED
 
-    async def release(self, request_id: str) -> None:
-        """Hand a running task back so another pod can start it at once."""
-        await self._release([self._keys.job(request_id)], [])
+    async def release(self, request_id: str, *, worker: str | None = None) -> None:
+        """Hand a running task back so another pod can start it at once.
+
+        With `worker`, only the current owner may release it (see `release_owned`).
+        """
+        await self.release_owned(request_id, worker=worker)
+
+    async def release_owned(self, request_id: str, *, worker: str | None) -> ClaimOutcome:
+        """Owner-checked `release`: APPLIED, NOT_RUNNING, or NOT_OWNER (nothing written).
+
+        `worker=None` releases any running record (the old, unchecked behaviour).
+        """
+        reply = int(await self._release([self._keys.job(request_id)], [worker or ""]))
+        if reply < 0:
+            logger.warning("claim_release_not_owner", request_id=request_id, worker=worker)
+            return ClaimOutcome.NOT_OWNER
+        return ClaimOutcome.APPLIED if reply else ClaimOutcome.NOT_RUNNING
 
     async def state(self, request_id: str) -> ClaimState | None:
         """Current claim state, or None when there is no record."""
