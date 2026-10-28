@@ -17,7 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from taskiq_llm_queue.errors import ConfigError
 
-ProviderKind = Literal["bedrock", "openai"]
+# Built-in provider names; custom providers (QueueConfig.providers / entry points) add their own.
+BUILTIN_PROVIDERS = frozenset({"bedrock", "openai"})
+ProviderKind = str
 ENV_PREFIX = "LLMQ_"
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
@@ -83,7 +85,7 @@ class QueueConfig(BaseModel):
     bedrock_endpoint_url: str | None = None
     aws_region: str = "us-east-1"
     models: dict[str, ModelConfig] = Field(default_factory=dict)
-    allowed_providers: frozenset[ProviderKind] = frozenset({"bedrock", "openai"})
+    allowed_providers: frozenset[ProviderKind] = BUILTIN_PROVIDERS
     denied_hosts: tuple[str, ...] = ()
     providers: dict[str, str] = Field(default_factory=dict)
     timeout_secs: dict[Lane, float] = Field(
