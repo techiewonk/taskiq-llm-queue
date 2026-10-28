@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Files that run inside Linux containers or shells keep LF on Windows checkouts.
+*.sh text eol=lf
+*.conf text eol=lf
+*.lua text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile* text eol=lf
+Makefile text eol=lf

@@ -1,0 +1,35 @@
+# Environments and secrets (never commit tokens: GitHub, PyPI, AWS)
+.env
+.env.*
+!.env.example
+.pypirc
+*.pem
+*.key
+.venv/
+venv/
+
+# Python build and cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Test and tool output
+.hypothesis/
+.locust/
+*.log
+reports/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

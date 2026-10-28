@@ -1,0 +1,34 @@
+# Local test stack for taskiq-llm-queue (plan D70, D91: Docker only, no .env).
+# Start:  docker compose -f libs/taskiq_llm_queue/docker/compose.yaml up -d --wait
+# Stop:   docker compose -f libs/taskiq_llm_queue/docker/compose.yaml down
+#
+# Core services only for now. fakellm, worker, locust, prometheus and grafana are added as they're built.
+name: llmq-test
+
+x-llmq-env: &llmq-env
+  LLMQ_KEY_PREFIX: llmq:local
+  LLMQ_REDIS_HOST: valkey
+  LLMQ_REDIS_PORT: "6379"
+  LLMQ_REDIS_PASSWORD: localdev
+  LLMQ_REDIS_SSL: "false"
+  LLMQ_SQS_ENDPOINT_URL: http://sqs:9324
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_DEFAULT_REGION: ap-south-1
+
+services:
+  valkey:
+    # Prod runs Valkey 8.x on ElastiCache; password required, TLS off locally (the app's VALKEY_SSL=false).
+    image: valkey/valkey:8.1-alpine
+    command: ["valkey-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "localdev", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  sqs:
+    image: softwaremill/elasticmq-native:1.7.1
+    volumes: ["./elasticmq.conf:/opt/elasticmq.conf:ro"]
+    ports: ["9324:9324", "9325:9325"]

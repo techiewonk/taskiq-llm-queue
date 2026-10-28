@@ -1,0 +1,109 @@
+[project]
+name = "taskiq-llm-queue"
+description = "An LLM request client with its own durable queue: taskiq + Amazon SQS, adaptive limits, retry and fallback."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+license = { text = "MIT" }
+keywords = ["taskiq", "sqs", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+# Ranges, not pins: a library that pins exact versions locks every user into one botocore
+# patch window. Exact versions live only in the consuming app's lockfile.
+dependencies = [
+    # Bounded: the broker builds on taskiq's AsyncBroker / Receiver internals (ack timing,
+    # listen()), which may change between minor versions.
+    "taskiq>=0.13,<0.14",
+    # Async SQS (and Bedrock) client. aiobotocore pins a narrow botocore window per release.
+    "aiobotocore>=2.23",
+    # Limiter, claims, live config and results on Redis/Valkey. >=5 so apps aren't forced
+    # onto redis 8 (taskiq-redis would force it; we ship our own JSON result backend).
+    "redis>=5",
+    "pydantic>=2.5,<3",
+    # Stable hashing for sticky canary routing and hashed ids in task labels.
+    "xxhash>=3",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.40,<2", "httpx>=0.27"]
+langchain-aws = ["langchain-aws>=0.2.24,<0.3", "langchain-core>=0.3.68,<0.4"]
+langchain-openai = ["langchain-openai>=0.3.26,<0.4", "langchain-core>=0.3.68,<0.4"]
+s3 = []  # S3 offload / result backend use aiobotocore (core); kept as a marker extra
+metrics = ["prometheus-client>=0.20"]
+
+[project.urls]
+Documentation = "https://github.com/<org>/taskiq-llm-queue#readme"
+Source = "https://github.com/<org>/taskiq-llm-queue"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-aiobotocore[sqs,s3,bedrock-runtime]",
+    "moto[server]>=5",
+    "fakeredis>=2.26",
+    # extras installed for development and tests of the provider/adapter layers
+    "openai>=1.40,<2",
+    "httpx>=0.27",
+    "langchain-aws>=0.2.24,<0.3",
+    "langchain-openai>=0.3.26,<0.4",
+    "langchain-core>=0.3.68,<0.4",
+    "langgraph>=0.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/taskiq_llm_queue/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/taskiq_llm_queue"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "C4", "D", "E", "F", "I", "PIE", "PT", "RET", "RUF", "SIM", "UP", "W"]
+ignore = ["D105"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["moto.*", "xxhash.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs the Docker stack (docker/compose.yaml)",
+]
