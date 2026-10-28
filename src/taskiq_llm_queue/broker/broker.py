@@ -16,11 +16,11 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
-import structlog
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
 from taskiq import AckableMessage, AsyncBroker, BrokerMessage
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.acker import Acker, VisibilityResult
 from taskiq_llm_queue.broker.batching import MicroBatcher, message_bytes
 from taskiq_llm_queue.broker.delivery import Delivery
@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from types_aiobotocore_sqs.client import SQSClient
     from types_aiobotocore_sqs.type_defs import MessageTypeDef
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 QUEUE_LABEL = "queue_name"
 DELAY_LABEL = "delay"

@@ -18,13 +18,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import orjson
-import structlog
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.connection import Connection, SSLConnection
 from redis.exceptions import RedisError
 from taskiq.exceptions import SendTaskError
 
 from taskiq_llm_queue import metrics_names as mn
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.config import Lane
@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.providers.registry import ProviderFactory
     from taskiq_llm_queue.routing_hooks import FailoverPolicy, PathRouter
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 Mode = Literal["send", "work", "both"]
 # HTTP status the OpenAI transport reports for an error reply, by `ErrorKind` value.

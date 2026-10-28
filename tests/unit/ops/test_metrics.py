@@ -9,7 +9,6 @@ import subprocess
 import sys
 
 import pytest
-import structlog
 
 from taskiq_llm_queue.metrics import EmfMetrics, MetricsSink, NullMetrics, PrometheusMetrics
 from taskiq_llm_queue.metrics_names import CALLS_TOTAL, PROVIDER_SECONDS
@@ -37,15 +36,17 @@ def test_emf_line_is_valid_cloudwatch_json() -> None:
     assert json.loads(lines[2])["_aws"]["CloudWatchMetrics"][0]["Dimensions"] == [["env"]]
 
 
-def test_emf_drops_unknown_labels_with_one_warning() -> None:
+def test_emf_drops_unknown_labels_with_one_warning(caplog: pytest.LogCaptureFixture) -> None:
     """Raw session/user ids must never become dimensions (cardinality, privacy)."""
     out = io.StringIO()
     sink = EmfMetrics(stream=out)
-    with structlog.testing.capture_logs() as logs:
+    with caplog.at_level(logging.WARNING, logger="taskiq_llm_queue.metrics.emf"):
         sink.incr(CALLS_TOTAL, labels={"model": "m", "session_id": "secret"})
         sink.incr(CALLS_TOTAL, labels={"model": "m", "session_id": "secret2"})
     assert "secret" not in out.getvalue()
-    assert logs == [{"event": "emf_label_dropped", "label": "session_id", "log_level": "warning"}]
+    assert [(r.levelname, r.__dict__["llmq"]) for r in caplog.records] == [
+        ("WARNING", {"event": "emf_label_dropped", "label": "session_id"})
+    ]
 
 
 def test_emf_defaults_to_logger(caplog: pytest.LogCaptureFixture) -> None:

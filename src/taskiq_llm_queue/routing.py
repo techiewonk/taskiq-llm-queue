@@ -13,10 +13,10 @@ import random
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Literal
 
-import structlog
 import xxhash
 from pydantic import BaseModel, ConfigDict, Field
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.metrics_names import CONFIG_INVALID_TOTAL
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.keys import KeySpace
     from taskiq_llm_queue.metrics import MetricsSink
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 RoutePath = Literal["sqs", "direct"]
 Pct = Annotated[int, Field(ge=0, le=100)]

@@ -14,11 +14,11 @@ from collections.abc import Callable, Mapping
 from typing import TextIO
 
 import orjson
-import structlog
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.metrics_names import LABELS
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 DEFAULT_NAMESPACE = "LLMQueue"
 _EMF_LOGGER = "taskiq_llm_queue.metrics.emf.lines"
 

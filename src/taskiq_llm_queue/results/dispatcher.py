@@ -17,8 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import structlog
-
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.errors import LLMQueueTimeout, QueueUnavailable
 
@@ -29,7 +28,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.keys import KeySpace
     from taskiq_llm_queue.protocols import ResultStore
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 # Poll interval per lane; the loop polls at the fastest interval among pending waiters.
 DEFAULT_INTERVALS_MS: Mapping[Lane, int] = {Lane.RT: 100, Lane.BG: 500, Lane.BULK: 2000}

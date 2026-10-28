@@ -14,9 +14,9 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
-import structlog
+from taskiq_llm_queue._logging import get_logger
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 R = TypeVar("R")

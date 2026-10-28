@@ -16,10 +16,10 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import structlog
 from redis.exceptions import RedisError
 from taskiq import AsyncResultBackend, Context, TaskiqDepends, TaskiqResult
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import (
     SQS_MESSAGE_ID_LABEL,
     SQS_RECEIPT_HANDLE_LABEL,
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.results.backend import LLMQResultBackend
     from taskiq_llm_queue.routing_hooks import FailoverPolicy
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 JOB_VERSION = 1
 JobFunction = Callable[[dict[str, Any]], Awaitable[Any]]

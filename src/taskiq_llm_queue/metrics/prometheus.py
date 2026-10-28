@@ -12,11 +12,10 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
-import structlog
-
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.metrics_names import LABELS
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 INSTALL_HINT = "PrometheusMetrics needs prometheus-client: pip install 'taskiq-llm-queue[metrics]'"
 
 

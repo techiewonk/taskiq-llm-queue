@@ -11,10 +11,10 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-import structlog
 from pydantic import BaseModel, ValidationError
 from redis.exceptions import RedisError
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.reliability import _lua
@@ -23,7 +23,7 @@ from taskiq_llm_queue.reliability.fallback import FallbackConfig
 if TYPE_CHECKING:
     import redis.asyncio
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 AUDIT_RETENTION_SECS = 90 * 86400
 

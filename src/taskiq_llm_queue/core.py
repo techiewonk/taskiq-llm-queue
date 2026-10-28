@@ -17,9 +17,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import orjson
-import structlog
 from redis.exceptions import RedisError
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
 from taskiq_llm_queue.errors import ErrorInfo, ErrorKind, QueueUnavailable
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.reliability.claims import RedisClaimStore
     from taskiq_llm_queue.reliability.fallback import FallbackStep
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 # DS13: a live (rt) call that can't get a slot within 2 s moves to the next fallback step.
 RT_ACQUIRE_SECS = 2.0

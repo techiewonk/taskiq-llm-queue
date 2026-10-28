@@ -11,12 +11,12 @@ import contextlib
 from typing import TYPE_CHECKING, Any
 
 import orjson
-import structlog
 from aiobotocore.config import AioConfig
 from aiobotocore.session import AioSession, get_session
 from botocore.exceptions import ClientError
 from taskiq import TaskiqMiddleware
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.errors import LLMQueueError
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
     from taskiq_llm_queue.broker.broker import HybridSQSBroker
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 OFFLOAD_LABEL = "s3_offload_key"
 DEFAULT_THRESHOLD_BYTES = 200_000  # DS15: 200 KB inline limit on the serialized taskiq message

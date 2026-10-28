@@ -15,9 +15,9 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import structlog
 from redis.exceptions import RedisError
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.protocols import Lease
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from taskiq_llm_queue.config import QueueConfig
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)

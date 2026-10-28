@@ -16,8 +16,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-import structlog
-
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.metrics_names import FAILOVER_ACTIVE
 from taskiq_llm_queue.reliability.limiter import local_cap
@@ -26,7 +25,7 @@ from taskiq_llm_queue.reliability.local_limiter import LocalLimiter
 if TYPE_CHECKING:
     from taskiq_llm_queue.metrics import MetricsSink
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 Probe = Callable[[], Awaitable[object]]
 
 

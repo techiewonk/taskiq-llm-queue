@@ -15,12 +15,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import structlog
 from redis.exceptions import RedisError
 from taskiq.acks import AcknowledgeType
 from taskiq.receiver import Receiver
 
 from taskiq_llm_queue import metrics_names as mn
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import HybridSQSBroker
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.broker.queue import SQSQueue
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.reliability.claims import RedisClaimStore
     from taskiq_llm_queue.routing_hooks import FailoverPolicy
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_WORKER_SLOTS = 50
 DEFAULT_JOB_SLOTS = 4

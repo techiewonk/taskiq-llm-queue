@@ -10,12 +10,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
-import structlog
+from taskiq_llm_queue._logging import get_logger
 
 if TYPE_CHECKING:
     from taskiq_llm_queue.config import Lane
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 CallPath = Literal["sqs", "direct"]
 

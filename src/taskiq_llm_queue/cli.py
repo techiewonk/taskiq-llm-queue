@@ -21,7 +21,6 @@ from typing import Any
 
 import orjson
 import redis.asyncio
-import structlog
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
@@ -100,11 +99,10 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
 def console_main() -> None:
     """`llm-queue` console script: warnings and errors to stderr, so stdout stays pure JSON.
 
-    The library never configures structlog; this entry point is an app, so it does.
+    The library never configures logging; this entry point is an app, so it does.
     """
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING),
-        logger_factory=structlog.PrintLoggerFactory(sys.stderr),
+    logging.basicConfig(
+        level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(message)s"
     )
     sys.exit(main())
 

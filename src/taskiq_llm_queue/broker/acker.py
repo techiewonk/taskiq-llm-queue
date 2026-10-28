@@ -13,8 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-import structlog
-
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.batching import MicroBatcher
 from taskiq_llm_queue.broker.errors import (
     ErrorFamily,
@@ -29,7 +28,7 @@ from taskiq_llm_queue.broker.queue import MAX_BATCH_ENTRIES
 if TYPE_CHECKING:
     from types_aiobotocore_sqs.client import SQSClient
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 class VisibilityResult(StrEnum):

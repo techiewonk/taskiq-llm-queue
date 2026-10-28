@@ -17,8 +17,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-import structlog
-
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.acker import VisibilityResult
 from taskiq_llm_queue.broker.events import BrokerHooks, safe_call
 
@@ -27,7 +26,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.broker.delivery import Delivery
     from taskiq_llm_queue.broker.queue import Heartbeat
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 class HeartbeatManager:

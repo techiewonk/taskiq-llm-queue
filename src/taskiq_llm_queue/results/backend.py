@@ -10,19 +10,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-import structlog
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.connection import Connection, SSLConnection
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.exceptions import ResultGetError
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.envelope import LLMReply
 
 if TYPE_CHECKING:
     from taskiq_llm_queue.config import QueueConfig
     from taskiq_llm_queue.keys import KeySpace
 
-logger = structlog.get_logger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_TAKE_BATCH = 1000  # keys per MGET; 10K waiters on one pod -> 10 MGETs per interval
 
