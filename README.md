@@ -130,7 +130,7 @@ Embeddings never switch model. A chat (`rt`) call that can't get capacity within
 uv run llm-queue fallback get                       # whole config (JSON)
 uv run llm-queue fallback get --model gpt120b       # resolved chain for one model
 uv run llm-queue fallback test --model gpt120b      # dry run: which target would serve now (limiter/breaker state)
-uv run llm-queue fallback set --model gpt120b --chain "gpt120b@apac,gpt20b"
+uv run llm-queue fallback set --model gpt120b --chain "gpt20b"
 uv run llm-queue fallback set --file fallback.json
 uv run llm-queue fallback reset                     # back to the startup default
 ```
@@ -138,10 +138,14 @@ uv run llm-queue fallback reset                     # back to the startup defaul
 Chains are stored in `<key_prefix>:cfg:fallback`, validated, and reloaded by every pod within 30 s with no restart. An invalid config is rejected and the last good one stays. Every change is written to the `<key_prefix>:cfg:audit` stream.
 
 ```json
-{ "gpt120b": {"steps": ["gpt120b@apac", "gpt20b"]},
-  "gpt20b":  {"steps": ["gpt20b@apac", "gpt120b"], "require_headroom": ["gpt120b"]},
-  "titan-v2": {"steps": ["titan-v2@apac"]} }
+{ "chains": {
+    "gpt120b": ["gpt20b"],
+    "gpt20b": [{"model": "gpt120b", "require_headroom": true}]
+  },
+  "skip_targets": { "gpt120b": ["apac"] } }
 ```
+
+Same-model targets are tried in the order of `ModelConfig.targets` (e.g. `primary`, then `apac`); `chains` lists the *other* models tried under policy `chain`; `skip_targets` turns a target off without a restart (e.g. a region not yet approved).
 
 **To see fallbacks happen:** `res.meta` / `response_metadata` show `served_model`, `served_target`, `fallback_used` and `attempts`, and the `llmq_fallback_total{model,step}` metric counts them. Locally, follow [TESTING.md §4](TESTING.md#4-verify-fallback-step-by-step).
 
