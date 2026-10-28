@@ -4,15 +4,26 @@ description = "An LLM request client with its own durable queue: taskiq + Amazon
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
-license = { text = "MIT" }
-keywords = ["taskiq", "sqs", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain"]
+# PEP 639 licence expression; NOTICE credits the projects the broker design builds on.
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The taskiq-llm-queue authors" }]
+keywords = [
+    "taskiq", "sqs", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain", "langgraph",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: AsyncIO",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
 ]
 
@@ -32,6 +43,8 @@ dependencies = [
     "xxhash>=3",
     # JSON on every hot path (envelopes, params, provider bodies): Rust, ~3-10x stdlib json.
     "orjson>=3.10,<4",
+    # Structured key-value logs. The library never configures it; the app does (README).
+    "structlog>=24.1",
 ]
 
 [project.scripts]
@@ -47,8 +60,11 @@ metrics = ["prometheus-client>=0.20"]
 speedups = ["hiredis>=3"]
 
 [project.urls]
+Homepage = "https://github.com/techiewonk/taskiq-llm-queue"
 Documentation = "https://github.com/techiewonk/taskiq-llm-queue#readme"
 Source = "https://github.com/techiewonk/taskiq-llm-queue"
+Issues = "https://github.com/techiewonk/taskiq-llm-queue/issues"
+Changelog = "https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -69,7 +85,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # PEP 639 license-files
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
@@ -79,7 +95,8 @@ path = "src/taskiq_llm_queue/_version.py"
 packages = ["src/taskiq_llm_queue"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+# Allow-list: secrets (.env, .pypirc) and local tooling can never reach the sdist.
+include = ["src/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md", "STABILITY.md", "docs/"]
 
 [tool.ruff]
 line-length = 100
