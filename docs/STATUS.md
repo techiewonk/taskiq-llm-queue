@@ -1,7 +1,6 @@
 # Status: features, issues, solutions and results
 
-Snapshot **2026-10-30**, library `main` (rate limits, lane buckets and the items below; see git log). PyPI has
-`0.1.0a1`, which has **none** of the features marked "main only". Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
+Snapshot **2026-10-30**. PyPI has **`0.1.0a2`** (tag `v0.1.0a2`, `037b6c0`): every feature below marked "main only" is in it. Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
 v0.30 in the app repo; rate-limit design: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
 
 Legend: ✅ built and verified · 🟡 built, partly verified or with a known limit · 🔵 proposed / agreed, not built · ❌ open problem
@@ -20,22 +19,22 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | F6 | Results via Valkey + per-pod dispatcher; cancel / timeout | ✅ 0.1.0a1 | results | 10 | S16, S17, S31 |
 | F7 | LangChain / LangGraph adapters, OpenAI-compatible provider, sync calls, jobs | ✅ 0.1.0a1 | langchain, providers | 02, 03, 07, 08, 09, 11 | samples 01–13, S02, S10 |
 | F8 | Canary routing (sqs vs direct), live fallback chains, CLI | ✅ 0.1.0a1 | routing, cli | 12_cli.md | integration tests |
-| F9 | **Bucket size** `max_concurrency` per model + target | ✅ main only | limiter | 14 | S53: peak exactly 10 of 2,000 |
-| F10 | **Settings per provider and model, six layers** (live model > live provider > env model > env provider > env global > default), `LLMQ_SETTINGS` | ✅ main only | model_settings | 14 | unit tests every layer; sample 14 shows sources |
-| F11 | **Live changes without restart** (`llm-queue settings get/set/unset/reset`, audited) | ✅ main only | cli, client | 14, 12_cli.md | S54: cap 20 → 5 live, peak 20 → 5; CLI integration tests |
-| F12 | **Provider-wide bucket** `shared_max_concurrency` | ✅ main only | core, lifecycle | 14 | S55: shared 8, combined peak exactly 8; integration test peak 3 |
-| F13 | **Retry curve** 1–2.5 s, 4–10 s, 16–30 s, cap 30 s; throttle cap 10 s; all knobs configurable | 🟡 main only | core | 15 | unit tests; see I4/I5 (throughput cost) |
-| F14 | **rt capacity wait** `rt_capacity_wait_secs` (30 s, live per model) | 🟡 main only | core | 15 | unit tests, sample 15; S35b effect unclear (I4) |
-| F15 | **`.meta` on every error** (attempts, queue wait, last target) | ✅ main only | client, core | 15 | unit tests, sample 15 |
-| F16 | Old `_S` env names dropped | ✅ main only | config | — | unit test |
-| F17 | **RPM / TPM rate budget** per model target and provider (`smooth` or `fixed` minute, rt reserve, usage-corrected TPM) | ✅ main only | rate, core | 16 | R01–R09, R11 PASS (below); integration tests on Valkey |
-| F18 | **Waiting / working / done view** `llm-queue status` + `llmq_rate_used` / `llmq_rate_remaining` | ✅ main only | cli, client | 16, 12_cli.md | R12: status = call log (12 started, 18 left) |
-| F19 | **A bucket per lane** `lane_max_concurrency.<lane>` | ✅ main only | core, lifecycle | 16 | S57: bulk 3 / bg 5 held exactly over 600 calls |
-| F20 | Cancel stops a running attempt; caller timeout too | ✅ main only | core, client | 10 | S56: slot freed 0.03–0.05 s after cancel |
-| F21 | Debug trace per call (`taskiq_llm_queue.core` at DEBUG) | ✅ main only | core | — | unit test of the event sequence |
-| F22 | Metrics: `llmq_inflight`, `llmq_breaker_open`, SQS counters per queue | ✅ main only | client, lifecycle | — | unit tests |
-| F23 | S3 offload for messages over 200 KB (`s3_offload_bucket`) | ✅ main only | lifecycle, client | — | integration test (moto S3 + ElasticMQ) |
-| F24 | Send batching for bg / bulk (`sqs_batch_wait_secs` 0.02 s) | ✅ main only | lifecycle | — | S35, S35b, S35c, S23, S27 PASS |
+| F9 | **Bucket size** `max_concurrency` per model + target | ✅ 0.1.0a2 | limiter | 14 | S53: peak exactly 10 of 2,000 |
+| F10 | **Settings per provider and model, six layers** (live model > live provider > env model > env provider > env global > default), `LLMQ_SETTINGS` | ✅ 0.1.0a2 | model_settings | 14 | unit tests every layer; sample 14 shows sources |
+| F11 | **Live changes without restart** (`llm-queue settings get/set/unset/reset`, audited) | ✅ 0.1.0a2 | cli, client | 14, 12_cli.md | S54: cap 20 → 5 live, peak 20 → 5; CLI integration tests |
+| F12 | **Provider-wide bucket** `shared_max_concurrency` | ✅ 0.1.0a2 | core, lifecycle | 14 | S55: shared 8, combined peak exactly 8; integration test peak 3 |
+| F13 | **Retry curve** 1–2.5 s, 4–10 s, 16–30 s, cap 30 s; throttle cap 10 s; all knobs configurable | 🟡 0.1.0a2 | core | 15 | unit tests; see I4/I5 (throughput cost) |
+| F14 | **rt capacity wait** `rt_capacity_wait_secs` (30 s, live per model) | 🟡 0.1.0a2 | core | 15 | unit tests, sample 15; S35b effect unclear (I4) |
+| F15 | **`.meta` on every error** (attempts, queue wait, last target) | ✅ 0.1.0a2 | client, core | 15 | unit tests, sample 15 |
+| F16 | Old `_S` env names dropped | ✅ 0.1.0a2 | config | — | unit test |
+| F17 | **RPM / TPM rate budget** per model target and provider (`smooth` or `fixed` minute, rt reserve, usage-corrected TPM) | ✅ 0.1.0a2 | rate, core | 16 | R01–R09, R11 PASS (below); integration tests on Valkey |
+| F18 | **Waiting / working / done view** `llm-queue status` + `llmq_rate_used` / `llmq_rate_remaining` | ✅ 0.1.0a2 | cli, client | 16, 12_cli.md | R12: status = call log (12 started, 18 left) |
+| F19 | **A bucket per lane** `lane_max_concurrency.<lane>` | ✅ 0.1.0a2 | core, lifecycle | 16 | S57: bulk 3 / bg 5 held exactly over 600 calls |
+| F20 | Cancel stops a running attempt; caller timeout too | ✅ 0.1.0a2 | core, client | 10 | S56: slot freed 0.03–0.05 s after cancel |
+| F21 | Debug trace per call (`taskiq_llm_queue.core` at DEBUG) | ✅ 0.1.0a2 | core | — | unit test of the event sequence |
+| F22 | Metrics: `llmq_inflight`, `llmq_breaker_open`, SQS counters per queue | ✅ 0.1.0a2 | client, lifecycle | — | unit tests |
+| F23 | S3 offload for messages over 200 KB (`s3_offload_bucket`) | ✅ 0.1.0a2 | lifecycle, client | — | integration test (moto S3 + ElasticMQ) |
+| F24 | Send batching for bg / bulk (`sqs_batch_wait_secs` 0.02 s) | ✅ 0.1.0a2 | lifecycle | — | S35, S35b, S35c, S23, S27 PASS |
 
 ## 2. Issues found and their solutions
 
@@ -147,9 +146,19 @@ In every run: **0 lost, 0 duplicate provider calls**; bg and bulk 100 % or close
 | N3 | ✅ Repeat gate (I8): S35b 5 runs in a row on a quiet stack, then the full suite 3 times | M (time) |
 | N4 | ✅ I9: S35b with `retry_attempts=5`, record the effect | S |
 | N5 | ✅ Debug lifecycle logs (I7), `limiter_initial_clamped` fix (I10), metrics I13–I14 | S |
-| N6 | Release `0.1.0a2` with F9–F16 (owner go-ahead) | S |
+| N6 | ✅ Released `0.1.0a2` to PyPI (CI green, twine check, clean install verified) | S |
 | N7 | ✅ Rate budget RPM/TPM + status view (F17–F18), lane buckets (F19), scenarios R01–R12 | L |
-| N8 | Research assistant integration: steps 1–11 + 2b/2c of `docs/taskiq-llm-queue/INTEGRATION_RESEARCH_ASSISTANT.md` | L |
+| N8 | ✅ Research assistant integration steps 1–8 on app branch `feat/llm-queue-integration` (`609f3aed`, flag off by default); 4 app tests pass incl. a `get_llm_model()` turn through SQS. Steps 9–11 (infra, alarms, canary) are DevOps / rollout | L |
+
+### Final gate (2026-10-30)
+
+| Check | Result |
+|---|---|
+| Full fakellm suite (S01–S57, R01–R12), one pass | **66 pass, 0 fail**, 3 skip (need LangChain / upstream / AWS) |
+| Unit / integration tests | 602 / 159 pass; ruff, format, mypy clean; GitHub CI green |
+| Samples 01–16 on the local stack | 15 / 15 exit 0 |
+| Adapter tests on langchain-aws 0.2.24 (app pin) and 0.2.35 | 39 / 39 each (found and fixed a 0.2.24 serialization bug) |
+| Real Bedrock subset (S01, S03, S16, S17, S29, S40, S41) | **blocked**: the AWS session token in `.env` has expired (`ExpiredTokenException`); S16, S17, S41 (no provider call) pass. Re-run after refreshing credentials: `SCN_PROVIDER=aws python -m tools.scenarios run S01 S03 S16 S17 S29 S40 S41` |
 
 ## 5. Using it in the research assistant
 
