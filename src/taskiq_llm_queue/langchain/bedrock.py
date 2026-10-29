@@ -65,11 +65,17 @@ class _QueueOnlyClient:
     converse_stream = invoke_model = get_inference_profile = _refuse
 
 
-def _queue_only_values(values: Any, *slots: str) -> Any:
-    """Fill the given boto3 client slots with the placeholder unless the caller supplied them."""
+def _queue_only_values(values: Any, fields: Any, *slots: str) -> Any:
+    """Fill the given boto3 client slots with the placeholder unless the caller supplied them.
+
+    Only slots that are fields of the installed langchain-aws class: 0.2.24 has no
+    `bedrock_client`, and an unknown key moves into `model_kwargs`, which reach the Converse
+    request (the placeholder then broke envelope serialization in the research assistant).
+    """
     if isinstance(values, dict):
         for slot in slots:
-            values.setdefault(slot, _QueueOnlyClient())
+            if slot in fields:
+                values.setdefault(slot, _QueueOnlyClient())
     return values
 
 
@@ -127,7 +133,9 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
     @model_validator(mode="before")
     @classmethod
     def _queue_defaults(cls, values: Any) -> Any:
-        values = _queue_only_values(_alias_values(values), "client", "bedrock_client")
+        values = _queue_only_values(
+            _alias_values(values), cls.model_fields, "client", "bedrock_client"
+        )
         if isinstance(values, dict):
             values["disable_streaming"] = True
         return values
@@ -242,7 +250,7 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
     @model_validator(mode="before")
     @classmethod
     def _queue_defaults(cls, values: Any) -> Any:
-        return _queue_only_values(values, "client")
+        return _queue_only_values(values, cls.model_fields, "client")
 
     def _queue(self) -> QueueClient:
         return resolve_queue(self.llmq)

@@ -34,6 +34,7 @@ a minor release may break the public API, with a deprecation announced one minor
 
 - A model fails over to direct after `sqs_timeouts_to_failover` SQS send timeouts within 60 s, not after one (a refused send still fails over at once); the timed-out call itself still runs direct. One timeout in a 10K burst used to cost the model 300 s of SQS.
 - A 5xx that opens a target's breaker ends the call's retries on that target; in-flight calls kept retrying the open target (S12).
+- `QueuedChatBedrockConverse` on langchain-aws 0.2.24: the queue-only client placeholder went into `model_kwargs` (no `bedrock_client` field there), reached the Converse request and failed envelope serialization. Only fields the installed class has are filled.
 - A pod that lacks a model waits a random fraction of a second before handing the message back, so the message no longer comes back in phase with that pod's own polls (S48: the old pod had won 8 redeliveries in a row).
 - `limiter_initial_clamped` warns only for a start you set, not for the default start (20) above a small `max_concurrency`.
 

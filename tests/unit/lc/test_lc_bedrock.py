@@ -87,9 +87,9 @@ def test_model_id_is_looked_up_from_the_queue_config() -> None:
 async def test_ainvoke_matches_parent_parsing() -> None:
     """Same Converse response → same message as plain ChatBedrockConverse, plus CallMeta."""
     stub = _StubBoto(CONVERSE_TOOL_RESPONSE)
-    plain = ChatBedrockConverse(
-        model_id=MODEL_ID, client=stub, bedrock_client=stub, region_name="us-east-1"
-    )
+    # `bedrock_client` is a field only in newer langchain-aws; on 0.2.24 it would be a model kwarg.
+    slots = {s: stub for s in ("client", "bedrock_client") if s in ChatBedrockConverse.model_fields}
+    plain = ChatBedrockConverse(model_id=MODEL_ID, region_name="us-east-1", **slots)
     fake = FakeQueueClient()
     queued = _queued(fake)
 
@@ -233,3 +233,16 @@ def test_embeddings_sync_and_normalize() -> None:
     emb.embed_documents(["a"])
     assert fake.ops == ["embed_sync", "embed_sync"]
     assert fake.calls[0][1] == "titan"
+
+
+def test_placeholder_client_only_fills_fields_the_installed_class_has() -> None:
+    """Research-assistant bug: on langchain-aws 0.2.24 `bedrock_client` is no field, so the
+    placeholder moved into `model_kwargs`, joined the Converse request and broke envelope
+    serialization. Only real client fields get the placeholder."""
+    from taskiq_llm_queue.langchain import QueuedChatBedrockConverse
+
+    model = QueuedChatBedrockConverse(model_id="openai.gpt-oss-20b-1:0", model_alias="gpt20b")
+    assert "bedrock_client" not in (getattr(model, "model_kwargs", None) or {})
+    for slot in ("client", "bedrock_client"):
+        if slot in type(model).model_fields:
+            assert getattr(model, slot) is not None
