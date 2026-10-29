@@ -58,9 +58,9 @@ async def release_all(lim: AdaptiveLimiter, leases: list[Lease]) -> None:
 
 
 async def throttle(lim: AdaptiveLimiter, n: int = 2) -> None:
-    """`n` throttles in a row: two make a storm (min_throttles, ratio 1) that cuts and pauses."""
+    """`n` throttles in a row: two cut (min_throttles, ratio 1); three also pause (95 % bound)."""
     for _ in range(n):
-        lease = await lim.try_acquire(M, T, Lane.RT)
+        lease = await lim.acquire(M, T, Lane.RT, timeout_secs=2)  # waits out a pause
         assert lease is not None
         await lim.release(lease, throttled=True)
 
@@ -186,7 +186,7 @@ async def test_acquire_sleeps_out_the_pause(valkey: redis.asyncio.Redis, keys: K
     lim = AdaptiveLimiter(
         valkey, keys, LimiterSettings(initial={M: 4}, pause_secs=0.3, poll_secs=0.01), sleep=sleep
     )
-    await throttle(lim)
+    await throttle(lim, 3)  # 3 of 3: a storm by the 95 % bound
     assert await lim.acquire(M, T, Lane.RT, timeout_secs=5) is not None
     assert delays, "acquire must have waited"
     assert delays[0] >= 0.2
@@ -291,7 +291,7 @@ async def test_pause_closes_gate_and_blocks_acquire(
     lim = make(valkey, keys, pause_secs=0.3)
     gate = lim.gate(M, T)
     assert gate.is_open()
-    await throttle(lim)
+    await throttle(lim, 3)  # 3 of 3: a storm by the 95 % bound
     assert not gate.is_open()
     assert await lim.acquire(M, T, Lane.RT, timeout_secs=0.05) is None
     other_pod = make(valkey, keys, pause_secs=0.3)
@@ -375,9 +375,10 @@ async def test_sync_limiter_shares_state(
     assert sync.acquire(M, T, Lane.RT, timeout_secs=0.05) is None
     assert sync.acquire(M, T, Lane.RT, timeout_secs=10, should_abort=lambda: True) is None
     sync.release(lease, throttled=True)
-    lease = sync.acquire(M, T, Lane.RT, timeout_secs=0)
-    assert lease is not None
-    sync.release(lease, throttled=True)
+    for _ in range(2):  # 3 throttles in a row: a storm by the 95 % bound, so it pauses
+        lease = sync.acquire(M, T, Lane.RT, timeout_secs=0)
+        assert lease is not None
+        sync.release(lease, throttled=True)
     assert (await lim.state(M, T)).paused_secs > 0
     await lim.release(held[0], throttled=False)
 

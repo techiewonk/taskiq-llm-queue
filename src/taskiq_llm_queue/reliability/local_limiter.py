@@ -7,6 +7,7 @@ shared limit. Thread-safe, so the same instance serves async workers and sync `d
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 import uuid
@@ -15,6 +16,18 @@ from collections.abc import Awaitable, Callable, Mapping
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.protocols import Lease
 from taskiq_llm_queue.reliability.limiter import PauseGate
+
+_ZZ = 1.645**2  # one-sided 95 %, the same bound as the shared limiter's Lua
+
+
+def storm_lower_bound(throttles: float, total: float) -> float:
+    """95 % Wilson lower bound of the throttle ratio: pause only on a storm the window shows.
+
+    S35b: "2 of 3 throttled" under 30 % random 429s is chance, not a storm; 3 of 3 is one.
+    """
+    ratio = throttles / total
+    spread = math.sqrt(ratio * (1 - ratio) / total + _ZZ / (4 * total * total))
+    return (ratio + _ZZ / (2 * total) - math.sqrt(_ZZ) * spread) / (1 + _ZZ / total)
 
 
 class LocalLimiter:
@@ -133,7 +146,7 @@ class LocalLimiter:
             storm = (
                 throttled
                 and counts[2] >= self._min_throttles
-                and counts[2] >= self._pause_ratio * (counts[1] + counts[2])
+                and storm_lower_bound(counts[2], counts[1] + counts[2]) >= self._pause_ratio
             )
         if storm:
             self.gate(*key).close_for(self._pause_secs)

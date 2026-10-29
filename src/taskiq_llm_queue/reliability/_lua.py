@@ -122,7 +122,7 @@ return {1, inflight + 1, limit, tostring(expires)}
 # window of `window_secs`; a throttle cuts the limit only when the window holds >= min_throttles
 # throttles making up >= loss_tolerance of its outcomes, at most once per window, and only for a
 # call started after the last cut (one cut per round trip). The pause is kept for throttle
-# storms (ratio >= pause_ratio), not for every 429.
+# storms (95 % lower bound of the ratio >= pause_ratio), not for every 429 or a lucky window.
 # Growth: +1 per min(increase_every, limit / 2) busy successes. After a cut the limit it was cut
 # from is kept as `w_max`; from `settle_ratio x w_max` on, growth is one step per `probe_secs`
 # and only on a success at full use (S07: it saw-toothed 44-64 around a capacity of 50 with
@@ -201,7 +201,18 @@ if throttled then
       limit = target
       redis.call('HSET', KEYS[1], 'limit', limit)
     end
-    if ratio >= tonumber(ARGV[16]) then
+  end
+  -- Pause only when the window *shows* a storm: the 95 % Wilson lower bound of the throttle
+  -- ratio must reach pause_ratio. S35b: 2 of 3 throttled under 30 % random 429s paused a
+  -- model ~22 % of windows; fewer outcomes then paused it more (stuck 50-70 % of the time).
+  -- 3 of 3 pauses, 5 of 6 does not. Checked on every throttle, not only when a cut is due,
+  -- so the evidence that arrives after the window's one cut still counts.
+  if e_thr >= tonumber(ARGV[15]) then
+    local n = e_thr + win_ok + prev_ok * carry
+    local zz = 2.706  -- 1.645^2 (one-sided 95 %)
+    local lower = (ratio + zz / (2 * n)
+      - math.sqrt(zz) * math.sqrt(ratio * (1 - ratio) / n + zz / (4 * n * n))) / (1 + zz / n)
+    if lower >= tonumber(ARGV[16]) then
       paused = math.max(paused, now + tonumber(ARGV[9]))
       redis.call('HSET', KEYS[1], 'paused_until', tostring(paused))
     end

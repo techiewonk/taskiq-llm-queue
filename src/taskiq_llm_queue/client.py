@@ -107,6 +107,9 @@ _T = TypeVar("_T")  # PEP 695 needs 3.12; the package supports 3.11
 # Share of the remaining call budget an SQS send may use, so a failed send leaves the rest
 # for the `direct` failover run (capped further by `sqs_send_timeout_secs`).
 _SEND_BUDGET_SHARE = 0.5
+# A send wait that returns this much later than asked means our own event loop was busy (e.g.
+# building 10K envelopes), not that SQS stalled.
+_LOOP_LAG_SECS = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,19 +973,25 @@ class LLMQueue:
         read timeout (S20), so a send gets `sqs_send_timeout_secs` and at most half the call
         budget. But a send queued behind a burst is slow, not failed (S35b: 10K sends timed out
         at 5 s and moved the sender to direct): while another send (any queue) completed
-        within the timeout, it keeps waiting up to the budget share. Raises `TimeoutError`.
+        within the timeout, it keeps waiting up to the budget share. The stall clock starts no
+        earlier than this send, and a wait our own busy event loop overran does not count
+        (S35b: a 10K burst kept the loop busy past 5 s before the first reply was read, and the
+        first sends looked stalled against "no send ever completed"). Raises `TimeoutError`.
         """
         limit = self.config.sqs_send_timeout_secs
-        give_up = time.monotonic() + max(0.0, _SEND_BUDGET_SHARE * (deadline_at - time.time()))
+        started = time.monotonic()
+        give_up = started + max(0.0, _SEND_BUDGET_SHARE * (deadline_at - time.time()))
         while True:
             wait = max(0.0, min(limit, give_up - time.monotonic()))
+            before = time.monotonic()
             done, _ = await asyncio.wait({send}, timeout=wait)
             if done:
                 send.result()  # raises the send's own error
                 self._sent_at = time.monotonic()
                 return
             now = time.monotonic()
-            if now >= give_up or now - self._sent_at >= limit:
+            loop_busy = now - before > wait + _LOOP_LAG_SECS
+            if now >= give_up or (not loop_busy and now - max(self._sent_at, started) >= limit):
                 send.cancel()
                 raise TimeoutError(f"SQS send for {alias} timed out")
 

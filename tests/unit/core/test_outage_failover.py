@@ -7,6 +7,7 @@ that fails, claims that record cancel flags. `_direct` is replaced, so no provid
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Sequence
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from typing import Any, cast
 import pytest
 
 from taskiq_llm_queue import Envelope, Lane, LLMReply, ModelConfig, QueueConfig, Target
+from taskiq_llm_queue import client as client_module
 from taskiq_llm_queue.client import LLMQueue
 from taskiq_llm_queue.failover import FailoverSettings, FailoverState
 from taskiq_llm_queue.results import ResultDispatcher
@@ -147,6 +149,34 @@ async def test_slow_send_behind_a_burst_keeps_waiting_while_sqs_progresses() -> 
         await q._bounded_send("big", stalled, time.time() + 30)
     await asyncio.sleep(0)  # let the cancellation land
     assert stalled.cancelled()
+
+
+async def test_busy_event_loop_is_not_an_sqs_stall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S35b bug: a 10K burst kept the sender's loop busy past the 5 s send timeout before any
+    reply was read; with no send ever completed the first sends counted as stalled and both
+    chat models failed over to direct for 300 s. A wait the loop overran does not count, and a
+    send is only judged from its own start, not from "never"."""
+    monkeypatch.setattr(client_module, "_LOOP_LAG_SECS", 0.05)
+    q, _, direct = make_queue(sqs_send_timeout_secs=0.1)
+    assert q._sent_at == -math.inf  # nothing completed yet, as at the start of a burst
+
+    async def hog() -> None:  # synchronous work blocking the loop, like building envelopes
+        time.sleep(0.3)  # noqa: ASYNC251  # blocking on purpose: the busy loop under test
+
+    async def reply_after_hog() -> None:
+        await asyncio.sleep(0.32)
+
+    send = asyncio.ensure_future(reply_after_hog())
+    blocker = asyncio.create_task(hog())
+    await q._bounded_send("big", send, time.time() + 30)
+    await blocker
+    assert send.done()
+    assert direct == []
+    stalled = asyncio.ensure_future(asyncio.sleep(3600))
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):  # a real stall with an idle loop still times out
+        await q._bounded_send("big", stalled, time.time() + 30)
+    assert time.monotonic() - t0 < 1
 
 
 async def test_dispatcher_read_errors_switch_new_calls_to_direct() -> None:

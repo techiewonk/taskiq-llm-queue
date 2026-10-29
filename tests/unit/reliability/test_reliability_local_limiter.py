@@ -135,9 +135,9 @@ async def test_local_limiter_waits_until_timeout() -> None:
 
 
 async def test_local_limiter_throttle_pauses() -> None:
-    """A throttle storm (2 of 2 calls in the window) pauses the model target."""
+    """A throttle storm (3 of 3 calls in the window) pauses the model target."""
     lim, clock = make_local(3)
-    for _ in range(2):
+    for _ in range(3):
         lease = await lim.acquire("m", "t", Lane.RT, 0)
         assert lease is not None
         await lim.release(lease, throttled=True)
@@ -187,3 +187,15 @@ def test_local_limiter_sync_from_threads() -> None:
 def test_local_limiter_rejects_zero_cap() -> None:
     with pytest.raises(ValueError, match="cap"):
         LocalLimiter(0)
+
+
+def test_storm_needs_evidence_not_a_lucky_window() -> None:
+    """Bug S35b: under 30 % random 429s, "2 of 3 throttled" paused a model ~22 % of windows and
+    fewer outcomes paused it more; it sat paused 50-70 % of the time. The 95 % lower bound
+    pauses 3 of 3 and 6 of 6, not 2 of 2, 2 of 3 or 5 of 6."""
+    from taskiq_llm_queue.reliability.local_limiter import storm_lower_bound
+
+    pauses = {
+        (t, n): storm_lower_bound(t, n) >= 0.5 for t, n in [(2, 2), (3, 3), (2, 3), (5, 6), (6, 6)]
+    }
+    assert pauses == {(2, 2): False, (3, 3): True, (2, 3): False, (5, 6): False, (6, 6): True}

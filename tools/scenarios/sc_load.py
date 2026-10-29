@@ -83,6 +83,48 @@ async def run_loadgen(
     return result
 
 
+class Timeline:
+    """Once a second: limit, live leases and pause per model target, and queue depths.
+
+    Written as JSON lines to `timeline.jsonl` in the scenario dir, so a failing burst shows
+    which model's limit collapsed and when (S35b investigation, STATUS.md I4).
+    """
+
+    def __init__(self, ctx: Ctx, config: Any) -> None:
+        """Remember the model targets and queues of `config`; nothing is read yet."""
+        self.ctx = ctx
+        self.keys = api.keys(ctx.settings.prefix)
+        self.targets = [(alias, t) for alias, m in config.models.items() for t in m.targets]
+        self.queues = sorted({q for m in config.models.values() for q in m.queues.values()})
+        self.path = ctx.dir / "timeline.jsonl"
+        self.next_at = 0.0
+
+    async def sample(self, elapsed: float) -> None:
+        """Append one row when a second has passed since the last one."""
+        if elapsed < self.next_at:
+            return
+        self.next_at = elapsed + 1.0
+        r = stack.redis_client(self.ctx.settings)
+        now = time.time()
+        row: dict[str, Any] = {"t": round(elapsed, 1), "models": {}, "queues": {}}
+        try:
+            for alias, target in self.targets:
+                state = await r.hgetall(self.keys.limiter(alias, target))
+                live = await r.zcount(self.keys.leases(alias, target), now, "+inf")
+                paused = float(state.get(b"paused_until", 0) or 0)
+                row["models"][f"{alias}@{target}"] = {
+                    "limit": int(state.get(b"limit", 0) or 0),
+                    "inflight": int(live),
+                    "paused": round(max(0.0, paused - now), 2),
+                }
+        finally:
+            await r.aclose()
+        counts = await stack.queue_counts(self.ctx.settings, self.queues)
+        row["queues"] = {q: counts.get(q, {}).get("visible", 0) for q in self.queues}
+        with self.path.open("ab") as f:
+            f.write(orjson.dumps(row) + b"\n")
+
+
 def _worker_counter(stats: dict[str, Any], name: str) -> float:
     counters = (stats.get("metrics") or {}).get("counters") or {}
     return float(sum(v for k, v in counters.items() if k.split("{", 1)[0] == name))
@@ -106,8 +148,10 @@ async def burst(
     spec = {"rid_prefix": prefix, "total": total, "mix": DEFAULT_MIX}
     ops_before = await stack.commandstats(ctx.settings)
     killed: dict[str, Any] = {}
+    timeline = Timeline(ctx, config)
 
     async def during(elapsed: float, done: int) -> None:
+        await timeline.sample(elapsed)
         if kill and not killed and elapsed >= kill[1]:
             victim = next(p for p in procs if p.name == kill[0])
             killed["stats"] = victim.stats()
