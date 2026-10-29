@@ -49,6 +49,7 @@ class LimiterSettings:
 
     initial: Mapping[str, int] | None = None
     max_by_model: Mapping[str, int] | None = None
+    bg_share_by_model: Mapping[str, float] | None = None
     default_initial: int = 20
     min_limit: int = 2
     max_limit: int = 2000
@@ -121,9 +122,11 @@ class LimiterSettings:
         """Highest limit a model alias may reach: its `max_by_model` cap, else `max_limit`."""
         return min(self.max_limit, (self.max_by_model or {}).get(model, self.max_limit))
 
-    def share_for(self, lane: Lane) -> float:
-        """Fraction of the limit a lane may use: rt the full limit, bg/bulk `bg_share`."""
-        return 1.0 if lane is Lane.RT else self.bg_share
+    def share_for(self, lane: Lane, model: str = "") -> float:
+        """Fraction of the limit a lane may use: rt all of it, bg/bulk the model's `bg_share`."""
+        if lane is Lane.RT:
+            return 1.0
+        return (self.bg_share_by_model or {}).get(model, self.bg_share)
 
     @classmethod
     def from_config(cls, config: QueueConfig, **overrides: Any) -> LimiterSettings:
@@ -202,7 +205,7 @@ def _bounds(settings: LimiterSettings, model: str) -> list[Any]:
 def _acquire_args(settings: LimiterSettings, model: str, lane: Lane, token: str) -> list[Any]:
     return [
         *_bounds(settings, model),
-        settings.share_for(lane),
+        settings.share_for(lane, model),
         settings.lease_ttl_secs,
         token,
     ]
@@ -303,7 +306,7 @@ class AdaptiveLimiter:
             raise
         if int(granted):
             self._note(model, target, int(limit), 0.0)
-            self._shares[token] = self.settings.share_for(lane)
+            self._shares[token] = self.settings.share_for(lane, model)
             return Lease(model, target, token, float(_lua.as_text(extra))), 0.0
         paused = float(_lua.as_text(extra))
         self._note(model, target, int(limit), paused)
@@ -495,7 +498,7 @@ class SyncAdaptiveLimiter:
                 keys, _acquire_args(self.settings, model, lane, token)
             )
             if int(granted):
-                self._shares[token] = self.settings.share_for(lane)
+                self._shares[token] = self.settings.share_for(lane, model)
                 return Lease(model, target, token, float(_lua.as_text(extra)))
             remaining = deadline - self._clock()
             if remaining <= 0 or (should_abort is not None and should_abort()):

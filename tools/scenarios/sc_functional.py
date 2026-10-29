@@ -14,6 +14,7 @@ from typing import Any
 
 import aiohttp
 
+from taskiq_llm_queue.model_settings import model_settings_store
 from tools.scenarios import api, stack
 from tools.scenarios.common import (
     Stream,
@@ -197,6 +198,94 @@ def _peak_concurrency(log: dict[str, list[list[Any]]]) -> int:
         live += step
         peak = max(peak, live)
     return peak
+
+
+async def _set_live(ctx: Ctx, value: dict[str, Any]) -> None:
+    """Write the live per-model / per-provider settings the way `llm-queue settings` does."""
+    keys = api.keys(ctx.settings.prefix)
+    await redis_call(
+        ctx, lambda r: model_settings_store(r, keys).set(value, actor=f"scn-{ctx.sid}")
+    )
+
+
+@scenario("S54", "Live bucket size: cap lowered mid-run reaches every worker")
+async def s54(ctx: Ctx) -> None:
+    """gpt20b runs with `max_concurrency` 20 (3 workers); mid-run `settings set` lowers it to 5.
+
+    After one reload interval plus the calls already in flight, the provider never sees more
+    than 5 calls at once and Valkey's limit is 5; before, it reached 20. No call is lost.
+    """
+    n, before_cap, after_cap = 900, 20, 5
+    await ctx.fake.patch(GPT20B_PRIMARY, {"latency_ms": {"p50": 200, "p95": 300}})
+    models = api.models(ctx.settings)
+    models["gpt20b"] = models["gpt20b"].model_copy(update={"max_concurrency": before_cap})
+    cfg = ctx.config(models=models, limiter={"bg_share": 1.0})
+    await ctx.workers(3, cfg)
+    q = await ctx.queue(cfg)
+    sent = asyncio.create_task(calls(ctx, q, n, tag="l", lane="bg"))
+
+    async def started() -> bool:
+        return len(await ctx.fake.calls(ctx.rid_prefix("l"))) >= 150
+
+    await wait_until(started, timeout_secs=60)
+    switched = time.time()
+    await _set_live(ctx, {"models": {"gpt20b": {"max_concurrency": after_cap}}})
+    settle = cfg.cfg_reload_secs + 2.0  # every worker reloads, in-flight calls finish
+    replies = await sent
+    log = await ctx.fake.calls(ctx.rid_prefix("l"))
+    early = {rid: [c for c in cs if c[1] <= switched] for rid, cs in log.items()}
+    late = {rid: [c for c in cs if c[0] >= switched + settle] for rid, cs in log.items()}
+    failed = [r for r in replies if not r.ok]
+    state = await limiter_state(ctx, "gpt20b", "primary")
+    ctx.metric("requests", n)
+    ctx.metric("failed", len(failed))
+    ctx.metric("peak_before", _peak_concurrency(early))
+    ctx.metric("peak_after", _peak_concurrency(late))
+    ctx.metric("calls_after", sum(len(c) for c in late.values()))
+    ctx.metric("limit_after", state.get("limit"))
+    ctx.expect(not failed, f"{len(failed)} calls failed")
+    ctx.expect(_peak_concurrency(early) == before_cap, "cap 20 not reached before the change")
+    ctx.expect(sum(len(c) for c in late.values()) > 100, "too few calls after the change")
+    ctx.expect(_peak_concurrency(late) <= after_cap, "live cap not applied by every worker")
+    ctx.expect(int(state.get("limit", 0) or 0) == after_cap, f"Valkey limit {state.get('limit')}")
+
+
+@scenario("S55", "Provider shared cap: two models share one bucket")
+async def s55(ctx: Ctx) -> None:
+    """Live `shared_max_concurrency` 8 on bedrock; gpt20b and gpt120b each allow 20.
+
+    600 bg calls split over both models: their combined provider concurrency never exceeds 8,
+    each model alone may use the whole shared bucket, and every call completes once.
+    """
+    n, shared = 600, 8
+    for target in (GPT20B_PRIMARY, GPT120B_PRIMARY, GPT120B_APAC):
+        await ctx.fake.patch(target, {"latency_ms": {"p50": 200, "p95": 300}})
+    models = api.models(ctx.settings)
+    for alias in ("gpt20b", "gpt120b"):
+        models[alias] = models[alias].model_copy(update={"max_concurrency": 20})
+    cfg = ctx.config(models=models, limiter={"bg_share": 1.0})
+    await _set_live(ctx, {"providers": {"bedrock": {"shared_max_concurrency": shared}}})
+    await ctx.workers(3, cfg)
+    q = await ctx.queue(cfg)
+    a, b = await asyncio.gather(
+        calls(ctx, q, n // 2, tag="x", lane="bg", model="gpt20b"),
+        calls(ctx, q, n // 2, tag="y", lane="bg", model="gpt120b", start=n // 2),
+    )
+    log = {**await ctx.fake.calls(ctx.rid_prefix("x")), **await ctx.fake.calls(ctx.rid_prefix("y"))}
+    failed = [r for r in (*a, *b) if not r.ok]
+    ok200 = stack.ok_calls(log)
+    dups = {rid: c for rid, c in ok200.items() if c > 1}
+    peak = _peak_concurrency(log)
+    pool = await limiter_state(ctx, "@bedrock", "shared")
+    ctx.metric("requests", n)
+    ctx.metric("failed", len(failed))
+    ctx.metric("duplicate_provider_success", len(dups))
+    ctx.metric("combined_peak_concurrency", peak)
+    ctx.metric("shared_limit", pool.get("limit"))
+    ctx.expect(not failed, f"{len(failed)} calls failed")
+    ctx.expect(not dups, f"{len(dups)} requests ran twice")
+    ctx.expect(peak == shared, f"combined provider peak {peak}, want exactly {shared}")
+    ctx.expect(int(pool.get("limit", 0) or 0) == shared, f"shared limit {pool.get('limit')}")
 
 
 @scenario("S53", "Fixed bucket: 2,000 queued, exactly N in flight", tags=("slow",))

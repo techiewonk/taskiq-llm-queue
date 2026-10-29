@@ -1,4 +1,4 @@
-"""`llm-queue` operator CLI: routing, fallback chains, limiter/breaker state, queues and jobs.
+"""`llm-queue` operator CLI: routing, fallback, model settings, limiter/breaker, queues, jobs.
 
 Connection settings come from `QueueConfig.from_env()` (`LLMQ_*`). Live config starts from the
 app's defaults (`LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT`) while nothing is stored, and
@@ -18,16 +18,23 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
-from taskiq_llm_queue.config import Lane, QueueConfig, create_redis
+from taskiq_llm_queue.config import LANE_SETTINGS, Lane, ModelSettings, QueueConfig, create_redis
 from taskiq_llm_queue.envelope import TASK_JOB
 from taskiq_llm_queue.errors import ConfigError, LLMQueueError
 from taskiq_llm_queue.keys import KeySpace
+from taskiq_llm_queue.model_settings import (
+    PROVIDER_SETTING_NAMES,
+    SETTING_NAMES,
+    SettingsResolver,
+    model_settings_store,
+    validate_scope,
+)
 from taskiq_llm_queue.reliability.breaker import BreakerState, CircuitBreaker
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore, fallback_store
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
@@ -91,6 +98,19 @@ def build_parser() -> argparse.ArgumentParser:
     j_send.add_argument("--payload-file", required=True, type=Path)
     j_send.add_argument("--queue", default=DEFAULT_JOB_QUEUE, help="queue name or URL")
     j_send.add_argument("--lane", default=Lane.BULK.value, choices=[lane.value for lane in Lane])
+
+    settings = groups.add_parser("settings", help="live per-provider / per-model settings")
+    s_cmd = settings.add_subparsers(dest="cmd", required=True)
+    s_get = s_cmd.add_parser("get", help="effective value and source of every setting")
+    s_set = s_cmd.add_parser("set", help="set live overrides: NAME=VALUE (timeout_secs.rt=60)")
+    s_unset = s_cmd.add_parser("unset", help="drop live overrides (all of the entry if no NAME)")
+    for sub in (s_get, s_set, s_unset):
+        scope = sub.add_mutually_exclusive_group(required=sub is not s_get)
+        scope.add_argument("--model", help="model alias")
+        scope.add_argument("--provider", help="provider name (every model of it)")
+    s_set.add_argument("values", nargs="+", metavar="NAME=VALUE")
+    s_unset.add_argument("names", nargs="*", metavar="NAME")
+    s_cmd.add_parser("reset", help="delete every live override (back to env and defaults)")
 
     limiter = groups.add_parser("limiter", help="adaptive limiter state")
     l_cmd = limiter.add_subparsers(dest="cmd", required=True)
@@ -174,6 +194,8 @@ async def _dispatch(args: argparse.Namespace, config: QueueConfig) -> int:
             return await _fallback(args, config, client, keys)
         if args.group == "breaker":
             return await _breaker(args, config, client, keys)
+        if args.group == "settings":
+            return await _settings(args, config, model_settings_store(client, keys))
         if args.cmd == "reset":
             return await _limiter_reset(args, config, client, keys)
         return await _limiter_show(args, config, client, keys)
@@ -208,6 +230,79 @@ async def _routing(args: argparse.Namespace, store: LiveConfigStore[RoutingConfi
         updated = current.with_user(args.user_id, allowed=args.action == "add")
     stored = await store.set(updated, actor=_actor(args))
     _print_json(_dump(stored))
+    return 0
+
+
+def _setting(name: str, allowed: Sequence[str]) -> tuple[str, Lane | None]:
+    """Split `timeout_secs.rt` into (name, lane); unknown names raise `ConfigError`."""
+    base, _, lane = name.partition(".")
+    if base not in allowed or bool(lane) != (base in LANE_SETTINGS):
+        raise ConfigError(f"unknown setting {name!r}; known: {', '.join(allowed)}")
+    try:
+        return base, Lane(lane) if lane else None
+    except ValueError as exc:
+        raise ConfigError(f"unknown lane in {name!r}") from exc
+
+
+def _setting_values(
+    pairs: Sequence[str], allowed: Sequence[str], *, unset: bool = False
+) -> dict[str, Any]:
+    """`NAME=VALUE` (or bare NAME to unset) into a `ModelSettings.with_values` mapping."""
+    values: dict[str, Any] = {}
+    for pair in pairs:
+        name, sep, raw = pair.partition("=")
+        if not unset and not sep:
+            raise ConfigError(f"expected NAME=VALUE, got {pair!r}")
+        base, lane = _setting(name.strip(), allowed)
+        value: Any = None
+        if not unset:
+            try:
+                value = orjson.loads(raw)
+            except orjson.JSONDecodeError:
+                value = raw
+        if lane is None:
+            values[base] = value
+        else:
+            values.setdefault(base, {})[lane] = value
+    return values
+
+
+async def _settings(
+    args: argparse.Namespace, config: QueueConfig, store: LiveConfigStore[ModelSettings]
+) -> int:
+    """`settings get | set | unset | reset` on the live per-provider / per-model overrides."""
+    if args.cmd == "reset":
+        _print_json(_dump(await store.reset(actor=_actor(args))))
+        return 0
+    if args.cmd == "get":
+        resolver = SettingsResolver(config, await store.load())
+        if args.model:
+            validate_scope(config, "models", args.model)
+            _print_json({args.model: resolver.describe(args.model)})
+        elif args.provider:
+            validate_scope(config, "providers", args.provider)
+            _print_json({args.provider: resolver.describe_provider(args.provider)})
+        else:
+            _print_json(
+                {
+                    "live": _dump(resolver.live),
+                    "providers": {p: resolver.describe_provider(p) for p in resolver.providers()},
+                    "models": {alias: resolver.describe(alias) for alias in config.models},
+                }
+            )
+        return 0
+    scope: Literal["providers", "models"] = "models" if args.model else "providers"
+    key = args.model or args.provider
+    validate_scope(config, scope, key)
+    allowed = SETTING_NAMES if scope == "models" else PROVIDER_SETTING_NAMES
+    current: ModelSettings = await _load_checked(store)
+    if args.cmd == "set":
+        updated = current.with_values(scope, key, _setting_values(args.values, allowed))
+    elif args.names:
+        updated = current.with_values(scope, key, _setting_values(args.names, allowed, unset=True))
+    else:
+        updated = current.without(scope, key)
+    _print_json(_dump(await store.set(updated, actor=_actor(args))))
     return 0
 
 

@@ -132,6 +132,94 @@ class BreakerTuning(BaseModel):
     cooldown_secs: float = Field(default=15.0, gt=0)
 
 
+LANE_SETTINGS = frozenset({"timeout_secs", "embed_timeout_secs"})
+
+
+class Overrides(BaseModel):
+    """Settings one model alias (or every model of one provider) may override; None = inherit."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_concurrency: int | None = Field(default=None, ge=1)
+    limiter_initial: int | None = Field(default=None, ge=1)
+    bg_share: float | None = Field(default=None, gt=0, le=1)
+    timeout_secs: dict[Lane, float] = Field(default_factory=dict)
+    embed_timeout_secs: dict[Lane, float] = Field(default_factory=dict)
+    attempt_timeout_secs: float | None = Field(default=None, gt=0)
+    throttle_retry_attempts: int | None = Field(default=None, ge=1, le=20)
+    retry_base_secs: float | None = Field(default=None, ge=0)
+    retry_multiplier: float | None = Field(default=None, ge=1)
+    retry_spread: float | None = Field(default=None, ge=1)
+    retry_max_secs: float | None = Field(default=None, gt=0)
+    throttle_retry_max_secs: float | None = Field(default=None, gt=0)
+    breaker_threshold: int | None = Field(default=None, ge=1)
+    breaker_cooldown_secs: float | None = Field(default=None, gt=0)
+
+    @field_validator("timeout_secs", "embed_timeout_secs")
+    @classmethod
+    def _positive(cls, value: dict[Lane, float]) -> dict[Lane, float]:
+        if any(v <= 0 for v in value.values()):
+            raise ValueError(f"lane timeouts must be > 0: {value}")
+        return value
+
+    def get(self, name: str, lane: Lane | None = None) -> Any:
+        """The override of `name` (a lane's entry for lane settings), None when not set."""
+        value = getattr(self, name, None)
+        if name in LANE_SETTINGS and isinstance(value, dict):
+            return value.get(lane)
+        return value
+
+
+class ProviderOverrides(Overrides):
+    """Provider defaults for its models, plus a cap shared by all of them.
+
+    `shared_max_concurrency` bounds the calls in flight across every model alias of the provider
+    and all pods (e.g. one vLLM server hosting three models); each call then holds two slots.
+    """
+
+    shared_max_concurrency: int | None = Field(default=None, ge=1)
+
+
+class ModelSettings(BaseModel):
+    """`{"providers": {name: ProviderOverrides}, "models": {alias: Overrides}}` (live or env)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    providers: dict[str, ProviderOverrides] = Field(default_factory=dict)
+    models: dict[str, Overrides] = Field(default_factory=dict)
+
+    def with_values(
+        self, scope: Literal["providers", "models"], key: str, values: Mapping[str, Any]
+    ) -> ModelSettings:
+        """Copy with `values` merged into one entry; a None value removes that setting."""
+        entries = {k: v.model_dump(exclude_defaults=True) for k, v in getattr(self, scope).items()}
+        entry = dict(entries.get(key, {}))
+        for name, value in values.items():
+            if name in LANE_SETTINGS and isinstance(value, Mapping):
+                lanes = {**entry.get(name, {}), **value}
+                entry[name] = {lane: v for lane, v in lanes.items() if v is not None}
+            elif value is None:
+                entry.pop(name, None)
+            else:
+                entry[name] = value
+        entries[key] = entry
+        return ModelSettings.model_validate(
+            {
+                **self.model_dump(exclude_defaults=True),
+                scope: {k: v for k, v in entries.items() if v},
+            }
+        )
+
+    def without(
+        self, scope: Literal["providers", "models"], key: str, names: list[str] | None = None
+    ) -> ModelSettings:
+        """Copy without the named settings of one entry, or without the whole entry."""
+        if not names:
+            entries = {k: v for k, v in getattr(self, scope).items() if k != key}
+            return self.model_copy(update={scope: entries})
+        return self.with_values(scope, key, dict.fromkeys(names))
+
+
 def _lane_map(default: Mapping[Lane, Any]) -> Any:
     """Field factory for per-lane settings (a fresh dict per instance)."""
     return Field(default_factory=lambda: dict(default))
@@ -195,9 +283,25 @@ class QueueConfig(BaseModel):
     fallback_default: dict[str, Any] = Field(default_factory=dict)
     routing_enabled: bool = False  # build a CanaryRouter on the live routing config
     routing_default: dict[str, Any] = Field(default_factory=dict)
+    # Env layer of per-provider / per-model settings (`LLMQ_SETTINGS`, `ModelSettings` JSON).
+    settings_default: ModelSettings = Field(default_factory=lambda: ModelSettings())
     job_queues: dict[str, str] = Field(default_factory=dict)
     retry_attempts: int = Field(default=3, ge=1, le=10)
     retry_base_secs: float = Field(default=1.0, ge=0)
+    retry_multiplier: float = Field(
+        default=4.0,
+        ge=1,
+        description="Retry n (0-based) sleeps a random time in [base * multiplier^n, that * "
+        "retry_spread]: 1-2.5 s, 4-10 s, 16-30 s with the defaults.",
+    )
+    retry_spread: float = Field(default=2.5, ge=1)
+    retry_max_secs: float = Field(default=30.0, gt=0)
+    throttle_retry_max_secs: float = Field(
+        default=10.0,
+        gt=0,
+        description="Cap of one sleep after a throttle, so `throttle_retry_attempts` tries still "
+        "fit an rt deadline (6 tries sleep at most 1-2.5 + 4-10 + 3 x 10 s).",
+    )
     throttle_retry_attempts: int = Field(
         default=6,
         ge=1,
@@ -340,6 +444,10 @@ class QueueConfig(BaseModel):
             ("CONSUMER_DRAIN_SECS", "drain_secs", float),
             ("RETRY_ATTEMPTS", "retry_attempts", int),
             ("RETRY_BASE_SECS", "retry_base_secs", float),
+            ("RETRY_MULTIPLIER", "retry_multiplier", float),
+            ("RETRY_SPREAD", "retry_spread", float),
+            ("RETRY_MAX_SECS", "retry_max_secs", float),
+            ("THROTTLE_RETRY_MAX_SECS", "throttle_retry_max_secs", float),
             ("THROTTLE_RETRY_ATTEMPTS", "throttle_retry_attempts", int),
             ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
             ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),
@@ -362,6 +470,7 @@ class QueueConfig(BaseModel):
             ("PROVIDERS", "providers"),
             ("FALLBACK_CHAINS", "fallback_default"),
             ("ROUTING_DEFAULT", "routing_default"),
+            ("SETTINGS", "settings_default"),
             ("JOB_QUEUES", "job_queues"),
         ):
             value = get(name)

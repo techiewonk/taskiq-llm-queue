@@ -26,6 +26,7 @@ from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.broker.queue import SQSQueue
 from taskiq_llm_queue.broker.serializer import WireSerializer
 from taskiq_llm_queue.config import Lane
+from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, SettingsResolver
 from taskiq_llm_queue.reliability.breaker import BreakerSettings
 from taskiq_llm_queue.reliability.claims import ClaimSettings
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, LimiterSettings
@@ -93,18 +94,24 @@ class MetricsHooks(QueueHooks, BrokerHooks):
             self.sink.incr(mn.RELEASED_UNKNOWN_TOTAL, float(count), {"queue": queue})
 
 
-def limiter_settings(config: QueueConfig) -> LimiterSettings:
-    """`LimiterSettings` from `QueueConfig.limiter`; per-model starts and caps from the models.
+def limiter_settings(
+    config: QueueConfig, resolver: SettingsResolver | None = None
+) -> LimiterSettings:
+    """`LimiterSettings` from `QueueConfig.limiter` and the effective per-model settings.
 
-    `limiter.initial` / `limiter.max_by_model` (env JSON) win over `limiter_initial` /
-    `max_concurrency` of the same alias.
+    Per alias: start (`limiter_initial`), cap (`max_concurrency`) and `bg_share` from the
+    resolver's six layers (README "Settings"); each provider's shared cap becomes a fixed
+    limit of the `@<provider>` limiter alias (start = cap).
     """
+    resolver = resolver or SettingsResolver(config)
     tuning = config.limiter
-    initial = {alias: m.limiter_initial for alias, m in config.models.items()}
-    initial.update(tuning.initial)
+    aliases = list(config.models)
+    shared = resolver.shared_caps()
+    initial = {a: resolver.value(a, "limiter_initial") for a in aliases}
     return LimiterSettings(
-        initial=initial,
-        max_by_model=model_caps(config),
+        initial={**initial, **shared},
+        max_by_model={**resolver.model_caps(), **shared},
+        bg_share_by_model={a: resolver.value(a, "bg_share") for a in aliases},
         min_limit=tuning.min_limit,
         max_limit=tuning.max_limit,
         ramp_window=tuning.ramp_window,
@@ -118,19 +125,30 @@ def limiter_settings(config: QueueConfig) -> LimiterSettings:
     )
 
 
-def model_caps(config: QueueConfig) -> dict[str, int]:
-    """Hard per-alias concurrency caps: `max_concurrency`, overridden by `limiter.max_by_model`.
+def model_caps(config: QueueConfig, resolver: SettingsResolver | None = None) -> dict[str, int]:
+    """Hard per-alias concurrency caps (effective `max_concurrency`).
 
     Feeds the shared limiter and the per-pod local caps used while Valkey is down.
     """
-    caps = {a: m.max_concurrency for a, m in config.models.items() if m.max_concurrency}
-    return {**caps, **config.limiter.max_by_model}
+    return (resolver or SettingsResolver(config)).model_caps()
 
 
 def breaker_settings(config: QueueConfig) -> BreakerSettings:
     """`BreakerSettings` from `QueueConfig.breaker`."""
     b = config.breaker
     return BreakerSettings(b.threshold, b.window_secs, b.cooldown_secs)
+
+
+def breaker_by_model(resolver: SettingsResolver) -> dict[str, BreakerSettings]:
+    """Per-alias breaker settings whose threshold or cooldown differ from the global ones."""
+    base = breaker_settings(resolver.config)
+    out: dict[str, BreakerSettings] = {}
+    for alias in resolver.config.models:
+        threshold = resolver.value(alias, "breaker_threshold")
+        cooldown = resolver.value(alias, "breaker_cooldown_secs")
+        if (threshold, cooldown) != (base.threshold, base.cooldown_secs):
+            out[alias] = BreakerSettings(threshold, base.window_secs, cooldown)
+    return out
 
 
 def claim_settings(config: QueueConfig) -> ClaimSettings:
@@ -204,16 +222,19 @@ def receive_budget(
     """DS4 budget for one model's queues: the best limiter headroom across its targets.
 
     Headroom is net of this pod's callers already waiting for a slot of that target, so a full
-    bucket (e.g. `max_concurrency`) leaves the backlog in SQS instead of in waiting tasks.
+    bucket (e.g. `max_concurrency`, or the provider's shared cap) leaves the backlog in SQS.
     Returns 0 while Valkey is down or unreachable, so nothing is received that can't run.
     """
 
     async def budget(queue: SQSQueue) -> int:
         if failover is not None and failover.redis_down():
             return 0
-        share = limiter.settings.share_for(lanes.get(queue.name, Lane.BG))
+        share = limiter.settings.share_for(lanes.get(queue.name, Lane.BG), alias)
+        shared = f"{SHARED_PREFIX}{model.provider}"
+        has_shared = shared in (limiter.settings.max_by_model or {})
         try:  # every target in one pipelined round trip, on each poll
             states = await limiter.states(alias, model.targets)
+            pool = await limiter.states(shared, [SHARED_TARGET]) if has_shared else []
         except RedisError as exc:
             if failover is not None:
                 failover.report_redis_failure(exc)
@@ -225,6 +246,8 @@ def receive_budget(
             ),
             default=0,
         )
+        if pool:  # the provider's shared cap bounds every model of that provider
+            best = min(best, pool[0].headroom() - limiter.waiting(shared, SHARED_TARGET))
         return max(0, best)
 
     return budget

@@ -274,3 +274,68 @@ def test_queues_lists_counts(
     rows = json.loads(run(env, capsys, "queues"))
     (row,) = [r for r in rows if r["queue"] == "jobs-ingest"]
     assert {"visible", "in_flight", "delayed"} <= set(row)
+
+
+def test_settings_set_get_unset_reset_with_sources_and_audit(
+    cli_env: dict[str, str],
+    prefix: str,
+    sync_valkey: redis.Redis,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`settings` edits the live layer: values resolve with their source, every change is
+    audited, `unset` falls back to env / defaults, and `reset` deletes the key."""
+    env = {**cli_env, "LLMQ_ATTEMPT_TIMEOUT_SECS": "100"}
+    run(env, capsys, "settings", "set", "--provider", "openai", "attempt_timeout_secs=60")
+    run(
+        env,
+        capsys,
+        "settings",
+        "set",
+        "--model",
+        "gpt20b",
+        "max_concurrency=5",
+        "timeout_secs.rt=45",
+    )
+    run(env, capsys, "settings", "set", "--provider", "openai", "shared_max_concurrency=8")
+    got = json.loads(run(env, capsys, "settings", "get", "--model", "gpt20b"))["gpt20b"]
+    assert got["max_concurrency"] == {"value": 5, "source": "live:model"}
+    assert got["timeout_secs.rt"] == {"value": 45.0, "source": "live:model"}
+    assert got["timeout_secs.bg"] == {"value": 300.0, "source": "default"}
+    assert got["attempt_timeout_secs"] == {"value": 60.0, "source": "live:provider"}
+    provider = json.loads(run(env, capsys, "settings", "get", "--provider", "openai"))["openai"]
+    assert provider["shared_max_concurrency"] == 8
+    assert provider["models"] == ["gpt120b", "gpt20b"]
+    run(env, capsys, "settings", "unset", "--provider", "openai", "attempt_timeout_secs")
+    got = json.loads(run(env, capsys, "settings", "get", "--model", "gpt20b"))["gpt20b"]
+    assert got["attempt_timeout_secs"] == {"value": 100.0, "source": "env"}
+    whole = json.loads(run(env, capsys, "settings", "get"))
+    assert set(whole) == {"live", "providers", "models"}
+    rows = audit(sync_valkey, prefix)
+    assert len(rows) == 4
+    assert {r["key"] for r in rows} == {KeySpace(prefix).model_settings}
+    run(env, capsys, "settings", "reset")
+    assert sync_valkey.get(KeySpace(prefix).model_settings) is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("settings", "set", "--model", "nope", "max_concurrency=5"),
+        ("settings", "set", "--provider", "bedrock", "max_concurrency=5"),
+        ("settings", "set", "--model", "gpt20b", "max_concurrency=0"),
+        ("settings", "set", "--model", "gpt20b", "shared_max_concurrency=3"),
+        ("settings", "set", "--model", "gpt20b", "timeout_secs.fast=3"),
+    ],
+)
+def test_settings_rejects_bad_input_without_writing(
+    cli_env: dict[str, str],
+    prefix: str,
+    sync_valkey: redis.Redis,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+) -> None:
+    """Unknown alias / provider, invalid value or name: exit 1 and nothing stored or audited."""
+    assert main(["--actor", "tester", *argv], environ=cli_env) == 1
+    assert "error:" in capsys.readouterr().err
+    assert sync_valkey.get(KeySpace(prefix).model_settings) is None
+    assert audit(sync_valkey, prefix) == []

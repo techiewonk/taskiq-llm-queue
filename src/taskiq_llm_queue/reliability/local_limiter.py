@@ -46,7 +46,7 @@ class LocalLimiter:
         if cap < 1:
             raise ValueError("cap must be >= 1")
         self.cap = cap
-        self._model_caps = dict(model_caps or {})
+        self.model_caps = dict(model_caps or {})
         self._bg_share = bg_share
         self._pause_secs = pause_secs
         self._lease_ttl = lease_ttl_secs
@@ -72,7 +72,7 @@ class LocalLimiter:
         if not self.gate(model, target).is_open():
             return None
         share = 1.0 if lane is Lane.RT else self._bg_share
-        allowed = max(1, int(min(self.cap, self._model_caps.get(model, self.cap)) * share))
+        allowed = max(1, int(min(self.cap, self.model_caps.get(model, self.cap)) * share))
         with self._lock:
             held = self._held.setdefault((model, target), set())
             if len(held) >= allowed:

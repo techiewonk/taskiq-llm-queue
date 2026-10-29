@@ -25,6 +25,7 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
 from taskiq_llm_queue.errors import ConfigError, ErrorInfo, ErrorKind, QueueUnavailable
+from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, Backoff, SettingsResolver
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.classify import is_target_error
 from taskiq_llm_queue.reliability import _lua
@@ -51,8 +52,6 @@ RT_ACQUIRE_SECS = 2.0
 # S35: one 2 s wait failed an rt call with no fallback during a burst; rt walks the chain this
 # many times (each step waiting 2 s) before giving up with `no_capacity`.
 RT_CAPACITY_PASSES = 3
-# Caps one backoff sleep; the deadline caps the total (DS10).
-MAX_BACKOFF_SECS = 20.0
 # DS4/DS10: a queued bg/bulk call waits this long per step for a slot, then the message is
 # released with a delay instead of holding a worker slot until its deadline.
 QUEUED_ACQUIRE_SECS = 15.0
@@ -141,10 +140,11 @@ class _Stopped(Exception):
 class CoreDeps:
     """Everything `execute_job` needs, injected so tests can pass fakes and clocks.
 
-    `providers(alias)` returns the provider for a model alias; `fallback()` returns the live
-    fallback config without I/O. `claims`, `breaker`, `results` and `redis` may be None on the
-    `direct` path or while Valkey is down. `leases` holds this pod's in-flight leases for the
-    pod heartbeat to renew (DS11); every path on a pod shares one set.
+    `providers(alias)` returns the provider for a model alias; `fallback()` and `settings()`
+    return the live fallback config and effective model settings without I/O. `claims`,
+    `breaker`, `results` and `redis` may be None on the `direct` path or while Valkey is down.
+    `leases` holds this pod's in-flight leases for the pod heartbeat to renew (DS11); every
+    path on a pod shares one set.
     """
 
     config: QueueConfig
@@ -156,6 +156,8 @@ class CoreDeps:
     results: ResultStore | None = None
     redis: Redis | None = None
     fallback: Callable[[], FallbackConfig] = FallbackConfig
+    # Effective per-provider / per-model settings (live reloads swap it); None = config only.
+    settings: Callable[[], SettingsResolver] | None = None
     worker: str = ""
     hooks: QueueHooks = field(default_factory=QueueHooks)
     clock: Callable[[], float] = time.time
@@ -209,15 +211,27 @@ def error_reply(
     )
 
 
-def backoff_secs(attempt: int, base_secs: float, rng: random.Random, hint: float | None) -> float:
-    """Sleep before retry `attempt` (0-based): `base * 2^attempt` + full jitter, or `Retry-After`.
+def backoff_secs(
+    attempt: int,
+    curve: Backoff,
+    rng: random.Random,
+    hint: float | None,
+    *,
+    throttled: bool = False,
+) -> float:
+    """Sleep before retry `attempt` (0-based): random in `curve`'s window, or `Retry-After`.
 
-    A provider's `Retry-After` hint wins when larger; the result is capped at 20 s.
+    The window is [base * multiplier^n, that * spread], capped at `max_secs` (`throttle_max_secs`
+    after a throttle); a larger provider `Retry-After` hint wins up to `max_secs`.
     """
-    delay = base_secs * float(2**attempt) + rng.uniform(0, base_secs)
+    low = curve.base_secs * curve.multiplier ** min(attempt, 32)
+    delay = min(
+        rng.uniform(low, low * curve.spread),
+        curve.throttle_max_secs if throttled else curve.max_secs,
+    )
     if hint is not None:
-        delay = max(delay, hint)
-    return min(delay, MAX_BACKOFF_SECS)
+        delay = max(delay, min(hint, curve.max_secs))
+    return delay
 
 
 def params_for_step(op: Op, params: Mapping[str, Any], model_id: str) -> dict[str, Any]:
@@ -518,7 +532,7 @@ async def _step_usable(step: FallbackStep, lane: Lane, deps: CoreDeps) -> bool:
     try:
         if step.require_headroom and isinstance(deps.limiter, AdaptiveLimiter):
             state = await deps.limiter.state(step.alias, step.target)
-            if state.headroom(deps.limiter.settings.share_for(lane)) <= 0:
+            if state.headroom(deps.limiter.settings.share_for(lane, step.alias)) <= 0:
                 return False
         if deps.breaker is not None:
             return await deps.breaker.allow(step.alias, step.target)
@@ -579,25 +593,49 @@ async def _take_slot(
     check_cancel: bool,
     bounded: bool,
     fresh_claim: bool = False,
-) -> Lease | None:
-    """Acquire one slot; cancel and deadline are checked before and right after (DS14).
+    shared_cap: int | None = None,
+) -> list[Lease] | None:
+    """Acquire the step's slot (and its provider's shared slot); cancel/deadline checked (DS14).
 
-    `fresh_claim`: the claim script checked the cancel flag just now, so skip the first check.
+    With `shared_cap` the call also holds a slot of `{m:@<provider>:shared}`, taken after the
+    model slot within the same wait; failing that, the model slot is returned. `fresh_claim`:
+    the claim script checked the cancel flag just now, so skip the first check.
     """
     await _check_live(envelope, deps, check_cancel and not fresh_claim)
     wait = _acquire_wait(envelope, deps, bounded=bounded)
     abort = _cancel_probe(envelope, deps) if check_cancel else None
+    started = deps.clock()
     lease = await deps.limiter.acquire(
         step.alias, step.target, envelope.lane, wait, should_abort=abort
     )
     if lease is None:
         return None
+    leases = [lease]
     try:
+        if shared_cap is not None:
+            provider = _provider(deps, step.alias)
+            remaining = max(0.0, wait - (deps.clock() - started))
+            shared = await deps.limiter.acquire(
+                f"{SHARED_PREFIX}{provider}", SHARED_TARGET, Lane.RT, remaining, should_abort=abort
+            )
+            if shared is None:
+                await _release(deps, lease, throttled=False)
+                return None
+            leases.append(shared)
         await _check_live(envelope, deps, check_cancel)
     except BaseException:
-        await _release(deps, lease, throttled=False)
+        for held in leases:
+            await _release(deps, held, throttled=False)
         raise
-    return lease
+    return leases
+
+
+def _provider(deps: CoreDeps, alias: str) -> str:
+    return deps.config.models[alias].provider
+
+
+def _resolver(deps: CoreDeps) -> SettingsResolver:
+    return deps.settings() if deps.settings is not None else SettingsResolver(deps.config)
 
 
 def _cancel_probe(envelope: Envelope, deps: CoreDeps) -> Callable[[], Awaitable[bool]] | None:
@@ -636,6 +674,7 @@ async def run_call(
     as does a fatal error about the target itself (`is_target_error`, e.g. model not in region).
     """
     config = deps.config
+    settings = _resolver(deps)
     steps = resolve_fallback(
         config, envelope.model, policy=envelope.fallback, op=envelope.op, live=deps.fallback()
     )
@@ -660,33 +699,36 @@ async def run_call(
             provider = deps.providers(step.alias)
             call_params = params_for_step(envelope.op, params, model_cfg.model_id)
             budget = config.retry_attempts
+            attempt_timeout = settings.value(step.alias, "attempt_timeout_secs")
+            shared_cap = settings.shared_cap(_provider(deps, step.alias))
             for attempt in itertools.count():
                 if attempt >= budget:
                     break
-                lease = await _take_slot(
+                leases = await _take_slot(
                     envelope,
                     step,
                     deps,
                     check_cancel=check_cancel,
                     bounded=requeue,
                     fresh_claim=fresh_claim,
+                    shared_cap=shared_cap,
                 )
                 fresh_claim = False
-                if lease is None:
+                if leases is None:
                     last, last_message = (
                         ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"),
                         "no capacity",
                     )
                     break  # DS13: next step
                 progress.attempts += 1
-                deps.leases.add(lease)
+                deps.leases.update(leases)
                 info: ErrorInfo | None = None
                 target_error = False
                 # One cap for the attempt timeout and the deadline: no extra task, unlike
                 # wait_for, and `expired()` tells it apart from a provider's own timeout.
                 remaining = envelope.deadline_at - deps.clock()
-                by_deadline = config.attempt_timeout_secs >= remaining
-                cap = asyncio.timeout(max(0.1, min(config.attempt_timeout_secs, remaining)))
+                by_deadline = attempt_timeout >= remaining
+                cap = asyncio.timeout(max(0.1, min(attempt_timeout, remaining)))
                 t0 = time.monotonic()
                 try:
                     async with cap:
@@ -696,17 +738,17 @@ async def run_call(
                 except Exception as exc:
                     if cap.expired() and not by_deadline:  # S39: a hung target, not the call
                         info = ErrorInfo(ErrorKind.RETRYABLE, "attempt_timeout")
-                        last_message = f"attempt timed out after {config.attempt_timeout_secs}s"
+                        last_message = f"attempt timed out after {attempt_timeout}s"
                     else:
                         info = _classify(provider, exc)
                         target_error = is_target_error(exc, info)
                         last_message = _attempt_message(exc, info)
                     last = info
                 finally:
-                    deps.leases.discard(lease)
-                    await _release(
-                        deps, lease, throttled=info is not None and info.kind is ErrorKind.THROTTLE
-                    )
+                    throttled = info is not None and info.kind is ErrorKind.THROTTLE
+                    deps.leases.difference_update(leases)
+                    for index_lease, held in enumerate(leases):  # the shared slot never learns
+                        await _release(deps, held, throttled=throttled and index_lease == 0)
                 secs = time.monotonic() - t0
                 kind = info.kind if info else "ok"
                 safe_hook(deps.hooks.on_attempt, step.alias, step.target, kind, secs)
@@ -758,7 +800,7 @@ async def run_call(
                     await _record(deps, step, ok=None)
                     # S35b: a random 30 % throttle storm failed calls after 3 tries (2.7 %);
                     # a throttled step gets more tries, each after a backoff without a slot.
-                    budget = max(budget, config.throttle_retry_attempts)
+                    budget = max(budget, settings.value(step.alias, "throttle_retry_attempts"))
                 if cap.expired():
                     if by_deadline:  # the call's deadline cut it off: expired, not a provider error
                         raise _Stopped(ClaimState.EXPIRED)
@@ -766,7 +808,11 @@ async def run_call(
                         break
                 if attempt + 1 < budget:
                     delay = backoff_secs(
-                        attempt, config.retry_base_secs, deps.rng, info.retry_after_secs
+                        attempt,
+                        settings.backoff(step.alias),
+                        deps.rng,
+                        info.retry_after_secs,
+                        throttled=info.kind is ErrorKind.THROTTLE,
                     )
                     if deps.clock() + delay >= envelope.deadline_at:
                         break

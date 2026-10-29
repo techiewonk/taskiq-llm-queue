@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import math
 import threading
 import time
@@ -27,7 +28,7 @@ from taskiq_llm_queue import metrics_names as mn
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
 from taskiq_llm_queue.broker.events import BrokerHooks
-from taskiq_llm_queue.config import Lane, create_redis, create_sync_redis
+from taskiq_llm_queue.config import Lane, ModelSettings, create_redis, create_sync_redis
 from taskiq_llm_queue.context import current_context
 from taskiq_llm_queue.core import CoreDeps, InfraError, JobResult, execute_job
 from taskiq_llm_queue.envelope import (
@@ -56,6 +57,7 @@ from taskiq_llm_queue.lifecycle import (
     PodHeartbeat,
     PodRegistry,
     Workers,
+    breaker_by_model,
     breaker_settings,
     build_brokers,
     claim_settings,
@@ -65,6 +67,7 @@ from taskiq_llm_queue.lifecycle import (
     queue_name,
 )
 from taskiq_llm_queue.metrics import MetricsSink, NullMetrics
+from taskiq_llm_queue.model_settings import SettingsResolver, model_settings_store
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.embeddings import (
     batches,
@@ -177,6 +180,7 @@ class _Started:
     claims: RedisClaimStore
     breaker: CircuitBreaker
     fallback: LiveConfigStore[FallbackConfig]
+    model_settings: LiveConfigStore[ModelSettings]
     dispatcher: ResultDispatcher
     brokers: BrokerSet
     runtime: WorkerRuntime
@@ -210,6 +214,8 @@ class LLMQueue:
     ) -> None:
         """Validate providers (boot-time `ConfigError`); no I/O until `start()`."""
         self.config = config
+        # Effective per-provider / per-model settings; swapped when the live layer changes.
+        self.settings = SettingsResolver(config)
         self.pod_id = pod_id or f"pod-{uuid.uuid4().hex[:8]}"
         self.metrics: MetricsSink = metrics or NullMetrics()
         self.router = router
@@ -291,6 +297,39 @@ class LLMQueue:
                 labels = {"model": model, "target": target}
                 safe_hook(self.metrics.gauge, mn.LIMIT, float(limit), labels)
 
+    def _apply_settings(
+        self, live: ModelSettings, limiter: AdaptiveLimiter, breaker: CircuitBreaker
+    ) -> None:
+        """Make `live` effective: limiter caps / starts / shares, breaker, local caps (§7a).
+
+        Settings the limiter rejects keep the previous ones (logged), never a failing call.
+        """
+        resolver = SettingsResolver(self.config, live)
+        try:
+            limits = limiter_settings(self.config, resolver)
+        except ValueError as exc:
+            logger.warning("model_settings_rejected", error=str(exc))
+            return
+        self.settings = resolver
+        limiter.settings = limits
+        breaker.by_model = breaker_by_model(resolver)
+        caps = {**resolver.model_caps(), **resolver.shared_caps()}
+        self._local_limiter.set_model_caps(caps)
+        if isinstance(self.failover, FailoverState):
+            self.failover.settings = dataclasses.replace(self.failover.settings, model_caps=caps)
+        logger.info(
+            "model_settings_applied", models=sorted(live.models), providers=sorted(live.providers)
+        )
+
+    async def _watch_settings(self, state: _Started) -> None:
+        """Reload the live settings every `cfg_reload_secs`; apply them when they change."""
+        while True:
+            await asyncio.sleep(self.config.cfg_reload_secs)
+            before = state.model_settings.current
+            live = await state.model_settings.load()
+            if live != before:
+                self._apply_settings(live, state.limiter, state.breaker)
+
     async def start(self, mode: Mode = "both") -> None:
         """Connect and start: `send` (dispatcher), `work` (receivers) or `both`; idempotent."""
         if self._state is not None:
@@ -309,6 +348,7 @@ class LLMQueue:
         breaker = CircuitBreaker(client, self.keys, breaker_settings(config))
         default_chains = FallbackConfig.model_validate(config.fallback_default)
         fallback = fallback_store(client, self.keys, default_chains)
+        live_settings = model_settings_store(client, self.keys)
         dispatcher = ResultDispatcher(
             results,
             redis=client,
@@ -330,6 +370,7 @@ class LLMQueue:
             results=results,
             redis=client,
             fallback=lambda: fallback.current,
+            settings=lambda: self.settings,
             worker=self.pod_id,
             hooks=self.hooks,
             leases=self._leases,
@@ -356,6 +397,8 @@ class LLMQueue:
                 await broker.startup()
                 started.append(broker)
             await fallback.load()
+            await live_settings.load()
+            self._apply_settings(live_settings.current, limiter, breaker)
         except BaseException:
             for broker in started:
                 with contextlib.suppress(Exception):
@@ -375,6 +418,7 @@ class LLMQueue:
             claims,
             breaker,
             fallback,
+            live_settings,
             dispatcher,
             brokers,
             runtime,
@@ -387,6 +431,7 @@ class LLMQueue:
         )
         state.tasks.append(asyncio.create_task(heartbeat.run(), name="llmq-pod-heartbeat"))
         state.tasks.append(asyncio.create_task(self._watch_limits(limiter), name="llmq-limits"))
+        state.tasks.append(asyncio.create_task(self._watch_settings(state), name="llmq-settings"))
         if self.router is None and config.routing_enabled:
             default = RoutingConfig.model_validate(config.routing_default)
             self._own_router = CanaryRouter(
@@ -779,9 +824,11 @@ class LLMQueue:
         self.config.resolve(model)  # unknown alias / target → ConfigError before anything runs
         ctx = current_context()
         call_lane = Lane(lane) if lane is not None else ctx.lane
-        waits = self.config.embed_timeout_secs if embed else self.config.timeout_secs
         now = time.time()
-        deadline = now + (timeout_secs if timeout_secs is not None else waits[call_lane])
+        if timeout_secs is None:
+            name = "embed_timeout_secs" if embed else "timeout_secs"
+            timeout_secs = self.settings.value(model, name, call_lane)
+        deadline = now + timeout_secs
         if deadline_at is not None:
             deadline = min(deadline, deadline_at)
         return Envelope(
@@ -988,6 +1035,7 @@ class LLMQueue:
                 keys=self.keys,
                 providers=self.registry.for_model,
                 limiter=self._local_limiter,
+                settings=lambda: self.settings,
                 worker=f"direct:{self.pod_id}",
                 hooks=self.hooks,
             )
@@ -1000,6 +1048,7 @@ class LLMQueue:
             breaker=state.breaker,
             redis=state.redis,
             fallback=lambda: state.fallback.current,
+            settings=lambda: self.settings,
             worker=f"direct:{self.pod_id}",
             hooks=self.hooks,
             leases=self._leases,
@@ -1120,6 +1169,10 @@ class _LocalLimiters:
             model_caps=model_caps(config),
         )
         self._issued: dict[str, LocalLimiter] = {}
+
+    def set_model_caps(self, caps: Mapping[str, int]) -> None:
+        """New per-alias caps for the fallback local limiter (live settings changed)."""
+        self._fallback.model_caps = dict(caps)
 
     def _for(self, model: str, target: str) -> LocalLimiter:
         factory = getattr(self._failover, "local_limiter", None)
@@ -1246,7 +1299,9 @@ class _SyncRunner:
         if self._redis is None:
             self._redis = create_sync_redis(owner.config, client_name=owner._redis_name())
         return _SyncLimiter(
-            SyncAdaptiveLimiter(self._redis, owner.keys, limiter_settings(owner.config))
+            SyncAdaptiveLimiter(
+                self._redis, owner.keys, limiter_settings(owner.config, owner.settings)
+            )
         )
 
     async def execute(self, envelope: Envelope) -> LLMReply:
@@ -1256,6 +1311,7 @@ class _SyncRunner:
             keys=owner.keys,
             providers=self._registry.for_model,
             limiter=self._limiter(),
+            settings=lambda: owner.settings,
             worker=f"sync:{owner.pod_id}",
             hooks=owner.hooks,
             leases=owner._leases,  # renewed by the pod heartbeat (DS11)

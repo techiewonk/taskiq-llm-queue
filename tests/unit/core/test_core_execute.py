@@ -32,8 +32,8 @@ from taskiq_llm_queue import (
     QueueConfig,
     Target,
 )
+from taskiq_llm_queue.config import ModelSettings
 from taskiq_llm_queue.core import (
-    MAX_BACKOFF_SECS,
     RT_CAPACITY_PASSES,
     CoreDeps,
     InfraError,
@@ -41,6 +41,7 @@ from taskiq_llm_queue.core import (
     execute_job,
 )
 from taskiq_llm_queue.errors import QueueUnavailable
+from taskiq_llm_queue.model_settings import Backoff, SettingsResolver
 from taskiq_llm_queue.reliability.claims import FailureCount
 from taskiq_llm_queue.reliability.fallback import FallbackConfig
 
@@ -437,13 +438,23 @@ async def test_params_by_reference_are_loaded() -> None:
     assert missing.error["type"] == "params_missing"
 
 
-def test_backoff_grows_and_honours_retry_after() -> None:
-    """Exponential with jitter, raised to Retry-After, capped at MAX_BACKOFF_SECS."""
+def test_backoff_windows_cap_and_retry_after() -> None:
+    """Default curve: 1-2.5 s, 4-10 s, 16-30 s, then the 30 s cap; throttles cap at 10 s.
+
+    A provider Retry-After wins when larger, up to `max_secs`; a zero base never sleeps.
+    """
     rng = random.Random(1)
-    assert 1 <= backoff_secs(0, 1.0, rng, None) < 2
-    assert 4 <= backoff_secs(2, 1.0, rng, None) < 5
-    assert backoff_secs(0, 1.0, rng, 7.0) == 7.0
-    assert backoff_secs(10, 1.0, rng, None) == MAX_BACKOFF_SECS
+    curve = Backoff()
+    for attempt, (low, high) in enumerate([(1, 2.5), (4, 10), (16, 30), (30, 30)]):
+        delays = [backoff_secs(attempt, curve, rng, None) for _ in range(200)]
+        assert low <= min(delays)
+        assert max(delays) <= high
+    assert all(backoff_secs(2, curve, rng, None, throttled=True) == 10 for _ in range(20))
+    assert backoff_secs(0, curve, rng, 7.0) == 7.0
+    assert backoff_secs(0, curve, rng, 99.0) == 30.0
+    assert backoff_secs(5, Backoff(base_secs=0), rng, None) == 0
+    custom = Backoff(base_secs=0.5, multiplier=3, spread=2, max_secs=60)
+    assert 4.5 <= backoff_secs(2, custom, rng, None) <= 9
 
 
 # ---------------------------------------------------------------- reliability regressions
@@ -841,3 +852,85 @@ def test_attempt_and_provider_timeouts_read_from_env() -> None:
     ) == (20.0, 25.0, 2.0)
     default = QueueConfig()
     assert default.attempt_timeout_secs < default.provider_read_timeout_secs
+
+
+# ---------------------------------------------------------------- live per-model settings
+
+
+def _live(world: World, **settings: Any) -> None:
+    resolver = SettingsResolver(world.deps.config, ModelSettings.model_validate(settings))
+    world.deps.settings = lambda: resolver
+
+
+async def test_live_attempt_timeout_override_applies_per_step(world: World) -> None:
+    """A live `attempt_timeout_secs` of the alias cuts a hung target (config says 180 s)."""
+    provider = HangOn("primary")
+    world.deps.providers = lambda alias: provider
+    _live(world, models={"big": {"attempt_timeout_secs": 0.2}})
+    t0 = time.monotonic()
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert time.monotonic() - t0 < 2
+    assert reply is not None
+    assert reply.ok
+    assert reply.meta.served_target == "apac"
+
+
+async def test_live_model_throttle_retries_beat_provider_value(world: World) -> None:
+    """Live model `throttle_retry_attempts` (8) wins over the live provider value (2)."""
+    throttle = FakeError(ErrorKind.THROTTLE, "ThrottlingException")
+    world.provider.script["primary"] = [throttle] * 7
+    _live(
+        world,
+        providers={"bedrock": {"throttle_retry_attempts": 2}},
+        models={"big": {"throttle_retry_attempts": 8}},
+    )
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert (reply.meta.served_target, reply.meta.attempts) == ("primary", 8)
+    world.provider.script["primary"] = [throttle] * 7
+    _live(world, providers={"bedrock": {"throttle_retry_attempts": 2}})
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert (reply.meta.served_target, reply.meta.attempts) == ("apac", 4)  # 3 = retry_attempts
+
+
+async def test_throttle_sleep_is_capped_by_throttle_retry_max(world: World) -> None:
+    """After a throttle one sleep is at most `throttle_retry_max_secs` (rt deadlines hold)."""
+    world.deps.config = config(retry_base_secs=1.0, throttle_retry_max_secs=0.5)
+    throttle = FakeError(ErrorKind.THROTTLE, "ThrottlingException")
+    world.provider.script["primary"] = [throttle] * 3
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert world.sleeps == [0.5, 0.5, 0.5]
+
+
+async def test_shared_provider_slot_is_held_and_never_learns(world: World) -> None:
+    """With a provider cap each attempt also holds `@bedrock/shared`; a throttle is fed only
+    to the model's limit, and both slots are back after the call."""
+    throttle = FakeError(ErrorKind.THROTTLE, "ThrottlingException")
+    world.provider.script["primary"] = [throttle]
+    _live(world, providers={"bedrock": {"shared_max_concurrency": 4}})
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    assert world.limiter.held == 0
+    assert world.limiter.events[:4] == [
+        ("acquire", "big", "primary", False),
+        ("acquire", "@bedrock", "shared", False),
+        ("release", "big", "primary", True),
+        ("release", "@bedrock", "shared", False),
+    ]
+    assert world.limiter.waits[1] <= world.limiter.waits[0]
+
+
+async def test_full_shared_provider_slot_returns_the_model_slot(world: World) -> None:
+    """No shared slot: the model slot is handed back and the step counts as no capacity."""
+    world.limiter.deny = {("@bedrock", "shared")}
+    _live(world, providers={"bedrock": {"shared_max_concurrency": 1}})
+    reply = (await execute_job(envelope(lane=Lane.BG), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert reply.error["type"] == "no_capacity"
+    assert world.limiter.held == 0
+    assert world.provider.calls == []

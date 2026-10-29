@@ -72,6 +72,11 @@ class KeySpace:
         return f"{self.prefix}:{{cfg}}:fallback"
 
     @property
+    def model_settings(self) -> str:
+        """Live per-provider / per-model settings (JSON string, `ModelSettings`)."""
+        return f"{self.prefix}:{{cfg}}:models"
+
+    @property
     def audit(self) -> str:
         """Audit stream of config changes (who, before, after)."""
         return f"{self.prefix}:{{cfg}}:audit"

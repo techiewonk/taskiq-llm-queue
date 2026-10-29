@@ -48,6 +48,9 @@ OPENAI_KEY_ENV = "SCN_OPENAI_KEY"
 HARNESS_ENV: dict[str, Any] = {
     "sqs_wait_time_secs": 2,
     "retry_base_secs": 0.2,
+    # The retry caps scale with the base (x0.2 of 30 s / 10 s), so the curve keeps its shape.
+    "retry_max_secs": 6.0,
+    "throttle_retry_max_secs": 2.0,
     "drain_secs": 5.0,
     "cfg_reload_secs": 2.0,
     "result_dispatch_ms": {"rt": 50, "bg": 100, "bulk": 200},

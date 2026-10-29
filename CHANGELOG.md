@@ -9,6 +9,16 @@ a minor release may break the public API, with a deprecation announced one minor
 ### Added
 - `ModelConfig.max_concurrency` (env `LLMQ_AC_MAX_BY_MODEL`, JSON `{"alias": N}`): a hard cluster-wide cap on calls in flight per model alias and target. The adaptive limiter still learns and cuts below it but never grows past it. Start limits above the cap are clamped (logged once), and a limit learned before the cap was set is clamped on next use. The cap also bounds the sync `direct` path (same Lua) and the per-pod local caps used while Valkey is down. Scenario S53 checks it: 2,000 queued, peak provider concurrency exactly 10.
 - The receive budget subtracts the pod's own callers already waiting for a limiter slot, so a full bucket leaves the backlog in SQS.
+- Settings per provider and per model, live on every pod without a restart (`model_settings.py`, README "Settings per provider and model"): `max_concurrency`, `limiter_initial`, `bg_share`, lane timeouts, `attempt_timeout_secs`, `throttle_retry_attempts`, the retry curve and breaker threshold/cooldown resolve through six layers (live model > live provider > env model > env provider > env global > default). Env layers come from the new `LLMQ_SETTINGS` JSON; live layers from Valkey `P:{cfg}:models`, validated, audited and reloaded every `cfg_reload_secs`.
+- `shared_max_concurrency` on a provider: one bucket across all its models and pods (limiter key `{m:@<provider>:shared}`); each call holds its model slot and the shared slot. Scenario S55: shared cap 8 over two models, combined peak exactly 8, 600/600 OK.
+- `llm-queue settings get [--model M | --provider P] | set | unset | reset`; `get` shows every value with its source. Scenario S54: a live `max_concurrency` cut from 20 to 5 mid-run reached all 3 workers within one reload, 900/900 OK.
+- Retry curve knobs `LLMQ_RETRY_MULTIPLIER` (4), `LLMQ_RETRY_SPREAD` (2.5), `LLMQ_RETRY_MAX_SECS` (30) and `LLMQ_THROTTLE_RETRY_MAX_SECS` (10).
+
+### Changed
+- Retry backoff: retry n sleeps a random time in `[base * multiplier^n, that * spread]`, i.e. 1-2.5 s, 4-10 s, 16-30 s, then 30 s (was `base * 2^n + uniform(0, base)`, capped at 20 s). After a throttle one sleep is capped at 10 s. `core.MAX_BACKOFF_SECS` is gone; `backoff_secs` takes a `Backoff` curve.
+
+### Removed
+- The old `_S` / suffix-less env spellings (`LLMQ_CONSUMER_DRAIN_S`, `LLMQ_RETRY_BASE_S`, `LLMQ_SQS_WAIT_TIME_S`, `LLMQ_TIMEOUT_RT`, ...) are no longer read; the README lists each with its `_SECS` name.
 
 ## [0.1.0a1] - 2026-10-29
 
@@ -20,7 +30,7 @@ First pre-release. Everything listed below is new.
 - `invoke_model(model, body, *, content_type=, accept=)` replaces guessing from a `"body"` key.
 - Cancellation raises `LLMQueueCancelled`.
 - `__all__` lists only the client surface; wire and plumbing names import from their submodules.
-- `aws_region` defaults to `None`; `redis_password` is a `SecretStr`; `_SECS` env names (the old `_S` spellings are no longer read).
+- `aws_region` defaults to `None`; `redis_password` is a `SecretStr`; `_SECS` env names (old `_S` names warn once).
 - Redis keys are hash-tagged for cluster mode (key schema 2); ids are hashed with keyed BLAKE2b (`LLMQ_ID_HASH_SALT`), and xxhash is no longer a dependency.
 - `QueuedChatBedrockConverse` takes `model_alias=`; an alias passed as `model=` raises.
 - The empty `s3` extra is gone.

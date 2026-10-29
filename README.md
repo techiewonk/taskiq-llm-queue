@@ -127,6 +127,8 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `provider_read_timeout_secs` / `provider_connect_timeout_secs` | 300 / 10 | Bedrock botocore and OpenAI httpx timeouts |
 | `sqs_send_timeout_secs` | 5 | SQS counts as down only when no send completed for this long; then the call runs direct |
 | `throttle_retry_attempts` | 6 | Tries per fallback step for throttles (backoff holds no slot) |
+| `retry_base_secs` / `retry_multiplier` / `retry_spread` / `retry_max_secs` | 1 / 4 / 2.5 / 30 | Retry n sleeps a random time in [base·4ⁿ, base·4ⁿ·2.5]: **1–2.5 s, 4–10 s, 16–30 s**, then 30 s; see [Retry backoff](#retry-backoff) |
+| `throttle_retry_max_secs` | 10 | Cap of one sleep after a throttle, so 6 throttle tries fit an rt deadline |
 | `valkey_wait_failover_secs` | 10 | Result reads failing this long make waiting callers run direct |
 | `redis_max_connections` | 32 | Raised automatically to worker slots + 16 |
 | `worker_slots` (`LLMQ_WORKER_SLOTS=gpt120b:50,jobs:4`) | 50 per model alias (4 for `jobs`) | Tasks one pod runs at once for that alias's queues |
@@ -134,8 +136,62 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `ModelConfig.max_concurrency` (`LLMQ_AC_MAX_BY_MODEL='{"gpt120b": 30}'`) | `None` (adaptive up to `LLMQ_AC_MAX`) | Hard cap on calls in flight across all pods, per alias **and target**; see below |
 | `limiter.max_limit` (`LLMQ_AC_MAX`) | 2000 | Global ceiling of every adaptive limit |
 | `limiter.bg_share` (`LLMQ_AC_BG_SHARE`) | 0.8 | Fraction of a limit `bg`/`bulk` may use; `rt` may use all of it |
+| `settings_default` (`LLMQ_SETTINGS`, JSON) | `{}` | Per-provider and per-model values of the settings below; see [Settings per provider and model](#settings-per-provider-and-model) |
 
 Redis keys are cluster-safe (hash-tagged per request and per model+target), so cluster-mode Valkey (e.g. ElastiCache Serverless) works.
+
+### Settings per provider and model
+
+A provider (`bedrock`, `openai`, or a custom one) serves several models. These settings can be given once for a provider, overridden for one model, and changed live on every pod without a restart:
+
+`max_concurrency`, `limiter_initial`, `bg_share`, `timeout_secs.<lane>`, `embed_timeout_secs.<lane>`, `attempt_timeout_secs`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs`, `breaker_threshold`, `breaker_cooldown_secs`, and for a provider only `shared_max_concurrency`.
+
+Each one resolves through six layers; the highest that has a value wins:
+
+| # | Layer | Where it comes from |
+|---|---|---|
+| 6 | Live model | Valkey, `llm-queue settings set --model M ...` |
+| 5 | Live provider | Valkey, `llm-queue settings set --provider P ...` |
+| 4 | Env model | `LLMQ_SETTINGS` `models`, plus `ModelConfig.max_concurrency` / `limiter_initial` and `LLMQ_AC_MAX_BY_MODEL` / `LLMQ_AC_INITIAL` |
+| 3 | Env provider | `LLMQ_SETTINGS` `providers` |
+| 2 | Env global | `LLMQ_ATTEMPT_TIMEOUT_SECS`, `LLMQ_TIMEOUT_RT_SECS`, `LLMQ_RETRY_*`, `LLMQ_CB_*`, `LLMQ_AC_BG_SHARE`, ... (code, `.env` or Secrets Manager) |
+| 1 | Built-in default | The defaults in the tables above |
+
+```bash
+# .env: provider defaults and one model override (layers 3-4), validated at boot
+LLMQ_SETTINGS='{"providers": {"openai": {"shared_max_concurrency": 40, "attempt_timeout_secs": 120}},
+                "models": {"gpt120b": {"max_concurrency": 30, "timeout_secs": {"rt": 60}}}}'
+
+# live, reaches every pod within LLMQ_CFG_RELOAD_SECS (30 s); every change is audited
+llm-queue settings set --model gpt120b max_concurrency=20 timeout_secs.rt=45
+llm-queue settings set --provider bedrock attempt_timeout_secs=90 retry_multiplier=3
+llm-queue settings get --model gpt120b      # every setting with its value and source
+llm-queue settings unset --model gpt120b max_concurrency
+llm-queue settings reset                    # drop all live overrides
+```
+
+`settings get` shows each value's source (`live:model`, `live:provider`, `env:model`, `env:provider`, `env`, `default`), so a value that differs from your `.env` is easy to explain. A live value wins over `.env` until it is unset. An unknown alias or provider, an unknown setting or a bad value is refused before anything is written. If the stored value is unreadable or Valkey is down, pods keep the last good one.
+
+**Provider-wide cap.** `shared_max_concurrency` on a provider bounds the calls in flight across *all* its models and pods, e.g. one vLLM server hosting three models. Each call then holds two slots, its model's and the provider's. Measured (scenario S55): with a shared cap of 8 on `bedrock` and gpt20b and gpt120b allowed 20 each, 600 calls peaked at exactly 8 at the provider, all OK, none duplicated.
+
+**Live bucket change.** Measured (scenario S54): gpt20b ran at `max_concurrency` 20 on 3 workers; `settings set --model gpt20b max_concurrency=5` mid-run brought the provider peak from 20 to 5 after one reload, with 900/900 calls OK.
+
+Not live (needs a restart): connection settings, the model list (targets, queues, provider), credentials, provider HTTP timeouts, `worker_slots` and `retry_attempts`.
+
+### Retry backoff
+
+Each fallback step retries a failed attempt `retry_attempts` times (3), or `throttle_retry_attempts` times (6) once the provider throttled it. Retry *n* (0-based) sleeps a random time in `[base · multiplierⁿ, base · multiplierⁿ · spread]`, capped at `retry_max_secs`:
+
+| Retry | Defaults (base 1, multiplier 4, spread 2.5, cap 30) | After a throttle (cap 10) |
+|---|---|---|
+| 1st | 1–2.5 s | 1–2.5 s |
+| 2nd | 4–10 s | 4–10 s |
+| 3rd | 16–30 s | 10 s |
+| 4th and later | 30 s | 10 s |
+
+A provider `Retry-After` larger than the drawn delay wins, up to `retry_max_secs`. A sleep that would pass the call's deadline is skipped and the next fallback step is tried. No limiter slot is held while sleeping. All five knobs are `LLMQ_*` variables and can be set per provider or model like the settings above.
+
+A sleeping call frees its limiter slot but keeps its worker task (one of `worker_slots`). Under a long throttle storm a longer curve therefore lowers per-pod throughput; if queued callers start to time out, raise `worker_slots` or lower `retry_multiplier` / `throttle_retry_max_secs` for that provider or model. The scenario harness scales the whole curve by 0.2 (base 0.2 s, caps 6 s and 2 s) to keep runs short.
 
 ### Setting names
 
@@ -187,7 +243,7 @@ The queue depth is unbounded: SQS holds every request that is not running. How m
 
 `bg` and `bulk` may use `bg_share` (80 %) of the limit, so with a cap of 10, background work runs at most 8 at once and keeps 2 slots for `rt`. Set `LLMQ_AC_BG_SHARE=1` to give all lanes the whole bucket.
 
-A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received gets three 2 s tries per fallback step, then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
+A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received gets three 2 s tries per fallback step, then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. `max_concurrency` and `bg_share` can also be set per provider and changed live ([Settings per provider and model](#settings-per-provider-and-model)), and a provider can have one bucket shared by all its models. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
 
 Measured (scenario S53, fakellm at 200 ms p50, 3 workers × 50 slots, `max_concurrency=10`, `bg_share=1`): 2,000 bg calls queued (2,000 visible in SQS at peak), peak provider concurrency exactly 10 (from the call log and fakellm's own counter), limiter never above 10, 2,000/2,000 done, 0 lost, 0 duplicates, 61 s wall time. SQS in-flight peaked at 40, which is 10 running plus finished messages waiting for the 0.5 s batched delete.
 
@@ -235,6 +291,9 @@ uv run llm-queue routing reset
 uv run llm-queue limiter show --model gpt120b                    # learned limit, in-flight, pause
 uv run llm-queue limiter reset --model gpt120b [--target apac]   # forget the learned limit
 uv run llm-queue breaker show | reset
+uv run llm-queue settings get --model gpt120b                   # effective settings + source
+uv run llm-queue settings set --model gpt120b max_concurrency=20 # live bucket size, all pods
+uv run llm-queue settings set --provider openai shared_max_concurrency=40
 uv run llm-queue queues                                          # messages per queue and DLQ
 uv run llm-queue job send ingest --payload-file payload.json --queue jobs-ingest
 ```

@@ -269,7 +269,7 @@ flowchart TD
 | Error classes | `Provider.classify(exc) -> ErrorInfo(kind)`, kind `throttle` / `retryable` / `fatal`, by error *family* (`providers/classify.py`), not exact code. Our own `TimeoutError` counts as retryable |
 | Target errors (S38) | `is_target_error`: fatal families that name the target (`ResourceNotFound`, `AccessDenied`, model not found) or validation messages about the model / region / profile → next step, breaker neutral |
 | Retry budget per step | `retry_attempts` (3); once the step throttled, `max(retry_attempts, throttle_retry_attempts)` (6) |
-| Backoff | `retry_base_secs * 2^attempt + uniform(0, base)`, raised to the provider's `Retry-After`, capped at 20 s (`MAX_BACKOFF_SECS`); skipped if it would pass the deadline; no slot held while sleeping |
+| Backoff | Retry *n* sleeps `uniform(base*mult^n, base*mult^n*spread)`: 1-2.5 s, 4-10 s, 16-30 s with the defaults; capped at `retry_max_secs` 30 s (`throttle_retry_max_secs` 10 s after a throttle); a larger `Retry-After` wins up to the cap; skipped if it would pass the deadline; no slot held while sleeping ([section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)) |
 | Per-attempt timeout (S39) | `attempt_timeout_secs` (180). If it fired before the deadline: `attempt_timeout`, and with more steps the call moves on instead of retrying the hung target. If the deadline fired: `deadline_exceeded` |
 | SDK retries | Off: Bedrock `retries={"total_max_attempts": 1}`, OpenAI `max_retries=0`, so every 429 reaches the limiter |
 | rt capacity | rt waits 2 s per step for a slot; when no step got a slot it walks the chain up to 3 passes (`RT_CAPACITY_PASSES`) before `no_capacity` |
@@ -519,6 +519,7 @@ Measured effect of the cut rules (CHANGELOG, scenario harness):
 | `P:{m:ALIAS:TARGET}:cb` | hash | `BREAKER` | none | `state`, `opened_at`, `fail_count`, `window_start`, `probes`, `probe_at` |
 | `P:{cfg}:routing` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `RoutingConfig` |
 | `P:{cfg}:fallback` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `FallbackConfig` (`chains`, `skip_targets`) |
+| `P:{cfg}:models` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `ModelSettings` (live per-provider / per-model overrides, [section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)) |
 | `P:{cfg}:audit` | stream | `CONFIG_SET`, CLI resets | trimmed to 90 days (`XTRIM MINID`) | `key`, `actor`, `before`, `after`, `ts` |
 | `P:pods` | sorted set | `PodRegistry.beat` | `EXPIRE` 60 s, members expire after 30 s | Live pod ids (for the local cap) |
 | `P:done:POD` | pub/sub channel | worker `PUBLISH` | — | Request id whose result is ready |
@@ -616,6 +617,8 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `attempt_timeout_secs` | `LLMQ_ATTEMPT_TIMEOUT_SECS` | 180 (unverified default per its own docstring) |
 | `provider_read_timeout_secs`, `provider_connect_timeout_secs` | `LLMQ_PROVIDER_READ_TIMEOUT_SECS`, `LLMQ_PROVIDER_CONNECT_TIMEOUT_SECS` | 300, 10 |
 | `retry_attempts`, `retry_base_secs` | `LLMQ_RETRY_ATTEMPTS`, `LLMQ_RETRY_BASE_SECS` | 3, 1.0 |
+| `retry_multiplier`, `retry_spread`, `retry_max_secs` | `LLMQ_RETRY_MULTIPLIER`, `LLMQ_RETRY_SPREAD`, `LLMQ_RETRY_MAX_SECS` | 4, 2.5, 30 |
+| `throttle_retry_max_secs` | `LLMQ_THROTTLE_RETRY_MAX_SECS` | 10 |
 | `throttle_retry_attempts` | `LLMQ_THROTTLE_RETRY_ATTEMPTS` | 6 |
 | `max_failures` | `LLMQ_MAX_FAILURES` | 3 (jobs) |
 | `state_ttl_secs`, `result_ttl_secs` | `LLMQ_STATE_TTL_SECS`, `LLMQ_RESULT_TTL_SECS` | 1800, 300 |
@@ -634,6 +637,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `cfg_reload_secs` | `LLMQ_CFG_RELOAD_SECS` | 30 |
 | `fallback_default` | `LLMQ_FALLBACK_CHAINS` (JSON `FallbackConfig`) | `{}` |
 | `routing_enabled`, `routing_default` | `LLMQ_ROUTING_ENABLED`, `LLMQ_ROUTING_DEFAULT` (JSON) | false, `{}` |
+| `settings_default` | `LLMQ_SETTINGS` (JSON `ModelSettings`: `providers`, `models`) | `{}` ([section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)) |
 | `local_limit_cap` | `LLMQ_LOCAL_LIMIT_CAP` | 10 |
 | `hash_ids` | `LLMQ_HASH_IDS` | true |
 | `id_hash_salt` | `LLMQ_ID_HASH_SALT` | public constant; **set your own in production**, shared by all pods (1–64 bytes) |
@@ -654,7 +658,58 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `utilisation` | none (constructor only) | 0.9 |
 | breaker `threshold`, `window_secs`, `cooldown_secs` | `LLMQ_CB_THRESHOLD`, `LLMQ_CB_WINDOW_SECS`, `LLMQ_CB_COOLDOWN_SECS` | 5, 30, 15 |
 
-Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter window / cut knobs († in [§5](#5-adaptive-limiter)), claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `RT_CAPACITY_PASSES` 3, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30, `MAX_BACKOFF_SECS` 20.
+Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter window / cut knobs († in [§5](#5-adaptive-limiter)), claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `RT_CAPACITY_PASSES` 3, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30.
+
+### 7a. Settings per provider and per model (`model_settings.py`)
+
+A provider (e.g. `bedrock`, `openai`) serves several model aliases. Limits, timeouts, retries and breaker thresholds can be set once for a provider, overridden for one model, and changed on every pod without a restart. Each setting resolves through six layers; the highest layer that has a value wins:
+
+```mermaid
+flowchart LR
+  D["1. Built-in default<br/>(field defaults)"] --> G["2. Env global<br/>LLMQ_ATTEMPT_TIMEOUT_SECS, ..."]
+  G --> EP["3. Env provider<br/>LLMQ_SETTINGS.providers"]
+  EP --> EM["4. Env model<br/>LLMQ_SETTINGS.models,<br/>ModelConfig, LLMQ_AC_* JSON"]
+  EM --> LP["5. Live provider<br/>Valkey P:{cfg}:models"]
+  LP --> LM["6. Live model<br/>Valkey P:{cfg}:models"]
+  LM --> E[Effective value]
+```
+
+Layers 3-6 share one JSON shape, `ModelSettings` (`config.py`):
+
+```json
+{
+  "providers": {"openai": {"shared_max_concurrency": 40, "attempt_timeout_secs": 120}},
+  "models":    {"gpt120b": {"max_concurrency": 30, "timeout_secs": {"rt": 60}, "bg_share": 0.7}}
+}
+```
+
+Layers 3-4 come from `LLMQ_SETTINGS` (validated at boot; a bad value is a `ConfigError`); layers 5-6 are the live value in Valkey, edited with `llm-queue settings`. `SettingsResolver(config, live)` answers `resolve(alias, name, lane) -> (value, source)`; it is immutable, so a reload swaps one object and a call reads one consistent snapshot.
+
+| Setting (provider or model) | Env global (layer 2) | Read where | Effect of a change |
+|---|---|---|---|
+| `max_concurrency` (bucket per model + target) | none (`ModelConfig.max_concurrency`, `LLMQ_AC_MAX_BY_MODEL` are layer 4) | limiter `max_for` on every acquire / release; receive budget | Lower: the next acquire clamps the stored limit; calls in flight finish, new ones wait. Higher: the adaptive limit may grow to it |
+| `limiter_initial` | none (`ModelConfig.limiter_initial`, `LLMQ_AC_INITIAL` are layer 4) | limiter `start_for` | Only while no learned limit exists (new target, or after `limiter reset`) |
+| `bg_share` | `LLMQ_AC_BG_SHARE` | limiter `share_for(lane, model)`, receive budget | Next `bg` / `bulk` acquire |
+| `timeout_secs.<lane>`, `embed_timeout_secs.<lane>` | `LLMQ_TIMEOUT_<LANE>_SECS`, `LLMQ_TIMEOUT_EMBED_<LANE>_SECS` | sender `LLMQueue._envelope` | Calls sent after the reload; a call keeps the deadline it was sent with |
+| `attempt_timeout_secs` | `LLMQ_ATTEMPT_TIMEOUT_SECS` | `core.run_call`, per fallback step alias | Next attempt |
+| `throttle_retry_attempts` | `LLMQ_THROTTLE_RETRY_ATTEMPTS` | `core.run_call`, per step alias | Next throttled step |
+| `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | `LLMQ_RETRY_BASE_SECS`, `LLMQ_RETRY_MULTIPLIER`, `LLMQ_RETRY_SPREAD`, `LLMQ_RETRY_MAX_SECS`, `LLMQ_THROTTLE_RETRY_MAX_SECS` | `core.backoff_secs`, per step alias | Next backoff sleep |
+| `breaker_threshold`, `breaker_cooldown_secs` | `LLMQ_CB_THRESHOLD`, `LLMQ_CB_COOLDOWN_SECS` | `CircuitBreaker._run` (`by_model`) | Next breaker call of that alias |
+| `shared_max_concurrency` (**provider only**) | none | `core._take_slot`, receive budget | Next acquire |
+
+**Provider shared cap.** `shared_max_concurrency` bounds the calls in flight across *every* model of the provider and every pod, e.g. one vLLM server hosting three models, or an account-wide quota. It is a fixed limit of the limiter key `P:{m:@<provider>:shared}` (start = cap; it never learns, because a throttle is fed only to the model's own limit). With it, each attempt holds two slots: the model's, then the provider's, taken within the same wait; if the shared slot is not free in time, the model slot is returned and the step counts as `no_capacity`. The receive budget also subtracts the shared headroom, so a full provider bucket leaves the backlog in SQS. Provider names are the `ModelConfig.provider` values (`bedrock`, `openai`, or a registered custom one); the `@` prefix cannot clash with an alias.
+
+**Retry backoff.** Retry *n* (0-based) of one step sleeps a random time in `[base * multiplier^n, base * multiplier^n * spread]`, capped at `retry_max_secs`. With the defaults (base 1, multiplier 4, spread 2.5, cap 30) that is **1-2.5 s, 4-10 s, 16-30 s, then 30 s**. After a throttle one sleep is capped at `throttle_retry_max_secs` (10 s), so the 6 throttle tries still fit an rt deadline of 90 s. A provider `Retry-After` larger than the drawn delay wins, up to `retry_max_secs`. A sleep that would pass the call's deadline is skipped (the step gives up), and no limiter slot is held while sleeping. The worker task *is* held while sleeping, so under a long throttle storm per-pod throughput is roughly `worker_slots / (call time + sleeps)`: raise `worker_slots` or shorten the curve for that provider or model if queued callers time out. The scenario harness scales the curve by 0.2 (base 0.2 s, caps 6 s / 2 s); with the caps left at 30 s / 10 s, S35b (30 % throttle storm, 10K burst) dropped to 86.9 % OK, with them scaled it passes at 99.6 %.
+
+**Stays pod config only** (read when clients, queues and pools are built): Valkey / SQS / AWS settings, `models` (targets, queues, provider), credentials, `provider_*_timeout_secs`, `worker_slots`, `retry_attempts`, limiter window knobs and `max_limit` (which still bounds a live `max_concurrency`).
+
+**Storage and reload.** The live value lives at `P:{cfg}:models` in the same `LiveConfigStore` as routing and fallback: validated by pydantic on `set` (a bad value never reaches Valkey), audited to `P:{cfg}:audit` with the actor (kept 90 days), reloaded by every pod each `cfg_reload_secs` (30 s). An invalid stored value, or Valkey being down, keeps the last good one; nothing stored means layers 1-4 apply. On a change `LLMQueue._apply_settings` swaps the resolver, the limiter's `LimiterSettings` (caps, starts, `bg_share` per model, shared caps), the breaker's per-model settings, the failover local caps and the sync-path limiter settings, and logs `model_settings_applied`. Settings the limiter rejects are logged as `model_settings_rejected` and the old ones stay. An alias or provider not in `LLMQ_MODELS` is rejected by the CLI and ignored by pods. While Valkey is down the provider shared cap becomes a per-pod local cap like every other limit ([section 4c](#4c-failover-to-the-direct-path-and-recovery)).
+
+**Operating it.** `llm-queue settings get [--model M | --provider P]` prints every setting with its effective value and source (`live:model`, `live:provider`, `env:model`, `env:provider`, `env`, `default`). `settings set --model M max_concurrency=30 timeout_secs.rt=60`, `settings set --provider openai shared_max_concurrency=40`, `settings unset --model M [NAME ...]` and `settings reset` edit the live layers. A database or admin UI that should own these values writes through the same store (`model_settings_store(...).set(value, actor=...)`) or the CLI; pods only read Valkey, so no new runtime dependency is added.
+
+**Verified.** Unit tests cover every layer, validation and the core paths. Integration tests on Valkey: a shared cap of 3 holds across two models (provider peak 3 over 40 calls), and a live cap of 2 clamps a learned limit of 10. Scenario S54: gpt20b at cap 20 on 3 workers, lowered live to 5 mid-run: provider peak 20 before, 5 after one reload, 900/900 calls OK. S55: live shared cap 8 on `bedrock` over gpt20b + gpt120b (cap 20 each): combined peak 8, 600/600 OK, no duplicates.
+
+**Trade-off.** A live value overrides `.env` until it is unset, so `settings get` showing the source is how to see why a pod runs with a value that differs from its env.
 
 ---
 
@@ -705,6 +760,7 @@ Reads connection settings from `LLMQ_*` (`QueueConfig.from_env`), prints JSON on
 |---|---|
 | `routing get \| set --model M --lane L --pct N \| kill on\|off \| allow add\|remove USER \| reset` | Canary routing config |
 | `fallback get [--model M] \| set --model M --chain "a,b@t" \| set --file F [--replace] \| test --model M \| reset` | Live fallback chains; `test` is a dry run of which step would serve now |
+| `settings get [--model M \| --provider P] \| set --model M\|--provider P NAME=VALUE ... \| unset ... [NAME ...] \| reset` | Live per-provider / per-model limits, timeouts, retries ([section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)); `get` shows value and source |
 | `limiter show [--model M] \| reset --model M [--target T]` | Learned limit, live leases, pause; `reset` forgets the learned state |
 | `breaker show [--model M] \| reset --model M [--target T]` | Breaker position; `reset` closes it |
 | `queues` | Visible / in-flight / delayed counts per configured queue and its DLQ (from `RedrivePolicy`) |

@@ -15,6 +15,8 @@ from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.reliability import _lua
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import redis.asyncio
 
 
@@ -56,10 +58,12 @@ class CircuitBreaker:
         """Register the Lua script on `client`; no I/O happens until the first call."""
         self._keys = keys
         self.settings = settings or BreakerSettings()
+        # Per-alias settings (live model settings); aliases not listed use `settings`.
+        self.by_model: Mapping[str, BreakerSettings] = {}
         self._script = client.register_script(_lua.BREAKER)
 
     async def _run(self, op: str, model: str, target: str) -> tuple[BreakerState, bool]:
-        s = self.settings
+        s = self.by_model.get(model, self.settings)
         state, allowed = await self._script(
             [self._keys.breaker(model, target)],
             [op, s.threshold, s.window_secs, s.cooldown_secs, s.half_open_probes],
