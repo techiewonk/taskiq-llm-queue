@@ -29,6 +29,7 @@ from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, Backof
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.classify import is_target_error
 from taskiq_llm_queue.reliability import _lua
+from taskiq_llm_queue.reliability.breaker import BreakerState
 from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter
@@ -795,7 +796,10 @@ async def run_call(
                         ),
                     )
                 if info.kind is ErrorKind.RETRYABLE:
-                    await _record(deps, step, ok=False)
+                    # S12: in-flight calls kept retrying a target their own failures had just
+                    # opened the breaker on (3 calls in 8 s with the longer backoff curve).
+                    if await _record(deps, step, ok=False) is BreakerState.OPEN:
+                        break
                 else:  # a throttle belongs to the limiter: frees a half-open probe, no count
                     await _record(deps, step, ok=None)
                     # S35b: a random 30 % throttle storm failed calls after 3 tries (2.7 %);
@@ -869,18 +873,18 @@ async def _release(deps: CoreDeps, lease: Lease, *, throttled: bool) -> None:
         )
 
 
-async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool | None) -> None:
+async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool | None) -> BreakerState | None:
     """Feed one outcome into the breaker (best effort); `ok=None` is a neutral throttle.
 
     Only 5xx/timeouts count as failures: throttles are the limiter's job (AIMD, pause).
+    Returns the breaker's new state, or None without a breaker or when Valkey failed.
     """
     if deps.breaker is None:
-        return
+        return None
     try:
         if ok is None:
-            await deps.breaker.record_neutral(step.alias, step.target)
-        else:
-            await deps.breaker.record(step.alias, step.target, ok=ok)
+            return await deps.breaker.record_neutral(step.alias, step.target)
+        return await deps.breaker.record(step.alias, step.target, ok=ok)
     except Exception as exc:
         logger.warning(
             "breaker_record_failed",
@@ -888,3 +892,4 @@ async def _record(deps: CoreDeps, step: FallbackStep, *, ok: bool | None) -> Non
             target=step.target,
             error_type=type(exc).__name__,
         )
+        return None

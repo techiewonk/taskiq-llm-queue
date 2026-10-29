@@ -442,7 +442,15 @@ async def s10(ctx: Ctx) -> None:
 @scenario("S11", "Live fallback change", aws_safe="low-volume")
 async def s11(ctx: Ctx) -> None:
     """`fallback set` reaches every worker within 30 s; invalid JSON keeps the last good chain."""
-    cfg = ctx.config(cfg_reload_secs=5.0, retry_attempts=1)  # one attempt per step: fast
+    # One attempt per step, throttled or not, and a short rt wait: otherwise each call spends
+    # ~15 s on throttle retries (and up to `rt_capacity_wait_secs` on paused targets), which
+    # hides the reload time this scenario measures.
+    cfg = ctx.config(
+        cfg_reload_secs=5.0,
+        retry_attempts=1,
+        throttle_retry_attempts=1,
+        rt_capacity_wait_secs=2.0,
+    )
     await ctx.workers(2, cfg)
     q = await ctx.queue(cfg)
     for key in (GPT120B_PRIMARY, GPT120B_APAC):

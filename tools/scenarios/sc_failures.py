@@ -114,18 +114,17 @@ async def s40(ctx: Ctx) -> None:
     await ctx.workers(1)
     q = await ctx.queue()
     rid = ctx.rid(1)
-    t0 = time.monotonic()
     if ctx.aws:  # a real generation far longer than the 1 s budget instead of a scripted hang
         request = api.converse_request(
             ctx.text(rid, "Write a detailed 1500-word essay on the history of stock exchanges."),
             max_tokens=2000,
         )
-        reply = await api.converse(
-            q, "gpt20b", request, lane="rt", request_id=rid, timeout_secs=1.0
-        )
     else:
         await ctx.fake.script(rid, ["hang:3"])
-        reply = await one(ctx, q, 1, lane="rt", timeout_secs=1.0)
+        request = api.converse_request(ctx.text(rid), max_tokens=ctx.max_tokens)
+    # The clock starts at the call: the fakellm script request above took up to 0.28 s.
+    t0 = time.monotonic()
+    reply = await api.converse(q, "gpt20b", request, lane="rt", request_id=rid, timeout_secs=1.0)
     took = time.monotonic() - t0
     await asyncio.sleep(4)
     if ctx.aws:

@@ -41,6 +41,7 @@ from taskiq_llm_queue.core import (
 )
 from taskiq_llm_queue.errors import QueueUnavailable
 from taskiq_llm_queue.model_settings import Backoff, SettingsResolver
+from taskiq_llm_queue.reliability.breaker import BreakerState
 from taskiq_llm_queue.reliability.claims import FailureCount
 from taskiq_llm_queue.reliability.fallback import FallbackConfig
 
@@ -160,19 +161,30 @@ class FakeResults:
 
 @dataclass
 class FakeBreaker:
-    """Breaker that blocks targets listed in `open_targets` and records outcomes."""
+    """Breaker that blocks targets listed in `open_targets` and records outcomes.
+
+    A failure on a target in `open_on_failure` opens its breaker (the state `record` returns).
+    """
 
     open_targets: set[str] = field(default_factory=set)
+    open_on_failure: set[str] = field(default_factory=set)
     records: list[tuple[str, bool | None]] = field(default_factory=list)
+
+    def _state(self, target: str) -> BreakerState:
+        return BreakerState.OPEN if target in self.open_targets else BreakerState.CLOSED
 
     async def allow(self, model: str, target: str) -> bool:
         return target not in self.open_targets
 
-    async def record(self, model: str, target: str, *, ok: bool) -> None:
+    async def record(self, model: str, target: str, *, ok: bool) -> BreakerState:
         self.records.append((target, ok))
+        if not ok and target in self.open_on_failure:
+            self.open_targets.add(target)
+        return self._state(target)
 
-    async def record_neutral(self, model: str, target: str) -> None:
+    async def record_neutral(self, model: str, target: str) -> BreakerState:
         self.records.append((target, None))
+        return self._state(target)
 
 
 def config(**overrides: Any) -> QueueConfig:
@@ -492,6 +504,20 @@ async def test_claim_complete_failure_after_store_is_logged_only(world: World) -
     assert result.reply is not None
     assert result.reply.ok
     assert world.claims.log == ["claim:pod-1", "put"]
+
+
+async def test_breaker_opened_by_a_failure_stops_retries_on_that_target(world: World) -> None:
+    """S12: a failure that opens the breaker ends the step; no retry hits the open target.
+
+    In-flight calls used to keep retrying it (3 calls in 8 s while open, longer backoff).
+    """
+    world.breaker.open_on_failure.add("primary")
+    world.provider.script["primary"] = [FakeError(ErrorKind.RETRYABLE, "ServiceUnavailable")] * 3
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
+    assert reply.meta.served_target == "apac"
+    assert [c[1] for c in world.provider.calls] == ["primary", "apac"]
+    assert world.sleeps == []  # no backoff before giving up on the open target
 
 
 async def test_throttles_do_not_trip_the_breaker(world: World) -> None:
