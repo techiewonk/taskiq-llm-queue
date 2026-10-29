@@ -23,6 +23,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
+          cache-suffix: ${{ github.job }}-${{ matrix.python || 'default' }}
       - run: uv sync --all-extras --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -63,6 +64,7 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+          cache-suffix: ${{ github.job }}-${{ matrix.python || 'default' }}
       - run: uv sync --all-extras --locked
       - run: docker compose -f docker/compose.yaml up -d --wait
       - run: uv run pytest tests/unit tests/integration -q
