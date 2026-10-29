@@ -707,3 +707,19 @@ async def test_receive_budget_nets_out_local_waiters(
     assert lease is not None
     assert lim.waiting(M, T) == 0
     await release_all(lim, [*held, lease])
+
+
+async def test_receive_budget_is_zero_for_bg_while_a_rate_hold_lasts(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """F17 C5: a rate hold on the alias stops bg/bulk receives; rt queues keep receiving."""
+    import time
+
+    lim = make(valkey, keys, initial={M: 4})
+    model = ModelConfig(provider="bedrock", model_id="x", targets={T: {}})
+    holds = {M: time.time() + 30}
+    budget = receive_budget(M, model, lim, {"rt": Lane.RT, "bg": Lane.BG}, None, holds)
+    assert await budget(SQSQueue(name="bg")) == 0
+    assert await budget(SQSQueue(name="rt")) > 0
+    holds[M] = time.time() - 1
+    assert await budget(SQSQueue(name="bg")) > 0

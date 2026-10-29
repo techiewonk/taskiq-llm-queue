@@ -1085,3 +1085,105 @@ async def test_full_shared_provider_slot_returns_the_model_slot(world: World) ->
     assert reply.error["type"] == "no_capacity"
     assert world.limiter.held == 0
     assert world.provider.calls == []
+
+
+@dataclass
+class FakeRate:
+    """Rate budget that refuses listed (model, target) scopes with `wait` and records calls."""
+
+    refuse: dict[tuple[str, str], float] = field(default_factory=dict)
+    taken: list[tuple[str, str, bool, int]] = field(default_factory=list)
+    given: list[tuple[str, str, int | None, bool]] = field(default_factory=list)
+
+    async def take(
+        self, model: str, target: str, limits: Any, *, bg: bool, tokens: int
+    ) -> tuple[Any, float]:
+        from taskiq_llm_queue.reliability.rate import RateGrant
+
+        if (model, target) in self.refuse:
+            return None, self.refuse[(model, target)]
+        self.taken.append((model, target, bg, tokens))
+        return RateGrant(model, target, limits, bg, tokens), 0.0
+
+    async def give(self, grant: Any, tokens: int | None = None, *, call: bool) -> None:
+        self.given.append((grant.model, grant.target, tokens, call))
+
+
+def _rated(world: World, **models: Any) -> FakeRate:
+    rate = FakeRate()
+    world.deps.rate = rate
+    _live(world, models=models)
+    return rate
+
+
+async def test_rt_out_of_budget_on_primary_is_served_by_the_next_target(world: World) -> None:
+    """F17 D3: rt whose primary budget is used moves to the next target's budget."""
+    rate = _rated(world, big={"rpm": 10})
+    rate.refuse[("big", "primary")] = 30.0
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.meta.served_target == "apac"
+    assert [c[1] for c in world.provider.calls] == ["apac"]
+    assert rate.taken == [("big", "apac", False, 0)]
+
+
+async def test_queued_bg_out_of_budget_goes_back_to_sqs_until_the_next_token(
+    world: World,
+) -> None:
+    """F17 C4/D3: a queued bg call waits in SQS for its own target (no fallback, no slot)."""
+    rate = _rated(world, big={"rpm": 10})
+    rate.refuse[("big", "primary")] = 23.4
+    holds: dict[str, float] = {}
+    world.deps.rate_holds = holds
+    result = await execute_job(envelope(lane="bg", deadline_at=time.time() + 300), world.deps)
+    assert result.reply is None
+    assert result.requeue_secs == 24
+    assert 20 < holds["big"] - time.time() < 23.5  # C5: no bg receives for big until then
+    assert world.provider.calls == []
+    assert world.limiter.held == 0
+
+
+async def test_rt_without_budget_anywhere_gets_rate_limited_with_retry_after(
+    world: World,
+) -> None:
+    """F17 C7/D4: rt waits up to `rt_capacity_wait_secs`, then `rate_limited` + retry_after."""
+    _fake_clock(world)
+    rate = _rated(world, big={"rpm": 10, "rt_capacity_wait_secs": 6}, small={"rpm": 10})
+    rate.refuse.update({("big", "primary"): 40, ("big", "apac"): 40, ("small", "primary"): 40})
+    reply = (await execute_job(envelope(lane="rt", fallback="chain"), world.deps)).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert (reply.error["type"], reply.error["kind"]) == ("rate_limited", "throttle")
+    assert reply.error["retry_after_secs"] == 40
+    assert world.provider.calls == []
+
+
+async def test_rate_tokens_go_back_when_no_slot_follows(world: World) -> None:
+    """F17 C3: a token taken before a refused concurrency slot is returned."""
+    rate = _rated(world, big={"rpm": 10})
+    world.limiter.deny.add(("big", "primary"))
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.meta.served_target == "apac"
+    assert ("big", "primary", None, True) in rate.given
+
+
+async def test_tpm_reservation_is_corrected_to_the_reported_usage(world: World) -> None:
+    """F17 C6: TPM reserves the estimate and is charged the response's `usage` after."""
+    rate = _rated(world, big={"tpm": 100_000})
+    world.provider.script["primary"] = [{"output": "x", "usage": {"totalTokens": 30}}]
+    reply = (await execute_job(envelope(lane="rt"), world.deps)).reply
+    assert reply is not None
+    assert reply.ok
+    (_, _, _, reserved) = rate.taken[0]
+    assert reserved > 1000  # input + default output limit
+    assert rate.given == [("big", "primary", reserved - 30, False)]
+
+
+async def test_provider_shared_budget_is_taken_after_the_model_one(world: World) -> None:
+    """F17 R06: a provider's `shared_rpm` adds a second token from `@<provider>`."""
+    rate = FakeRate()
+    world.deps.rate = rate
+    _live(world, providers={"bedrock": {"shared_rpm": 500}})
+    await execute_job(envelope(lane="bg"), world.deps)
+    assert [(m, t) for m, t, _, _ in rate.taken] == [("@bedrock", "shared")]

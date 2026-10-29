@@ -255,18 +255,23 @@ def receive_budget(
     limiter: AdaptiveLimiter,
     lanes: Mapping[str, Lane],
     failover: FailoverPolicy | None,
+    rate_holds: Mapping[str, float] | None = None,
 ) -> Callable[[SQSQueue], Any]:
     """DS4 budget for one model's queues: the best limiter headroom across its targets.
 
     Headroom is net of this pod's callers already waiting for a slot of that target, so a full
     bucket (e.g. `max_concurrency`, or the provider's shared cap) leaves the backlog in SQS.
-    Returns 0 while Valkey is down or unreachable, so nothing is received that can't run.
+    Returns 0 while Valkey is down or unreachable, so nothing is received that can't run,
+    and for bg/bulk queues while a rate hold of the alias lasts (C5: its budget is used up).
     """
 
     async def budget(queue: SQSQueue) -> int:
         if failover is not None and failover.redis_down():
             return 0
-        share = limiter.settings.share_for(lanes.get(queue.name, Lane.BG), alias)
+        lane = lanes.get(queue.name, Lane.BG)
+        if lane is not Lane.RT and rate_holds and rate_holds.get(alias, 0.0) > time.time():
+            return 0
+        share = limiter.settings.share_for(lane, alias)
         shared = f"{SHARED_PREFIX}{model.provider}"
         has_shared = shared in (limiter.settings.max_by_model or {})
         try:  # every target in one pipelined round trip, on each poll
@@ -326,6 +331,7 @@ def build_brokers(
     failover: FailoverPolicy | None = None,
     hooks: BrokerHooks | None = None,
     session: AioSession | None = None,
+    rate_holds: Mapping[str, float] | None = None,
 ) -> BrokerSet:
     """One broker per distinct model queue set, plus a jobs broker when `job_queues` is set.
 
@@ -376,7 +382,7 @@ def build_brokers(
             max_inflight=slots,
             reserve_for_priority0=reserve,
             min_slots_for_lower=lower,
-            receive_budget=receive_budget(alias, model, limiter, lanes, failover),
+            receive_budget=receive_budget(alias, model, limiter, lanes, failover, rate_holds),
             **common,
         ).with_result_backend(result_backend)
         broker.with_serializer(WireSerializer())

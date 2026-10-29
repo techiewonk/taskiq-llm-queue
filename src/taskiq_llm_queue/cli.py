@@ -31,6 +31,8 @@ from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.model_settings import (
     PROVIDER_SETTING_NAMES,
     SETTING_NAMES,
+    SHARED_PREFIX,
+    SHARED_TARGET,
     SettingsResolver,
     model_settings_store,
     validate_scope,
@@ -39,6 +41,7 @@ from taskiq_llm_queue.reliability.breaker import BreakerState, CircuitBreaker
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore, fallback_store
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, LimiterSettings
+from taskiq_llm_queue.reliability.rate import RateLimits, ValkeyRateBudget
 from taskiq_llm_queue.routing import RoutingConfig, routing_store
 
 if TYPE_CHECKING:
@@ -129,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     b_reset.add_argument("--target", help="one target (default: every target of the model)")
 
     groups.add_parser("queues", help="message counts per configured SQS queue and its DLQ")
+    status = groups.add_parser(
+        "status", help="waiting / working / started this minute / budget left per model"
+    )
+    status.add_argument("--model", help="one alias (default: every configured model)")
     return parser
 
 
@@ -187,6 +194,8 @@ async def _dispatch(args: argparse.Namespace, config: QueueConfig) -> int:
         return await _queues(config)
     keys = KeySpace(config.key_prefix)
     async with _valkey(config) as client:
+        if args.group == "status":
+            return await _status(args, config, client, keys)
         if args.group == "routing":
             default = RoutingConfig.model_validate(config.routing_default)
             return await _routing(args, routing_store(client, keys, default))
@@ -526,6 +535,83 @@ async def _queues(config: QueueConfig) -> int:
         rows = list(await asyncio.gather(*(_queue_row(sqs, q) for q in queues)))
     _print_json(rows)
     return 0
+
+
+async def _status(
+    args: argparse.Namespace, config: QueueConfig, client: redis.asyncio.Redis, keys: KeySpace
+) -> int:
+    """F18 / R12: per model, waiting (SQS), working (leases) and this minute's rate budget.
+
+    `waiting` is visible messages, `delayed` those released for later (rate or capacity),
+    `received` those a worker holds; per target `working` is the cluster-wide in-flight count
+    and `started` / `tokens` what the rate budget counted this calendar minute.
+    """
+    from aiobotocore.session import get_session  # SQS client only for this command
+
+    aliases = [args.model] if args.model else list(config.models)
+    unknown = [a for a in aliases if a not in config.models]
+    if unknown:
+        raise ConfigError(f"not in LLMQ_MODELS: {unknown}")
+    live = await model_settings_store(client, keys).load()
+    resolver = SettingsResolver(config, live)
+    limiter = AdaptiveLimiter(client, keys, LimiterSettings.from_config(config))
+    rate = ValkeyRateBudget(client, keys)
+    async with get_session().create_client(
+        "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
+    ) as sqs:
+        rows = []
+        for alias in aliases:
+            model = config.models[alias]
+            lanes = dict(
+                zip(
+                    model.queues,
+                    await asyncio.gather(*(_queue_row(sqs, q) for q in model.queues.values())),
+                    strict=True,
+                )
+            )
+            limits = resolver.rate_limits(alias)
+            targets = []
+            for target in model.targets:
+                state = await limiter.state(alias, target)
+                row: dict[str, Any] = {
+                    "target": target,
+                    "working": state.inflight,
+                    "limit": state.limit,
+                }
+                if limits.active:
+                    seen = await rate.peek(alias, target, limits)
+                    row.update(_budget_row(limits, seen))
+                targets.append(row)
+            entry: dict[str, Any] = {
+                "model": alias,
+                "queues": {
+                    lane: {
+                        "waiting": q.get("visible"),
+                        "delayed": q.get("delayed"),
+                        "received": q.get("in_flight"),
+                        **({"error": q["error"]} if "error" in q else {}),
+                    }
+                    for lane, q in lanes.items()
+                },
+                "targets": targets,
+            }
+            rpm, tpm = resolver.shared_rate(model.provider)
+            if rpm or tpm:
+                shared = RateLimits(rpm, tpm, limits.window, None, limits.rt_share)
+                seen = await rate.peek(f"{SHARED_PREFIX}{model.provider}", SHARED_TARGET, shared)
+                entry["provider_budget"] = {"provider": model.provider, **_budget_row(shared, seen)}
+            rows.append(entry)
+    _print_json(rows)
+    return 0
+
+
+def _budget_row(limits: RateLimits, seen: Mapping[str, int]) -> dict[str, Any]:
+    row: dict[str, Any] = {"window": limits.window, "started": seen["calls"]}
+    if limits.rpm:
+        row.update(rpm=limits.rpm, rpm_left=seen["rpm_left"])
+    if limits.tpm:
+        row.update(tpm=limits.tpm, tokens=seen["tokens"], tpm_left=seen["tpm_left"])
+    return row
 
 
 def job_message(

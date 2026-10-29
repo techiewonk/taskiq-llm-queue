@@ -49,6 +49,7 @@ from taskiq_llm_queue.reliability.breaker import CircuitBreaker
 from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.config_store import fallback_store
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, SyncAdaptiveLimiter
+from taskiq_llm_queue.reliability.rate import RateLimits, ValkeyRateBudget
 from taskiq_llm_queue.routing import routing_store
 
 
@@ -343,6 +344,7 @@ _REPLIES: dict[str, object] = {
     "CLAIM_COMPLETE": 1,
     "CLAIM_RELEASE": 1,
     "CONFIG_SET": b"",
+    "RATE": [1, b"0"],
 }
 
 
@@ -410,6 +412,9 @@ async def test_every_lua_call_site_uses_one_cluster_slot() -> None:
     await claims.release_owned("llm-1", worker="pod-a")
     for store in (routing_store(client, keys), fallback_store(client, keys)):
         await store.reset(actor="t")
+    rate = ValkeyRateBudget(client, keys)
+    grant, _ = await rate.take("@bedrock", "shared", RateLimits(rpm=10), bg=True, tokens=0)
+    assert grant is not None
 
     assert {name for name, _ in calls} == set(_script_names().values())  # every script ran
     for name, call_keys in calls:

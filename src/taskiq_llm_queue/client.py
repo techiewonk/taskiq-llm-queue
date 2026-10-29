@@ -82,6 +82,7 @@ from taskiq_llm_queue.reliability.config_store import LiveConfigStore, fallback_
 from taskiq_llm_queue.reliability.fallback import FallbackConfig
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, SyncAdaptiveLimiter
 from taskiq_llm_queue.reliability.local_limiter import LocalLimiter
+from taskiq_llm_queue.reliability.rate import LocalRateBudget, ValkeyRateBudget
 from taskiq_llm_queue.results.backend import LLMQResultBackend
 from taskiq_llm_queue.results.dispatcher import ResultDispatcher, ResultsUnavailable
 from taskiq_llm_queue.routing import CanaryRouter, RoutingConfig, routing_store
@@ -189,6 +190,7 @@ class _Started:
     runtime: WorkerRuntime
     workers: Workers | None
     pods: PodRegistry | None = None
+    rate: ValkeyRateBudget | None = None
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
 
 
@@ -252,6 +254,9 @@ class LLMQueue:
         self._pending_cancels: set[str] = set()
         self._sent_at = -math.inf  # monotonic time the last SQS send completed (any queue)
         self._local_limiter = _LocalLimiters(self.failover, config)
+        # C8: while Valkey is down each pod takes 1 / live pods of every rate budget.
+        self._local_rate = LocalRateBudget(share=self._pod_share)
+        self._rate_holds: dict[str, float] = {}  # C5: bg/bulk receive pauses by alias
         self._jobs: dict[str, JobFunction] = {}
         self._sync: _SyncRunner | None = None
         self._sync_lock = threading.Lock()
@@ -345,12 +350,18 @@ class LLMQueue:
         if stored < SCHEMA_VERSION:
             logger.error("schema_migration_needed", key=key, stored=stored, expected=SCHEMA_VERSION)
 
-    async def _watch_limits(self, limiter: AdaptiveLimiter, breaker: CircuitBreaker) -> None:
+    async def _watch_limits(
+        self,
+        limiter: AdaptiveLimiter,
+        breaker: CircuitBreaker,
+        rate: ValkeyRateBudget | None = None,
+    ) -> None:
         """Feed learned limits to the failover local cap; gauges per model target used here.
 
         `llmq_limit` from the last limiter reply; with a metrics sink also `llmq_inflight`
         (cluster-wide leases) and `llmq_breaker_open` (1 open, 0.5 half-open, 0 closed),
-        read from Valkey once per `cfg_reload_secs` (I14).
+        read from Valkey once per `cfg_reload_secs` (I14); for a target with a rate budget
+        also `llmq_rate_used` (calls started this minute) and `llmq_rate_remaining`.
         """
         note = getattr(self.failover, "note_limit", None)
         read_state = not isinstance(self.metrics, NullMetrics)
@@ -372,6 +383,17 @@ class LLMQueue:
                 safe_hook(self.metrics.gauge, mn.INFLIGHT, float(state.inflight), labels)
                 value = breaker_value.get(position, 0.0)
                 safe_hook(self.metrics.gauge, mn.BREAKER_OPEN, value, labels)
+                limits = self.settings.rate_limits(model)
+                if rate is None or not limits.active:
+                    continue
+                try:
+                    seen = await rate.peek(model, target, limits)
+                except Exception:
+                    continue
+                safe_hook(self.metrics.gauge, mn.RATE_USED, float(seen["calls"]), labels)
+                if limits.rpm:
+                    left = float(seen["rpm_left"])
+                    safe_hook(self.metrics.gauge, mn.RATE_REMAINING, left, labels)
 
     def _apply_settings(
         self, live: ModelSettings, limiter: AdaptiveLimiter, breaker: CircuitBreaker
@@ -422,6 +444,7 @@ class LLMQueue:
         limiter = AdaptiveLimiter(client, self.keys, limiter_settings(config))
         claims = RedisClaimStore(client, self.keys, claim_settings(config))
         breaker = CircuitBreaker(client, self.keys, breaker_settings(config))
+        rate = ValkeyRateBudget(client, self.keys)
         default_chains = FallbackConfig.model_validate(config.fallback_default)
         fallback = fallback_store(client, self.keys, default_chains)
         live_settings = model_settings_store(client, self.keys)
@@ -451,6 +474,8 @@ class LLMQueue:
             hooks=self.hooks,
             leases=self._leases,
             inflight=self._inflight,
+            rate=rate,
+            rate_holds=self._rate_holds,
         )
         runtime = WorkerRuntime(
             deps,
@@ -467,6 +492,7 @@ class LLMQueue:
             failover=self.failover,
             hooks=broker_hooks,
             session=self.aws_session,
+            rate_holds=self._rate_holds,
         )
         started: list[Any] = []
         try:
@@ -502,6 +528,7 @@ class LLMQueue:
             runtime,
             workers,
             pods,
+            rate,
         )
         heartbeat = self._pod_heartbeat(state, interval)
         state.tasks.append(
@@ -509,7 +536,7 @@ class LLMQueue:
         )
         state.tasks.append(asyncio.create_task(heartbeat.run(), name="llmq-pod-heartbeat"))
         state.tasks.append(
-            asyncio.create_task(self._watch_limits(limiter, breaker), name="llmq-limits")
+            asyncio.create_task(self._watch_limits(limiter, breaker, rate), name="llmq-limits")
         )
         state.tasks.append(asyncio.create_task(self._watch_settings(state), name="llmq-settings"))
         if self.router is None and config.routing_enabled:
@@ -1132,6 +1159,7 @@ class LLMQueue:
                 settings=lambda: self.settings,
                 worker=f"direct:{self.pod_id}",
                 hooks=self.hooks,
+                rate=self._local_rate,
             )
         return CoreDeps(
             config=self.config,
@@ -1146,7 +1174,14 @@ class LLMQueue:
             worker=f"direct:{self.pod_id}",
             hooks=self.hooks,
             leases=self._leases,
+            rate=state.rate,
         )
+
+    def _pod_share(self) -> float:
+        """This pod's share of a budget while Valkey is down: 1 / live pods (R09)."""
+        live = getattr(self.failover, "live_pods", None)
+        count = live() if callable(live) else 1
+        return 1 / max(1, int(count))
 
     async def _direct(self, envelope: Envelope, *, claim: bool = False) -> LLMReply:
         """Run in-process; with `claim` (DS17) a queued copy that already runs is awaited.

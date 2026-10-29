@@ -53,6 +53,10 @@ class KeySpace:
         """In-flight slot leases scored by expiry (sorted set)."""
         return self._target(model, target, "lease")
 
+    def rate(self, model: str, target: str) -> str:
+        """RPM / TPM budget state of one model target or `@<provider>` scope (hash, TTL)."""
+        return self._target(model, target, "rate")
+
     def breaker(self, model: str, target: str) -> str:
         """Circuit breaker state for one model target (hash, no TTL)."""
         return self._target(model, target, "cb")

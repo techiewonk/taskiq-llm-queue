@@ -23,6 +23,7 @@ from taskiq_llm_queue.config import (
     QueueConfig,
 )
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore
+from taskiq_llm_queue.reliability.rate import RateLimits
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -71,8 +72,8 @@ def _global(config: QueueConfig, name: str, lane: Lane | None) -> Any:
         return getattr(config.breaker, name.removeprefix("breaker_"))
     if name == "limiter_initial":
         return ModelConfig.model_fields["limiter_initial"].default
-    if name == "max_concurrency":
-        return None
+    if name in ("max_concurrency", "rpm", "tpm", "rate_burst"):
+        return None  # per model / provider only
     return getattr(config, name)
 
 
@@ -154,6 +155,28 @@ class SettingsResolver:
                 return cap
         return None
 
+    def rate_limits(self, alias: str) -> RateLimits:
+        """Effective RPM / TPM budget of one alias's targets (F17)."""
+        return RateLimits(
+            rpm=self.value(alias, "rpm"),
+            tpm=self.value(alias, "tpm"),
+            window=self.value(alias, "rate_window"),
+            burst=self.value(alias, "rate_burst"),
+            rt_share=self.value(alias, "rt_rate_share"),
+        )
+
+    def shared_rate(self, provider: str) -> tuple[int | None, int | None]:
+        """Provider-wide `(shared_rpm, shared_tpm)`: live, else `LLMQ_SETTINGS`, each on its own."""
+        out: list[int | None] = []
+        for name in ("shared_rpm", "shared_tpm"):
+            found = None
+            for layer in (self.live.providers, self.config.settings_default.providers):
+                found = getattr(layer.get(provider, _EMPTY_PROVIDER), name)
+                if found is not None:
+                    break
+            out.append(found)
+        return out[0], out[1]
+
     def shared_caps(self) -> dict[str, int]:
         """`@<provider>` limiter alias -> shared cap, for every provider that has one."""
         providers = {m.provider for m in self.config.models.values()}
@@ -176,6 +199,8 @@ class SettingsResolver:
         return {
             "models": sorted(a for a, m in self.config.models.items() if m.provider == provider),
             "shared_max_concurrency": self.shared_cap(provider),
+            "shared_rpm": self.shared_rate(provider)[0],
+            "shared_tpm": self.shared_rate(provider)[1],
             "live": live.model_dump(mode="json", exclude_defaults=True) if live else {},
             "env": env.model_dump(mode="json", exclude_defaults=True) if env else {},
         }

@@ -339,3 +339,45 @@ def test_settings_rejects_bad_input_without_writing(
     assert "error:" in capsys.readouterr().err
     assert sync_valkey.get(KeySpace(prefix).model_settings) is None
     assert audit(sync_valkey, prefix) == []
+
+
+def test_status_shows_waiting_working_and_this_minutes_budget(
+    cli_env: dict[str, str],
+    prefix: str,
+    jobs_queue: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F18 / R12: `status` joins SQS counts, in-flight leases and the rate budget per model."""
+    from taskiq_llm_queue.reliability.rate import RateLimits, ValkeyRateBudget
+
+    models = json.loads(cli_env["LLMQ_MODELS"])
+    models["gpt20b"]["queues"] = {"default": "jobs-ingest"}
+    env = {**cli_env, "LLMQ_MODELS": json.dumps(models)}
+    run(env, capsys, "settings", "set", "--model", "gpt20b", "rpm=100", "rate_window=fixed")
+    run(env, capsys, "settings", "set", "--provider", "openai", "shared_rpm=500")
+
+    async def take_three() -> None:
+        client = redis.asyncio.Redis(
+            host=env["LLMQ_REDIS_HOST"],
+            port=int(env["LLMQ_REDIS_PORT"]),
+            password=env["LLMQ_REDIS_PASSWORD"],
+        )
+        budget = ValkeyRateBudget(client, KeySpace(prefix))
+        for _ in range(3):
+            grant, _ = await budget.take(
+                "gpt20b", "primary", RateLimits(rpm=100, window="fixed"), bg=True, tokens=0
+            )
+            assert grant is not None
+        await client.aclose()
+
+    asyncio.run(take_three())
+    rows = json.loads(run(env, capsys, "status", "--model", "gpt20b"))
+    (row,) = rows
+    (target,) = row["targets"]
+    assert target["target"] == "primary"
+    assert target["working"] == 0
+    assert (target["rpm"], target["started"], target["rpm_left"]) == (100, 3, 97)
+    assert target["window"] == "fixed"
+    assert {"waiting", "delayed", "received"} <= set(row["queues"]["default"])
+    assert row["provider_budget"]["provider"] == "openai"
+    assert row["provider_budget"]["rpm"] == 500

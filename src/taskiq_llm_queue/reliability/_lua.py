@@ -470,3 +470,112 @@ redis.call('XTRIM', KEYS[2], 'MINID', tostring(now_ms - tonumber(ARGV[3])))
 return before
 """
 )
+
+# F17 rate budget for one scope (a model target or a provider's shared budget). KEYS: rate
+# hash. ARGV: op (take|give|peek), mode (smooth|fixed), bg (0|1), bg_share, ttl, then per
+# budget (rpm, tpm): limit (0 = off), cost, burst; then (give) calls to take back. `smooth`
+# is GCRA per budget (theoretical arrival time `<b>_tat`, burst allowance `burst` units, a
+# single cost above it passes when idle); `fixed` counts per calendar minute. bg/bulk also
+# pass a second bucket at
+# `limit * bg_share`, so rt keeps the rest. `take` is all or nothing: reply {1, '0'} or
+# {0, wait_secs}. `give` returns `cost` (negative: charges more, for a TPM correction).
+# `seen_*` count calls / tokens taken in the current minute (status view).
+# peek reply: {seen_calls, seen_tokens, available rpm units, available tpm units}.
+RATE = (
+    _NOW
+    + """
+local op, mode, bg = ARGV[1], ARGV[2], ARGV[3] == '1'
+local share, ttl = tonumber(ARGV[4]), tonumber(ARGV[5])
+local window = math.floor(now / 60)
+local budgets = {}
+for i, name in ipairs({'rpm', 'tpm'}) do
+  local base = 5 + (i - 1) * 3
+  local limit = tonumber(ARGV[base + 1])
+  if limit > 0 then
+    budgets[#budgets + 1] = {name = name, limit = limit,
+      cost = tonumber(ARGV[base + 2]), burst = tonumber(ARGV[base + 3])}
+  end
+end
+local function hnum(field, default)
+  return tonumber(redis.call('HGET', KEYS[1], field) or '') or default
+end
+if mode == 'fixed' and hnum('win', -1) ~= window then
+  redis.call('HSET', KEYS[1], 'win', window, 'rpm_n', 0, 'rpm_bgn', 0, 'tpm_n', 0, 'tpm_bgn', 0)
+end
+if hnum('seen_win', -1) ~= window then
+  redis.call('HSET', KEYS[1], 'seen_win', window, 'seen_calls', 0, 'seen_tokens', 0)
+end
+-- One bucket: returns (wait, new value) for a take of `cost`.
+local function check(b, suffix, limit, burst)
+  if mode == 'fixed' then
+    local n = hnum(b.name .. suffix, 0)
+    if n + b.cost <= limit or (n == 0 and b.cost > limit) then return 0, n + b.cost end
+    return (window + 1) * 60 - now, n
+  end
+  local t = 60 / limit
+  local tat = math.max(hnum(b.name .. suffix, now), now)
+  local new = tat + b.cost * t
+  local over = new - now - math.max(burst, b.cost) * t
+  if over > 0 then return over, tat end
+  return 0, new
+end
+local function buckets(b)
+  local list = {{suffix = (mode == 'fixed') and '_n' or '_tat', limit = b.limit, burst = b.burst}}
+  if bg then
+    list[2] = {suffix = (mode == 'fixed') and '_bgn' or '_bgtat',
+      limit = math.max(b.limit * share, 1e-9), burst = math.max(1, math.floor(b.burst * share))}
+  end
+  return list
+end
+if op == 'peek' then
+  local avail = {-1, -1}
+  for i, b in ipairs(budgets) do
+    local idx = (b.name == 'rpm') and 1 or 2
+    if mode == 'fixed' then
+      avail[idx] = math.max(0, b.limit - hnum(b.name .. '_n', 0))
+    else
+      local t = 60 / b.limit
+      local debt = math.max(hnum(b.name .. '_tat', now), now) - now
+      avail[idx] = math.max(0, math.floor((b.burst * t - debt) / t))
+    end
+  end
+  return {hnum('seen_calls', 0), hnum('seen_tokens', 0), avail[1], avail[2]}
+end
+if op == 'give' then
+  for _, b in ipairs(budgets) do
+    for _, k in ipairs(buckets(b)) do
+      local field = b.name .. k.suffix
+      if mode == 'fixed' then
+        redis.call('HSET', KEYS[1], field, math.max(0, hnum(field, 0) - b.cost))
+      else
+        local tat = hnum(field, now)
+        if b.cost < 0 or tat > now then
+          tat = math.max(math.max(tat, now) - b.cost * 60 / k.limit, now)
+          redis.call('HSET', KEYS[1], field, tostring(tat))
+        end
+      end
+    end
+    if b.name == 'tpm' then redis.call('HINCRBY', KEYS[1], 'seen_tokens', -b.cost) end
+  end
+  redis.call('HINCRBY', KEYS[1], 'seen_calls', -tonumber(ARGV[12] or '0'))
+  redis.call('EXPIRE', KEYS[1], ttl)
+  return {1, '0'}
+end
+local wait, updates = 0, {}
+for _, b in ipairs(budgets) do
+  for _, k in ipairs(buckets(b)) do
+    local w, value = check(b, k.suffix, k.limit, k.burst)
+    if w > wait then wait = w end
+    updates[#updates + 1] = {b.name .. k.suffix, value}
+  end
+end
+if wait > 0 then return {0, tostring(wait)} end
+for _, u in ipairs(updates) do redis.call('HSET', KEYS[1], u[1], tostring(u[2])) end
+redis.call('HINCRBY', KEYS[1], 'seen_calls', 1)
+for _, b in ipairs(budgets) do
+  if b.name == 'tpm' then redis.call('HINCRBY', KEYS[1], 'seen_tokens', b.cost) end
+end
+redis.call('EXPIRE', KEYS[1], ttl)
+return {1, '0'}
+"""
+)

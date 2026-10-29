@@ -14,6 +14,9 @@ SYNC_FALLBACK_TOTAL = "llmq_sync_fallback_total"
 RELEASED_UNKNOWN_TOTAL = "llmq_released_unknown_total"
 CONFIG_INVALID_TOTAL = "llmq_config_invalid_total"
 FAILOVER_ACTIVE = "llmq_failover_active"
+# F17 rate budget per model target: calls started this minute, RPM units left now.
+RATE_USED = "llmq_rate_used"
+RATE_REMAINING = "llmq_rate_remaining"
 # Broker (SQS) events, per queue (I14).
 SQS_RECEIVED_TOTAL = "llmq_sqs_received_total"
 SQS_SENT_TOTAL = "llmq_sqs_sent_total"

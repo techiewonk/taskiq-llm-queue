@@ -164,6 +164,12 @@ class Overrides(BaseModel):
     rt_capacity_wait_secs: float | None = Field(default=None, ge=0)
     breaker_threshold: int | None = Field(default=None, ge=1)
     breaker_cooldown_secs: float | None = Field(default=None, gt=0)
+    # F17 rate budget per model target (docs/RATE_LIMIT_PLAN.md); None = no rate limit.
+    rpm: int | None = Field(default=None, ge=1)
+    tpm: int | None = Field(default=None, ge=1)
+    rate_window: Literal["smooth", "fixed"] | None = None
+    rate_burst: int | None = Field(default=None, ge=1)
+    rt_rate_share: float | None = Field(default=None, ge=0, lt=1)
 
     @field_validator("timeout_secs", "embed_timeout_secs")
     @classmethod
@@ -188,6 +194,9 @@ class ProviderOverrides(Overrides):
     """
 
     shared_max_concurrency: int | None = Field(default=None, ge=1)
+    # One RPM / TPM budget across all models of the provider (an account quota).
+    shared_rpm: int | None = Field(default=None, ge=1)
+    shared_tpm: int | None = Field(default=None, ge=1)
 
 
 class ModelSettings(BaseModel):
@@ -359,6 +368,18 @@ class QueueConfig(BaseModel):
         description="Connect timeout of the built-in providers (botocore `connect_timeout`, "
         "httpx connect for OpenAI-compatible servers).",
     )
+    rate_window: Literal["smooth", "fixed"] = Field(
+        default="smooth",
+        description="Shape of `rpm` / `tpm` budgets: `smooth` spreads starts evenly (token "
+        "bucket with `rate_burst`), `fixed` allows the whole budget from each calendar minute.",
+    )
+    rt_rate_share: float = Field(
+        default=0.2,
+        ge=0,
+        lt=1,
+        description="Part of each rate budget only rt calls may use, so a bg backlog never "
+        "starves live calls (bg/bulk get at most 1 - share of the rate).",
+    )
     sqs_batch_wait_secs: float = Field(
         default=0.02,
         ge=0,
@@ -496,6 +517,8 @@ class QueueConfig(BaseModel):
             ("PROVIDER_CONNECT_TIMEOUT_SECS", "provider_connect_timeout_secs", float),
             ("SQS_SEND_TIMEOUT_SECS", "sqs_send_timeout_secs", float),
             ("SQS_BATCH_WAIT_SECS", "sqs_batch_wait_secs", float),
+            ("RATE_WINDOW", "rate_window", str),
+            ("RT_RATE_SHARE", "rt_rate_share", float),
             ("VALKEY_WAIT_FAILOVER_SECS", "valkey_wait_failover_secs", float),
             ("WORKER_SLOTS", "worker_slots", _int_map),
         ):

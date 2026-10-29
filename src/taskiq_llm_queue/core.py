@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import random
 import time
 from collections import OrderedDict
@@ -34,6 +35,12 @@ from taskiq_llm_queue.reliability.breaker import BreakerState
 from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.fallback import FallbackConfig, resolve_fallback
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter
+from taskiq_llm_queue.reliability.rate import (
+    RateGrant,
+    RateLimits,
+    estimate_tokens,
+    usage_tokens,
+)
 from taskiq_llm_queue.results.backend import LLMQResultBackend
 from taskiq_llm_queue.routing_hooks import QueueHooks, safe_hook
 
@@ -46,6 +53,7 @@ if TYPE_CHECKING:
     from taskiq_llm_queue.protocols import Lease, Limiter, Provider, ResultStore
     from taskiq_llm_queue.reliability.breaker import CircuitBreaker
     from taskiq_llm_queue.reliability.fallback import FallbackStep
+    from taskiq_llm_queue.reliability.rate import RateBudget
 
 logger = get_logger(__name__)
 
@@ -125,6 +133,14 @@ class ReplyCache:
         if item is None or item[0] <= now:
             return None
         return item[1]
+
+
+class _RateLimited(Exception):
+    """Internal: no rate token within this attempt's patience; `wait` is the time to the next."""
+
+    def __init__(self, wait: float) -> None:
+        super().__init__(wait)
+        self.wait = wait
 
 
 class _Stopped(Exception):
@@ -211,6 +227,10 @@ class CoreDeps:
     reply_cache: ReplyCache = field(default_factory=ReplyCache)
     # Running attempts by request id, for the cancel channel (I18); None: not stoppable.
     inflight: InflightAttempts | None = None
+    # RPM / TPM budgets (F17); None: no rate limiting on this path.
+    rate: RateBudget | None = None
+    # C5: alias -> epoch time until which this pod receives no bg/bulk work for it.
+    rate_holds: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,6 +653,104 @@ def _requeue_secs(envelope: Envelope, deps: CoreDeps) -> int | None:
     return int(min(_MAX_REQUEUE_SECS, max(_MIN_REQUEUE_SECS, remaining / 4)))
 
 
+# A queued bg/bulk call sleeps at most this long for a rate token, then goes back to SQS.
+_QUEUED_RATE_PATIENCE_SECS = 1.0
+
+
+def _rate_scopes(step: FallbackStep, deps: CoreDeps) -> list[tuple[str, str, RateLimits]]:
+    """The step's model-target budget and its provider's shared budget, when set."""
+    settings = _resolver(deps)
+    limits = settings.rate_limits(step.alias)
+    provider = _provider(deps, step.alias)
+    rpm, tpm = settings.shared_rate(provider)
+    shared = RateLimits(rpm, tpm, limits.window, None, limits.rt_share)
+    scopes = [
+        (step.alias, step.target, limits),
+        (f"{SHARED_PREFIX}{provider}", SHARED_TARGET, shared),
+    ]
+    return [scope for scope in scopes if scope[2].active]
+
+
+async def _take_rate(
+    envelope: Envelope,
+    step: FallbackStep,
+    deps: CoreDeps,
+    params: Mapping[str, Any],
+    *,
+    bounded: bool,
+    check_cancel: bool,
+) -> list[RateGrant]:
+    """Rate tokens for one attempt (model target, then provider), all or nothing (F17, C3).
+
+    Sleeps for a token while that fits the attempt's patience (rt: `RT_ACQUIRE_SECS`; a
+    queued bg/bulk call: 1 s, then back to SQS; a direct call: its deadline), else raises
+    `_RateLimited` with the wait. Tokens taken before a refusal are given back.
+    """
+    if deps.rate is None:
+        return []
+    scopes = _rate_scopes(step, deps)
+    if not scopes:
+        return []
+    remaining = envelope.deadline_at - deps.clock()
+    if envelope.lane is Lane.RT:
+        patience = min(RT_ACQUIRE_SECS, remaining)
+    elif bounded:
+        patience = min(_QUEUED_RATE_PATIENCE_SECS, remaining)
+    else:
+        patience = remaining
+    tokens = estimate_tokens(params) if any(lim.tpm for _, _, lim in scopes) else 0
+    bg = envelope.lane is not Lane.RT
+    started = deps.clock()
+    while True:
+        grants: list[RateGrant] = []
+        wait = 0.0
+        for model, target, limits in scopes:
+            grant, wait = await deps.rate.take(
+                model, target, limits, bg=bg, tokens=tokens if limits.tpm else 0
+            )
+            if grant is None:
+                break
+            grants.append(grant)
+        if wait <= 0:
+            return grants
+        for grant in grants:
+            await deps.rate.give(grant, call=True)
+        if deps.clock() - started + wait > patience:
+            raise _RateLimited(wait)
+        await _check_live(envelope, deps, check_cancel)
+        await deps.sleep(wait)
+
+
+async def _give_rate(deps: CoreDeps, grants: list[RateGrant]) -> None:
+    """Return tokens of an attempt that never started (no slot); best effort."""
+    if deps.rate is None:
+        return
+    for grant in grants:
+        try:
+            await deps.rate.give(grant, call=True)
+        except Exception as exc:  # the token is spent; the budget refills on its own
+            logger.warning("rate_give_failed", model=grant.model, error_type=type(exc).__name__)
+
+
+async def _correct_tokens(
+    deps: CoreDeps, grants: list[RateGrant], response: Mapping[str, Any]
+) -> None:
+    """C6: charge TPM budgets the real `usage` instead of the reservation; best effort."""
+    if deps.rate is None or not any(g.limits.tpm for g in grants):
+        return
+    used = usage_tokens(response)
+    if used is None:
+        return
+    for grant in grants:
+        if grant.limits.tpm and grant.tokens != used:
+            try:
+                await deps.rate.give(grant, grant.tokens - used, call=False)
+            except Exception as exc:
+                logger.warning(
+                    "rate_correct_failed", model=grant.model, error_type=type(exc).__name__
+                )
+
+
 async def _take_slot(
     envelope: Envelope,
     step: FallbackStep,
@@ -642,21 +760,31 @@ async def _take_slot(
     bounded: bool,
     fresh_claim: bool = False,
     shared_cap: int | None = None,
-) -> list[Lease] | None:
-    """Acquire the step's slot (and its provider's shared slot); cancel/deadline checked (DS14).
+    params: Mapping[str, Any] | None = None,
+) -> tuple[list[Lease], list[RateGrant]] | None:
+    """Rate tokens, then the step's slot (and its provider's shared slot) (DS14, F17).
 
     With `shared_cap` the call also holds a slot of `{m:@<provider>:shared}`, taken after the
     model slot within the same wait; failing that, the model slot is returned. `fresh_claim`:
-    the claim script checked the cancel flag just now, so skip the first check.
+    the claim script checked the cancel flag just now, so skip the first check. Rate tokens
+    come first (`_take_rate`, may raise `_RateLimited`) and go back when no slot follows.
     """
     await _check_live(envelope, deps, check_cancel and not fresh_claim)
+    grants = await _take_rate(
+        envelope, step, deps, params or {}, bounded=bounded, check_cancel=check_cancel
+    )
     wait = _acquire_wait(envelope, deps, bounded=bounded)
     abort = _cancel_probe(envelope, deps) if check_cancel else None
     started = deps.clock()
-    lease = await deps.limiter.acquire(
-        step.alias, step.target, envelope.lane, wait, should_abort=abort
-    )
+    try:
+        lease = await deps.limiter.acquire(
+            step.alias, step.target, envelope.lane, wait, should_abort=abort
+        )
+    except BaseException:
+        await _give_rate(deps, grants)
+        raise
     if lease is None:
+        await _give_rate(deps, grants)
         return None
     leases = [lease]
     try:
@@ -668,14 +796,16 @@ async def _take_slot(
             )
             if shared is None:
                 await _release(deps, lease, throttled=False)
+                await _give_rate(deps, grants)
                 return None
             leases.append(shared)
         await _check_live(envelope, deps, check_cancel)
     except BaseException:
         for held in leases:
             await _release(deps, held, throttled=False)
+        await _give_rate(deps, grants)
         raise
-    return leases
+    return leases, grants
 
 
 def _provider(deps: CoreDeps, alias: str) -> str:
@@ -751,7 +881,10 @@ async def run_call(
         pass_started = deps.clock()
         attempts_before = progress.attempts
         circuit_only = True
+        rate_stop = False  # D3: a bg/bulk call out of budget does not move to other steps
         for index, step in enumerate(steps):
+            if rate_stop:
+                break
             if not await _step_usable(step, envelope.lane, deps):
                 last, last_message = ErrorInfo(ErrorKind.RETRYABLE, "circuit_open"), "circuit open"
                 continue
@@ -767,17 +900,45 @@ async def run_call(
                 if attempt >= budget:
                     break
                 slot_t0 = deps.clock()
-                leases = await _take_slot(
-                    envelope,
-                    step,
-                    deps,
-                    check_cancel=check_cancel,
-                    bounded=requeue,
-                    fresh_claim=fresh_claim,
-                    shared_cap=shared_cap,
-                )
+                try:
+                    taken = await _take_slot(
+                        envelope,
+                        step,
+                        deps,
+                        check_cancel=check_cancel,
+                        bounded=requeue,
+                        fresh_claim=fresh_claim,
+                        shared_cap=shared_cap,
+                        params=call_params,
+                    )
+                except _RateLimited as limited:
+                    fresh_claim = False
+                    last = ErrorInfo(
+                        ErrorKind.THROTTLE, "rate_limited", retry_after_secs=round(limited.wait, 1)
+                    )
+                    last_message = f"rate budget used; next start in {limited.wait:.1f}s"
+                    if debug:
+                        logger.debug(
+                            "rate_limited",
+                            request_id=rid,
+                            model=step.alias,
+                            target=step.target,
+                            wait_secs=round(limited.wait, 2),
+                        )
+                    if envelope.lane is Lane.RT:
+                        break  # D3: rt tries the next target's budget
+                    # D3: bg/bulk wait for this target's budget, back in SQS when queued.
+                    if deps.rate_holds is not None:
+                        until = deps.clock() + limited.wait
+                        hold = deps.rate_holds.get(step.alias, 0.0)
+                        deps.rate_holds[step.alias] = max(hold, until)
+                    if requeue and deps.clock() + limited.wait < envelope.deadline_at:
+                        raise _Requeue(max(1, math.ceil(limited.wait))) from None
+                    rate_stop = True
+                    break
                 fresh_claim = False
                 slot_ms = round((deps.clock() - slot_t0) * 1000)
+                leases, grants = taken if taken is not None else (None, [])
                 if leases is None:
                     last, last_message = (
                         ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"),
@@ -849,6 +1010,7 @@ async def run_call(
                     )
                 if info is None:
                     await _record(deps, step, ok=True)
+                    await _correct_tokens(deps, grants, response)
                     if index:
                         safe_hook(
                             deps.hooks.on_fallback, envelope.model, f"{step.alias}@{step.target}"
