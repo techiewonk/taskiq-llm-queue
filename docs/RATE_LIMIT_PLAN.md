@@ -1,6 +1,8 @@
 # Rate limits (RPM / TPM) and the waiting / working streams — analysis and plan
 
-Status: **plan agreed** (decisions in section 6), not implemented yet. Written 2026-10-29 against `main` (`1af5ebb`).
+Status: **built** (C1–C11) on `main` from `8d47946`, scenarios R01–R12 in `tools/scenarios/sc_rate.py` (results in [STATUS.md](STATUS.md)). How it works: [ARCHITECTURE §5a](ARCHITECTURE.md#5a-rate-budgets-rpm--tpm-reliabilityratepy); how to use it: README "Rate limits (RPM / TPM)". Plan written 2026-10-29 against `1af5ebb`.
+
+Differences from the plan: R04 is folded into R01 (three workers share one budget); R10 (real quota below the configured RPM) is the adaptive limiter's existing behaviour, covered by S07 and S35c; in `fixed` mode a refused bg/bulk call waits for the next minute even when TPM corrections free tokens earlier (fewer SQS receives per message).
 
 ## 1. The question
 

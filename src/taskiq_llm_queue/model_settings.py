@@ -34,6 +34,8 @@ Source = Literal["live:model", "live:provider", "env:model", "env:provider", "en
 # Provider prefix of the shared-cap limiter key `{m:@<provider>:shared}`; aliases never hold "@".
 SHARED_PREFIX = "@"
 SHARED_TARGET = "shared"
+# F19 lane cap limiter alias `<alias>#<lane>` (per target, like the model's own key).
+LANE_SEP = "#"
 
 
 SETTING_NAMES: tuple[str, ...] = tuple(Overrides.model_fields)
@@ -62,8 +64,15 @@ def _builtin() -> QueueConfig:
     return QueueConfig()
 
 
+def lane_scope(alias: str, lane: Lane) -> str:
+    """Limiter alias of one model's lane cap, e.g. `gpt20b#bulk` (F19)."""
+    return f"{alias}{LANE_SEP}{lane.value}"
+
+
 def _global(config: QueueConfig, name: str, lane: Lane | None) -> Any:
     """Env-global (or built-in) value of `name`; per-model-only settings have none."""
+    if name == "lane_max_concurrency":
+        return None
     if name in LANE_SETTINGS:
         return getattr(config, name)[lane]
     if name == "bg_share":
@@ -177,6 +186,16 @@ class SettingsResolver:
             out.append(found)
         return out[0], out[1]
 
+    def lane_caps(self) -> dict[str, int]:
+        """`<alias>#<lane>` limiter alias -> cap, for every model lane that has one (F19)."""
+        out: dict[str, int] = {}
+        for alias in self.config.models:
+            for lane in Lane:
+                cap = self.value(alias, "lane_max_concurrency", lane)
+                if cap is not None:
+                    out[lane_scope(alias, lane)] = cap
+        return out
+
     def shared_caps(self) -> dict[str, int]:
         """`@<provider>` limiter alias -> shared cap, for every provider that has one."""
         providers = {m.provider for m in self.config.models.values()}
@@ -237,6 +256,7 @@ def model_settings_store(
 
 
 __all__ = [
+    "LANE_SEP",
     "LANE_SETTINGS",
     "PROVIDER_SETTING_NAMES",
     "SETTING_NAMES",
@@ -245,6 +265,7 @@ __all__ = [
     "Overrides",
     "ProviderOverrides",
     "SettingsResolver",
+    "lane_scope",
     "model_settings_store",
     "validate_scope",
 ]

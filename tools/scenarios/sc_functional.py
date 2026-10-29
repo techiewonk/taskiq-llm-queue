@@ -22,6 +22,7 @@ from tools.scenarios.common import (
     calls,
     hgetall,
     limiter_state,
+    one,
     redis_call,
     wait_until,
 )
@@ -286,6 +287,46 @@ async def s55(ctx: Ctx) -> None:
     ctx.expect(not dups, f"{len(dups)} requests ran twice")
     ctx.expect(peak == shared, f"combined provider peak {peak}, want exactly {shared}")
     ctx.expect(int(pool.get("limit", 0) or 0) == shared, f"shared limit {pool.get('limit')}")
+
+
+@scenario("S57", "Lane caps: bulk and bg each have their own bucket")
+async def s57(ctx: Ctx) -> None:
+    """`lane_max_concurrency` bulk 3, bg 5 on gpt20b (bucket 20), set live.
+
+    300 bulk + 300 bg calls at once: bulk never has more than 3 in flight, bg never more than
+    5, an rt call still starts at once, and every call completes once.
+    """
+    await ctx.fake.patch(GPT20B_PRIMARY, {"latency_ms": {"p50": 200, "p95": 300}})
+    models = api.models(ctx.settings)
+    models["gpt20b"] = models["gpt20b"].model_copy(update={"max_concurrency": 20})
+    cfg = ctx.config(models=models, limiter={"bg_share": 1.0})
+    await _set_live(ctx, {"models": {"gpt20b": {"lane_max_concurrency": {"bulk": 3, "bg": 5}}}})
+    await ctx.workers(3, cfg)
+    q = await ctx.queue(cfg)
+    work = asyncio.gather(
+        calls(ctx, q, 300, tag="u", lane="bulk"),
+        calls(ctx, q, 300, tag="g", lane="bg", start=300),
+    )
+    await asyncio.sleep(3)
+    t0 = time.monotonic()
+    rt = await one(ctx, q, 999, tag="r", lane="rt", timeout_secs=30)
+    rt_secs = time.monotonic() - t0
+    bulk, bg = await work
+    bulk_log = await ctx.fake.calls(ctx.rid_prefix("u"))
+    bg_log = await ctx.fake.calls(ctx.rid_prefix("g"))
+    failed = [r for r in (*bulk, *bg) if not r.ok]
+    dups = {rid: c for rid, c in stack.ok_calls({**bulk_log, **bg_log}).items() if c > 1}
+    bulk_peak, bg_peak = _peak_concurrency(bulk_log), _peak_concurrency(bg_log)
+    ctx.metric("bulk_peak", bulk_peak)
+    ctx.metric("bg_peak", bg_peak)
+    ctx.metric("rt_secs", round(rt_secs, 2))
+    ctx.expect(not failed, f"{len(failed)} calls failed")
+    ctx.expect(not dups, f"{len(dups)} requests ran twice")
+    ctx.expect(bulk_peak <= 3, f"bulk peak {bulk_peak}, cap 3")
+    ctx.expect(bg_peak <= 5, f"bg peak {bg_peak}, cap 5")
+    ctx.expect(bulk_peak == 3 and bg_peak == 5, f"caps not reached: {bulk_peak}, {bg_peak}")
+    ctx.expect(rt.ok and rt_secs < 2, f"rt call: {rt.error!r} after {rt_secs:.1f}s")
+    await ctx.final_checks()
 
 
 @scenario("S53", "Fixed bucket: 2,000 queued, exactly N in flight", tags=("slow",))

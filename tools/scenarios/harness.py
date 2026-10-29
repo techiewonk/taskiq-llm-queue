@@ -104,6 +104,7 @@ def load_all() -> None:
         sc_failures,
         sc_functional,
         sc_load,
+        sc_rate,
     )
 
 

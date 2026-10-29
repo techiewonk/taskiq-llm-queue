@@ -27,7 +27,13 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.envelope import CallMeta, Envelope, LLMReply
 from taskiq_llm_queue.errors import ConfigError, ErrorInfo, ErrorKind, QueueUnavailable
-from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, Backoff, SettingsResolver
+from taskiq_llm_queue.model_settings import (
+    SHARED_PREFIX,
+    SHARED_TARGET,
+    Backoff,
+    SettingsResolver,
+    lane_scope,
+)
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.classify import is_target_error
 from taskiq_llm_queue.reliability import _lua
@@ -760,6 +766,7 @@ async def _take_slot(
     bounded: bool,
     fresh_claim: bool = False,
     shared_cap: int | None = None,
+    lane_capped: bool = False,
     params: Mapping[str, Any] | None = None,
 ) -> tuple[list[Lease], list[RateGrant]] | None:
     """Rate tokens, then the step's slot (and its provider's shared slot) (DS14, F17).
@@ -768,6 +775,8 @@ async def _take_slot(
     model slot within the same wait; failing that, the model slot is returned. `fresh_claim`:
     the claim script checked the cancel flag just now, so skip the first check. Rate tokens
     come first (`_take_rate`, may raise `_RateLimited`) and go back when no slot follows.
+    `lane_capped`: the lane has its own bucket `{m:<alias>#<lane>:<target>}` (F19), taken
+    after the model slot and before the provider's.
     """
     await _check_live(envelope, deps, check_cancel and not fresh_claim)
     grants = await _take_rate(
@@ -787,18 +796,23 @@ async def _take_slot(
         await _give_rate(deps, grants)
         return None
     leases = [lease]
+    extra: list[tuple[str, str]] = []
+    if lane_capped:
+        extra.append((lane_scope(step.alias, envelope.lane), step.target))
+    if shared_cap is not None:
+        extra.append((f"{SHARED_PREFIX}{_provider(deps, step.alias)}", SHARED_TARGET))
     try:
-        if shared_cap is not None:
-            provider = _provider(deps, step.alias)
+        for scope, scope_target in extra:  # fixed buckets: never learn, rt share (all of it)
             remaining = max(0.0, wait - (deps.clock() - started))
-            shared = await deps.limiter.acquire(
-                f"{SHARED_PREFIX}{provider}", SHARED_TARGET, Lane.RT, remaining, should_abort=abort
+            held = await deps.limiter.acquire(
+                scope, scope_target, Lane.RT, remaining, should_abort=abort
             )
-            if shared is None:
-                await _release(deps, lease, throttled=False)
+            if held is None:
+                for taken in leases:
+                    await _release(deps, taken, throttled=False)
                 await _give_rate(deps, grants)
                 return None
-            leases.append(shared)
+            leases.append(held)
         await _check_live(envelope, deps, check_cancel)
     except BaseException:
         for held in leases:
@@ -896,6 +910,9 @@ async def run_call(
             budget = config.retry_attempts
             attempt_timeout = settings.value(step.alias, "attempt_timeout_secs")
             shared_cap = settings.shared_cap(_provider(deps, step.alias))
+            lane_capped = (
+                settings.value(step.alias, "lane_max_concurrency", envelope.lane) is not None
+            )
             for attempt in itertools.count():
                 if attempt >= budget:
                     break
@@ -909,6 +926,7 @@ async def run_call(
                         bounded=requeue,
                         fresh_claim=fresh_claim,
                         shared_cap=shared_cap,
+                        lane_capped=lane_capped,
                         params=call_params,
                     )
                 except _RateLimited as limited:

@@ -27,7 +27,12 @@ from taskiq_llm_queue.broker.queue import Batching, SQSQueue
 from taskiq_llm_queue.broker.s3_offload import S3OffloadMiddleware
 from taskiq_llm_queue.broker.serializer import WireSerializer
 from taskiq_llm_queue.config import Lane
-from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, SettingsResolver
+from taskiq_llm_queue.model_settings import (
+    SHARED_PREFIX,
+    SHARED_TARGET,
+    SettingsResolver,
+    lane_scope,
+)
 from taskiq_llm_queue.reliability.breaker import BreakerSettings
 from taskiq_llm_queue.reliability.claims import ClaimSettings
 from taskiq_llm_queue.reliability.limiter import AdaptiveLimiter, LimiterSettings
@@ -130,16 +135,17 @@ def limiter_settings(
 
     Per alias: start (`limiter_initial`), cap (`max_concurrency`) and `bg_share` from the
     resolver's six layers (README "Settings"); each provider's shared cap becomes a fixed
-    limit of the `@<provider>` limiter alias (start = cap).
+    limit of the `@<provider>` limiter alias and each lane cap one of `<alias>#<lane>`
+    (start = cap).
     """
     resolver = resolver or SettingsResolver(config)
     tuning = config.limiter
     aliases = list(config.models)
-    shared = resolver.shared_caps()
+    fixed = {**resolver.shared_caps(), **resolver.lane_caps()}  # fixed buckets: start = cap
     initial = {a: resolver.value(a, "limiter_initial") for a in aliases}
     return LimiterSettings(
-        initial={**initial, **shared},
-        max_by_model={**resolver.model_caps(), **shared},
+        initial={**initial, **fixed},
+        max_by_model={**resolver.model_caps(), **fixed},
         bg_share_by_model={a: resolver.value(a, "bg_share") for a in aliases},
         min_limit=tuning.min_limit,
         max_limit=tuning.max_limit,
@@ -290,6 +296,22 @@ def receive_budget(
         )
         if pool:  # the provider's shared cap bounds every model of that provider
             best = min(best, pool[0].headroom() - limiter.waiting(shared, SHARED_TARGET))
+        capped = lane_scope(alias, lane)
+        if capped in (limiter.settings.max_by_model or {}):  # F19: this lane's own bucket
+            try:
+                lane_states = await limiter.states(capped, model.targets)
+            except RedisError as exc:
+                if failover is not None:
+                    failover.report_redis_failure(exc)
+                return 0
+            lane_best = max(
+                (
+                    state.headroom() - limiter.waiting(capped, target)
+                    for target, state in zip(model.targets, lane_states, strict=True)
+                ),
+                default=0,
+            )
+            best = min(best, lane_best)
         return max(0, best)
 
     return budget

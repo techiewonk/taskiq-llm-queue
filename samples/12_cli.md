@@ -112,6 +112,18 @@ uv run llm-queue settings set --provider bedrock shared_max_concurrency=40 retry
 uv run llm-queue settings set --model gpt20b rt_capacity_wait_secs=10 throttle_retry_attempts=10
 uv run llm-queue settings unset --model gpt20b max_concurrency     # back to .env / default
 uv run llm-queue settings reset                                    # drop every live override
+uv run llm-queue settings set --model gpt20b rpm=500 tpm=200000 rate_window=fixed   # rate budget
+uv run llm-queue settings set --provider bedrock shared_rpm=800                       # account quota
+uv run llm-queue settings set --model gpt20b lane_max_concurrency.bulk=5             # bulk bucket
 ```
 
 Sources in `get`: `live:model`, `live:provider`, `env:model`, `env:provider` (`LLMQ_SETTINGS`), `env` (`LLMQ_*`), `default`. Every change is audited (`--actor`, default the OS user); a bad name, value, alias or provider is refused before anything is written.
+
+## What is waiting and what is running
+
+```bash
+uv run llm-queue status                  # every model
+uv run llm-queue status --model gpt20b
+```
+
+Per model: `queues.<lane>` with `waiting` (visible in SQS), `delayed` (released for later: no rate token or no slot) and `received` (held by a worker); per target `working` (calls in flight on all pods), `limit`, and with a rate budget `started` this minute, `rpm_left`, `tokens`, `tpm_left`; `provider_budget` when the provider has `shared_rpm` / `shared_tpm`.

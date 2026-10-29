@@ -1187,3 +1187,20 @@ async def test_provider_shared_budget_is_taken_after_the_model_one(world: World)
     _live(world, providers={"bedrock": {"shared_rpm": 500}})
     await execute_job(envelope(lane="bg"), world.deps)
     assert [(m, t) for m, t, _, _ in rate.taken] == [("@bedrock", "shared")]
+
+
+async def test_lane_cap_takes_a_slot_of_the_lane_bucket(world: World) -> None:
+    """F19: a bulk call of a model with `lane_max_concurrency.bulk` also holds a slot of
+    `big#bulk`; with that bucket full it moves on like any other full bucket."""
+    _live(world, models={"big": {"lane_max_concurrency": {"bulk": 2}}})
+    await execute_job(envelope(lane="bulk"), world.deps)
+    assert ("acquire", "big#bulk", "primary", False) in world.limiter.events
+    world.limiter.events.clear()
+    await execute_job(envelope(lane="bg"), world.deps)  # bg has no cap: no lane slot
+    assert all("#" not in event[1] for event in world.limiter.events)
+    world.limiter.deny.add(("big#bulk", "primary"))
+    reply = (
+        await execute_job(envelope(lane="bulk", deadline_at=time.time() + 300), world.deps)
+    ).reply
+    assert reply is None or reply.meta.served_target != "primary"
+    assert world.limiter.held == 0  # the model slot taken before the refusal went back

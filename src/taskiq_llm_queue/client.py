@@ -67,7 +67,12 @@ from taskiq_llm_queue.lifecycle import (
     queue_name,
 )
 from taskiq_llm_queue.metrics import MetricsSink, NullMetrics
-from taskiq_llm_queue.model_settings import SHARED_PREFIX, SettingsResolver, model_settings_store
+from taskiq_llm_queue.model_settings import (
+    LANE_SEP,
+    SHARED_PREFIX,
+    SettingsResolver,
+    model_settings_store,
+)
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.embeddings import (
     batches,
@@ -373,7 +378,7 @@ class LLMQueue:
                     safe_hook(note, model, target, limit)
                 labels = {"model": model, "target": target}
                 safe_hook(self.metrics.gauge, mn.LIMIT, float(limit), labels)
-                if not read_state or model.startswith(SHARED_PREFIX):
+                if not read_state or model.startswith(SHARED_PREFIX) or LANE_SEP in model:
                     continue
                 try:
                     state = await limiter.state(model, target)
@@ -411,7 +416,7 @@ class LLMQueue:
         self.settings = resolver
         limiter.settings = limits
         breaker.by_model = breaker_by_model(resolver)
-        caps = {**resolver.model_caps(), **resolver.shared_caps()}
+        caps = {**resolver.model_caps(), **resolver.shared_caps(), **resolver.lane_caps()}
         self._local_limiter.set_model_caps(caps)
         if isinstance(self.failover, FailoverState):
             self.failover.settings = dataclasses.replace(self.failover.settings, model_caps=caps)
@@ -1399,7 +1404,8 @@ class _SyncRunner:
     """A daemon thread with its own event loop and providers for sync callers (R22).
 
     Providers bind their HTTP clients to a loop, so sync calls get their own registry; the
-    limiter is the shared Valkey one through a blocking client (or the local cap, DS18).
+    limiter is the shared Valkey one through a blocking client (or the local cap, DS18). Rate
+    budgets use an async client created on this loop (or a local budget while Valkey is down).
     """
 
     def __init__(self, owner: LLMQueue) -> None:
@@ -1411,6 +1417,8 @@ class _SyncRunner:
         self._thread.start()
         self._registry = ProviderRegistry(owner.config, factories=owner._factories)
         self._redis: redis.Redis | None = None
+        self._async_redis: Redis | None = None  # rate budgets; bound to this loop
+        self._local_rate = LocalRateBudget(share=owner._pod_share)
 
     def run(self, coro: Coroutine[Any, Any, _T], timeout_secs: float) -> _T:
         """Run `coro` on the private loop and block for its result."""
@@ -1433,6 +1441,14 @@ class _SyncRunner:
             )
         )
 
+    def _rate(self) -> ValkeyRateBudget | LocalRateBudget:
+        owner = self._owner
+        if owner.failover.redis_down():
+            return self._local_rate
+        if self._async_redis is None:  # created on the private loop, used only there
+            self._async_redis = create_redis(owner.config, client_name=owner._redis_name())
+        return ValkeyRateBudget(self._async_redis, owner.keys)
+
     async def execute(self, envelope: Envelope) -> LLMReply:
         owner = self._owner
         deps = CoreDeps(
@@ -1444,6 +1460,7 @@ class _SyncRunner:
             worker=f"sync:{owner.pod_id}",
             hooks=owner.hooks,
             leases=owner._leases,  # renewed by the pod heartbeat (DS11)
+            rate=self._rate(),
         )
         try:
             result = await execute_job(envelope, deps, claim=False, store=False)
@@ -1452,6 +1469,7 @@ class _SyncRunner:
             if exc.attempted:  # never a second provider call
                 raise QueueUnavailable(f"Valkey failed during call {envelope.request_id}") from exc
             deps.limiter = owner._local_limiter
+            deps.rate = self._local_rate
             result = await execute_job(envelope, deps, claim=False, store=False)
         assert result.reply is not None
         return result.reply
@@ -1460,6 +1478,9 @@ class _SyncRunner:
         """Close providers, stop the loop and the thread."""
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self._registry.aclose(), self._loop).result(10)
+        if self._async_redis is not None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self._async_redis.aclose(), self._loop).result(5)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=10)
         if self._redis is not None:

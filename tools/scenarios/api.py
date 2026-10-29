@@ -408,6 +408,7 @@ def cli_environ(config: QueueConfig) -> dict[str, str]:
         "LLMQ_AWS_REGION": str(config.aws_region),
         "LLMQ_MODELS": orjson.dumps(data["models"]).decode(),
         "LLMQ_FALLBACK_CHAINS": orjson.dumps(data["fallback_default"]).decode(),
+        "LLMQ_SETTINGS": orjson.dumps(data["settings_default"]).decode(),
     }
 
 

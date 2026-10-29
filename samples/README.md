@@ -49,6 +49,7 @@ something else, set the matching `LLMQ_*` variable (e.g. `LLMQ_REDIS_HOST`, `LLM
 | `13_research_assistant_flow.py` | the research-assistant app's 12 LLM/embedding flows (agent graph, guardrail, follow-ups, embeddings, nudge/ingest jobs) on the local stack or real Bedrock; see below |
 | `14_settings_and_buckets.py` | settings per provider and model (`settings_default` = `LLMQ_SETTINGS`), value + source, bucket size, a live change without restart, a provider-wide bucket shared by two models |
 | `15_retries_errors_and_rt_wait.py` | the retry curve, `exc.meta` on a failed call (attempts, queue wait, last target), `rt_capacity_wait_secs` live per model |
+| `16_rate_limits_and_lane_caps.py` | RPM budget per minute (`fixed`), the rt reserve inside it, a bucket for the bulk lane (`lane_max_concurrency`), `llm-queue status` |
 
 ## Running
 

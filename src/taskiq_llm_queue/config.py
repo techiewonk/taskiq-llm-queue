@@ -141,7 +141,7 @@ class BreakerTuning(BaseModel):
     cooldown_secs: float = Field(default=15.0, gt=0)
 
 
-LANE_SETTINGS = frozenset({"timeout_secs", "embed_timeout_secs"})
+LANE_SETTINGS = frozenset({"timeout_secs", "embed_timeout_secs", "lane_max_concurrency"})
 
 
 class Overrides(BaseModel):
@@ -154,6 +154,8 @@ class Overrides(BaseModel):
     bg_share: float | None = Field(default=None, gt=0, le=1)
     timeout_secs: dict[Lane, float] = Field(default_factory=dict)
     embed_timeout_secs: dict[Lane, float] = Field(default_factory=dict)
+    # F19: cap on one lane's calls in flight per target, inside `max_concurrency`.
+    lane_max_concurrency: dict[Lane, int] = Field(default_factory=dict)
     attempt_timeout_secs: float | None = Field(default=None, gt=0)
     throttle_retry_attempts: int | None = Field(default=None, ge=1, le=20)
     retry_base_secs: float | None = Field(default=None, ge=0)
@@ -171,11 +173,11 @@ class Overrides(BaseModel):
     rate_burst: int | None = Field(default=None, ge=1)
     rt_rate_share: float | None = Field(default=None, ge=0, lt=1)
 
-    @field_validator("timeout_secs", "embed_timeout_secs")
+    @field_validator("timeout_secs", "embed_timeout_secs", "lane_max_concurrency")
     @classmethod
-    def _positive(cls, value: dict[Lane, float]) -> dict[Lane, float]:
+    def _positive(cls, value: dict[Lane, Any]) -> dict[Lane, Any]:
         if any(v <= 0 for v in value.values()):
-            raise ValueError(f"lane timeouts must be > 0: {value}")
+            raise ValueError(f"lane values must be > 0: {value}")
         return value
 
     def get(self, name: str, lane: Lane | None = None) -> Any:

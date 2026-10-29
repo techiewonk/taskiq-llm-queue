@@ -148,7 +148,7 @@ Redis keys are cluster-safe (hash-tagged per request and per model+target), so c
 
 A provider (`bedrock`, `openai`, or a custom one) serves several models. These settings can be given once for a provider, overridden for one model, and changed live on every pod without a restart:
 
-`max_concurrency`, `limiter_initial`, `bg_share`, `timeout_secs.<lane>`, `embed_timeout_secs.<lane>`, `attempt_timeout_secs`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs`, `breaker_threshold`, `breaker_cooldown_secs`, and for a provider only `shared_max_concurrency`.
+`max_concurrency`, `limiter_initial`, `bg_share`, `timeout_secs.<lane>`, `embed_timeout_secs.<lane>`, `attempt_timeout_secs`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs`, `breaker_threshold`, `breaker_cooldown_secs`, `lane_max_concurrency.<lane>`, the rate budget `rpm`, `tpm`, `rate_window`, `rate_burst`, `rt_rate_share` ([Rate limits](#rate-limits-rpm--tpm)), and for a provider only `shared_max_concurrency`, `shared_rpm`, `shared_tpm`.
 
 Each one resolves through six layers; the highest that has a value wins:
 
@@ -251,9 +251,48 @@ The queue depth is unbounded: SQS holds every request that is not running. How m
 
 `bg` and `bulk` may use `bg_share` (80 %) of the limit, so with a cap of 10, background work runs at most 8 at once and keeps 2 slots for `rt`. Set `LLMQ_AC_BG_SHARE=1` to give all lanes the whole bucket.
 
+**A bucket per lane.** `lane_max_concurrency.<lane>` gives one lane of a model its own cap inside the model's bucket, per target and across all pods, e.g. bulk embeddings at most 5 while bg may use 15 of 20:
+
+```bash
+LLMQ_SETTINGS='{"models": {"titan": {"max_concurrency": 20, "lane_max_concurrency": {"bulk": 5, "bg": 15}}}}'
+llm-queue settings set --model titan lane_max_concurrency.bulk=3      # live, every pod
+```
+
+A call in a capped lane holds a slot of the model's bucket and one of the lane's (`{m:<alias>#<lane>:<target>}`, a fixed bucket that never learns). A full lane leaves its own backlog in SQS while the other lanes keep receiving. Measured (scenario S57): gpt20b bucket 20, bulk 3, bg 5, 300 bulk + 300 bg calls at once: bulk peaked at exactly 3, bg at exactly 5, an rt call in the middle started in 0.23 s, all 600 OK.
+
 A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received keeps walking its fallback chain for a free slot (2 s per step) for up to `rt_capacity_wait_secs` (30 s, never past its deadline), then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. `max_concurrency` and `bg_share` can also be set per provider and changed live ([Settings per provider and model](#settings-per-provider-and-model)), and a provider can have one bucket shared by all its models. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
 
 Measured (scenario S53, fakellm at 200 ms p50, 3 workers × 50 slots, `max_concurrency=10`, `bg_share=1`): 2,000 bg calls queued (2,000 visible in SQS at peak), peak provider concurrency exactly 10 (from the call log and fakellm's own counter), limiter never above 10, 2,000/2,000 done, 0 lost, 0 duplicates, 61 s wall time. SQS in-flight peaked at 40, which is 10 running plus finished messages waiting for the 0.5 s batched delete.
+
+### Rate limits (RPM / TPM)
+
+Concurrency caps how many calls run at once; a provider quota is usually per minute. Set `rpm` (calls that may **start** per minute) and / or `tpm` (tokens per minute) per model, and `shared_rpm` / `shared_tpm` per provider for an account quota. Each budget is per model **target** (a model with a primary and an APAC profile has one budget on each), shared by every pod in Valkey. Unset means no rate limit.
+
+```bash
+LLMQ_SETTINGS='{"models": {"gpt120b": {"rpm": 500, "tpm": 200000}},
+                "providers": {"bedrock": {"shared_rpm": 800}}}'
+llm-queue settings set --model gpt120b rpm=300 rate_window=fixed    # live, every pod
+llm-queue status --model gpt120b       # waiting / working / started this minute / left
+```
+
+A call starts only with a rate token **and** a concurrency slot. How the budget behaves:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `rate_window` | `smooth` | `smooth`: a token bucket, `rpm / 60` per second with `rate_burst` back to back. `fixed`: the whole `rpm` from each calendar minute (500 at 10:00:00, the next 500 from 10:01:00) |
+| `rate_burst` | 10 % of `rpm` | Calls that may start back to back in `smooth` mode; TPM uses the same fraction |
+| `rt_rate_share` | 0.2 | Part of each budget only `rt` may use: `bg`/`bulk` get at most 80 % of the rate, so a backlog never starves live calls |
+
+When a budget is used up:
+
+- **`bg` / `bulk`** wait for **their own target's** budget: the message goes back to SQS with a delay until the next token, and that pod stops receiving the model's `bg`/`bulk` work until then (the backlog stays in SQS). They never spend a fallback target's budget.
+- **`rt`** moves to the next target in its chain (each target has its own budget), then keeps trying for `rt_capacity_wait_secs` (30 s, never past its deadline), then fails with `ProviderError("rate_limited ...")`, `retryable=True`, `retry_after_secs` = time to the next token (HTTP 429 through `http_transport`).
+- **TPM** reserves `input characters / 4 + max output tokens` (1,000 when the request sets none) before the call and is corrected with the response's `usage` after it, so a generous `max_tokens` does not hold the budget.
+- **Valkey down**: each pod applies `limit / live pods` in process (best effort; the total is right while the pod count is right).
+
+`llm-queue status` prints per model: SQS `waiting` / `delayed` / `received` per lane queue, and per target `working` (calls in flight, all pods), `limit`, `started` this minute, `rpm_left`, `tokens`, `tpm_left`, plus the provider's shared budget. Metrics: `llmq_rate_used` and `llmq_rate_remaining` per model target; waiting messages are SQS's own `ApproximateNumberOfMessagesVisible` in CloudWatch.
+
+The adaptive limiter stays on underneath: if the real quota is lower than the `rpm` you set, throttles still cut concurrency.
 
 ## Results
 

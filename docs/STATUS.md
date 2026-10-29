@@ -1,6 +1,6 @@
 # Status: features, issues, solutions and results
 
-Snapshot **2026-10-30**, library `main` at `1e09f08`. PyPI has
+Snapshot **2026-10-30**, library `main` (rate limits, lane buckets and the items below; see git log). PyPI has
 `0.1.0a1`, which has **none** of the features marked "main only". Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
 v0.30 in the app repo; rate-limit design: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
 
@@ -28,8 +28,14 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | F14 | **rt capacity wait** `rt_capacity_wait_secs` (30 s, live per model) | 🟡 main only | core | 15 | unit tests, sample 15; S35b effect unclear (I4) |
 | F15 | **`.meta` on every error** (attempts, queue wait, last target) | ✅ main only | client, core | 15 | unit tests, sample 15 |
 | F16 | Old `_S` env names dropped | ✅ main only | config | — | unit test |
-| F17 | **RPM / TPM rate budget** ("500 this minute, rest next minute") | 🔵 planned (D101–D104) | — | — | scenarios R01–R12 defined |
-| F18 | **Waiting / working / done view** (`llm-queue status` + metrics) | 🔵 planned | — | — | R12 |
+| F17 | **RPM / TPM rate budget** per model target and provider (`smooth` or `fixed` minute, rt reserve, usage-corrected TPM) | ✅ main only | rate, core | 16 | R01–R09, R11 PASS (below); integration tests on Valkey |
+| F18 | **Waiting / working / done view** `llm-queue status` + `llmq_rate_used` / `llmq_rate_remaining` | ✅ main only | cli, client | 16, 12_cli.md | R12: status = call log (12 started, 18 left) |
+| F19 | **A bucket per lane** `lane_max_concurrency.<lane>` | ✅ main only | core, lifecycle | 16 | S57: bulk 3 / bg 5 held exactly over 600 calls |
+| F20 | Cancel stops a running attempt; caller timeout too | ✅ main only | core, client | 10 | S56: slot freed 0.03–0.05 s after cancel |
+| F21 | Debug trace per call (`taskiq_llm_queue.core` at DEBUG) | ✅ main only | core | — | unit test of the event sequence |
+| F22 | Metrics: `llmq_inflight`, `llmq_breaker_open`, SQS counters per queue | ✅ main only | client, lifecycle | — | unit tests |
+| F23 | S3 offload for messages over 200 KB (`s3_offload_bucket`) | ✅ main only | lifecycle, client | — | integration test (moto S3 + ElasticMQ) |
+| F24 | Send batching for bg / bulk (`sqs_batch_wait_secs` 0.02 s) | ✅ main only | lifecycle | — | S35, S35b, S35c, S23, S27 PASS |
 
 ## 2. Issues found and their solutions
 
@@ -41,22 +47,25 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | I4 | **One model's rt queue missed its 180 s deadline in some S35b runs** | Two causes found with a per-second timeline: (1) false "SQS down" at burst start: the sender's busy loop made its first sends look stalled against `_sent_at = -inf`, so both chat models failed over to direct for 300 s; (2) the limiter paused a model on chance windows (2 of 3 throttled ≈ 22 % of windows at 30 % random), pauses fed on themselves (failing runs paused 43–70 % of the time) | (1) a send wait the loop overran does not count; a send is judged from its own start. (2) pause only when the 95 % Wilson lower bound of the throttle ratio reaches `pause_ratio` (3 of 3 pauses, 2 of 3 / 5 of 6 do not), on every throttle; same rule in the local limiter | ✅ fixed (`ad81729`): pauses ~0 %, no false failovers |
 | I5 | New code failed S35b more often than old | Mostly I4 cause (1): the new per-call work tipped the sender's busy start past 5 s | Fixed by I4 (1) | ✅ fixed |
 | I6 | S35b failed 2 of 5 runs right after `ad81729` (806 and 1,267 rt timeouts; was up to 4,429) | Not reproduced since. Those runs had no pauses, no failovers and full slots but half the calls/s; per-process CPU (added `f29ed63`) shows workers ~0.55 core, sender ~0.3, fakellm ~0.08 of 8, so CPU is not the limit | 16 runs since the fixes: **14 pass**, the last **11 in a row** (99.90–99.96 % OK) | 🟡 watching |
-| I7 | A timed-out call cannot be traced | Library logs nothing per call (INFO only shows taskiq "Executing task") | Debug-level lifecycle logs: received, slot wait, attempt, throttle, backoff, released, done | 🔵 proposed |
+| I7 | A timed-out call cannot be traced | Library logged nothing per call | DEBUG trace: `call_started`, `slot_acquired`, `attempt_done`, `backoff`, `rate_limited`, `call_done` ... | ✅ built (`1bce171`) |
 | I8 | Scenario gate passes on a single run | Flaky scenarios slip through | Repeat gate run: full suite 3 times in a row, S35b 5 times. Found I21–I23 (failed all 3 passes); everything else passed 3 / 3 | ✅ done |
 | I9 | `retry_attempts=5` (owner request) | `retry_attempts` covers 5xx; the S35b leftovers are throttle runs on single-target gpt20b (`throttle_retry_attempts`) | Measured: 99.90 % and 99.95 % OK with 5 vs 99.91–99.95 % with 3: no difference. Keep 3 | ✅ measured |
-| I10 | `limiter_initial_clamped` warning when you only set `max_concurrency` below 20 | The warning fires for the *default* start (20), not only one you set | Warn only when `limiter_initial` was set explicitly | 🔵 proposed (small) |
+| I10 | `limiter_initial_clamped` warned for the default start | Warning fired for start 20 > a small `max_concurrency` | Warn only for a start someone chose | ✅ fixed (`1bce171`) |
 | I11 | First S35b failure was blamed on unscaled harness caps | That run had the same one-model pattern as I4 | Claim withdrawn; caps stay scaled (consistent shape) | ✅ corrected |
-| I12 | No per-minute limit: starts/min = bucket ÷ latency, so a 500 RPM quota is only respected after Bedrock throttles | Library limits concurrency, not rate | F17 rate budget (RPM + TPM, smooth or fixed window, rt falls back / bg waits) | 🔵 planned, T4.1–T4.11 |
-| I13 | No single view of waiting / working | Counts spread over SQS, `limiter show`, CloudWatch; `llmq_inflight` never emitted | F18 `llm-queue status` + `llmq_waiting`, `llmq_inflight`, `llmq_rate_used/remaining` | 🔵 planned, T4.9 |
-| I14 | `llmq_breaker_open` never emitted; only `on_release` broker hook exported | metrics wiring gap | Emit both; export all broker hooks | 🔵 proposed |
-| I15 | `<prefix>:schema` never written although STABILITY.md says the schema is versioned | missing code | Write + check on start | 🔵 proposed |
-| I16 | S3 offload not wired into `LLMQueue`; params > 200 KB go to Valkey | missing wiring | Wire `S3OffloadMiddleware` when `s3_bucket` is set | 🔵 proposed |
-| I17 | Send batching available but not enabled | `build_brokers` does not turn it on | Enable for bg/bulk | 🔵 proposed |
-| I18 | `cancel()` does not stop an attempt already in flight | by design so far | Cancel the attempt task on the cancel flag | 🔵 proposed |
+| I12 | No per-minute limit | Library limited concurrency only | F17 rate budget (RPM + TPM, smooth / fixed, rt reserve, usage correction, Valkey-down local share) | ✅ built (`8d47946`) |
+| I13 | No single view of waiting / working | Counts spread over SQS, limiter, CloudWatch | F18 `llm-queue status`; `llmq_inflight`, `llmq_rate_used`, `llmq_rate_remaining`; waiting = SQS `ApproximateNumberOfMessagesVisible` | ✅ built |
+| I14 | `llmq_breaker_open` never emitted; broker hooks not exported | metrics wiring gap | Both gauges per used target; every broker hook except heartbeat reported | ✅ built (`53a5d0c`) |
+| I15 | `<prefix>:schema` never written | missing code | Written with NX on start; newer schema refuses to start | ✅ built (`ba5c269`) |
+| I16 | S3 offload not wired | missing wiring | `s3_offload_bucket` installs `S3OffloadMiddleware` on every broker | ✅ built (`9611d91`) |
+| I17 | Send batching not enabled | `build_brokers` did not turn it on | bg / bulk batch for 0.02 s; rt sends at once | ✅ built (`5ea3159`) |
+| I18 | `cancel()` did not stop an attempt in flight | by design so far | Cancel channel + `InflightAttempts`; caller timeouts publish too | ✅ built (`5ea3159`) |
 | I19 | Valkey without persistence can re-run in-flight calls (S50: 0–16) | claims are lost on restart | Keep ElastiCache persistence on (ops) | ✅ documented |
-| I20 | Limiter cut/hold/probe knobs have no `LLMQ_*` variables | only `LimiterSettings` fields | Add to `LimiterTuning` + live settings | 🔵 proposed |
+| I20 | Limiter cut / hold / probe knobs had no env variables | only `LimiterSettings` fields | `LLMQ_AC_UTILISATION`, `_WINDOW_SECS`, `_LOSS_TOLERANCE`, `_MIN_THROTTLES`, `_PAUSE_RATIO`, `_SETTLE_RATIO`, `_PROBE_SECS`, `_HOLD_RATIO`, `_PEAK_HALFLIFE_SECS` | ✅ built (`388fe3b`) |
 | I21 | S12: 3 calls reached a target while its breaker was open (limit 2) | Calls already in flight kept retrying after their own 5xx opened the breaker; the longer retry curve stretched those retries into the open window | A failure that opens the breaker ends the step at once (unit test + S12 3 / 3, `calls_while_open_8s` 2) | ✅ fixed (`1e09f08`) |
 | I22 | S11: new fallback chain "not used within 30 s" (took ~34 s) | Scenario timing: `throttle_retry_attempts` (6) overrode its one attempt per step, ~15 s of throttle retries per call | Scenario sets one throttle attempt and a 2 s rt wait; chain change takes effect in ~4.5 s (3 / 3) | ✅ fixed (`1e09f08`) |
+| I24 | One SQS send timeout in a burst sent a model direct for 300 s (H17) | A timeout is ambiguous | Fail over after `sqs_timeouts_to_failover` (3) timeouts in 60 s; a refused send still at once | ✅ fixed (`1bce171`); S20 5 calls 15.8 s (was 5.7 s), all direct |
+| I25 | S48: a pod lacking a model won 8 redeliveries in a row | Whole-second SQS delays kept the message in phase with that pod's polls | Random sub-second pause before the release | 🟡 improved (`5ea3159`): 6 / 6 pass, the old pod still wins 2–3 times on ElasticMQ |
+| I26 | S27 rt queue wait p95 29.8 s once | mypy ran on the same machine during the run | Quiet re-run 0.47 s; never run checks during load scenarios | ✅ explained |
 | I23 | S40: timeout after 1.28 s (want 1.0 ± 0.2) | Scenario timer included the fakellm script request (0.28 s); the queue call itself took 1.015 s | Clock starts at the call (3 / 3) | ✅ fixed (`1e09f08`) |
 
 ## 3. Results
@@ -81,6 +90,26 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | S55 | provider bucket 8 over two models | PASS: combined peak 8, 600/600, 0 duplicates |
 | S35b | 10K burst, 30 % random throttles, worker killed at 10 s | **14 of 16 pass** since fixes `ad81729`, last 11 in a row (was ~2 of 4), see below |
 | Full suite × 3 | all 57 scenarios, 3 passes in a row (S04, S24, S33 skip: need LangChain / upstream / AWS) | 51 pass every pass; S11, S12, S40 failed every pass → I21–I23 fixed, then 3 / 3 each. Re-run after the breaker fix: S10, S12, S36, S39, S42, S44, S50, S35b pass |
+
+### Rate limits and lane buckets (fakellm, 2026-10-30)
+
+| Scenario | What | Result |
+|---|---|---|
+| R01 (+R04) | RPM 50 `fixed`, 120 bg calls, 3 workers | PASS: 40 / 40 / 40 per minute (bg = 80 %), 120 / 120 |
+| R02 | RPM 120 `smooth`, burst 10, `max_concurrency` 3, 1 s calls | PASS: max 19 starts in any 10 s, 60 calls in 33.9 s |
+| R03 | rt reserve under a 150-call bg backlog (RPM 60) | PASS: rt 15 / 15, p95 0.47 s; bg ≤ 41 / min |
+| R05 | TPM 30,000 `smooth`, 200 calls reserving ~260, using ~14 | PASS: 5.2–5.6 s, budget counted 2,800 = usage (not 52,000) |
+| R06 | gpt20b + gpt120b RPM 40 each, bedrock shared 50 | PASS: combined 40 / 40 / 20, each ≤ 40 |
+| R07 | rt call with 10 s left, budget spent | PASS: `rate_limited`, `retry_after_secs`, answered at 8 s |
+| R08 | RPM 60 → 15 live | PASS: 48 then 12 per minute |
+| R09 | Valkey down, RPM 20 | PASS: 16 then 9 (local share), no errors |
+| R11 | gpt120b RPM 5 per target | PASS: rt 5 primary + 3 apac; bg never on apac |
+| R12 | `status` vs call log | PASS: started 12, `rpm_left` 18, working 0 |
+| S56 | cancel during a 20 s provider hang | PASS 3 / 3: slot freed in 0.03–0.05 s |
+| S57 | lane buckets bulk 3, bg 5 | PASS: peaks exactly 3 and 5, rt 0.23 s, 600 / 600 |
+| Sample 16 | RPM 10 fixed, rt reserve, bulk cap 2, status | 8 now + 4 next minute, rt 0.5 s, bulk peak 2, status matches |
+
+R10 (real quota lower than the configured RPM) is the adaptive limiter's existing behaviour (S07, S35c).
 
 ### S35b runs (gate: ≥ 95 % OK, 0 lost, 0 duplicates)
 
@@ -117,9 +146,9 @@ In every run: **0 lost, 0 duplicate provider calls**; bg and bulk 100 % or close
 | N2 | ✅ Fix I4 (limiter behaviour under random throttles) and I5 (backoff without holding a worker for queued bg/bulk) | M |
 | N3 | ✅ Repeat gate (I8): S35b 5 runs in a row on a quiet stack, then the full suite 3 times | M (time) |
 | N4 | ✅ I9: S35b with `retry_attempts=5`, record the effect | S |
-| N5 | Debug lifecycle logs (I7), `limiter_initial_clamped` fix (I10), metrics I13–I14 | S |
+| N5 | ✅ Debug lifecycle logs (I7), `limiter_initial_clamped` fix (I10), metrics I13–I14 | S |
 | N6 | Release `0.1.0a2` with F9–F16 (owner go-ahead) | S |
-| N7 | Rate budget RPM/TPM + status view (F17–F18, T4.1–T4.11, scenarios R01–R12) | L |
+| N7 | ✅ Rate budget RPM/TPM + status view (F17–F18), lane buckets (F19), scenarios R01–R12 | L |
 | N8 | Research assistant integration: steps 1–11 + 2b/2c of `docs/taskiq-llm-queue/INTEGRATION_RESEARCH_ASSISTANT.md` | L |
 
 ## 5. Using it in the research assistant

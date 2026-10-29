@@ -500,6 +500,18 @@ Measured effect of the cut rules (CHANGELOG, scenario harness):
 
 **Valkey-down variant.** `LocalLimiter` has no learning: a fixed per-pod cap per target (`local_cap`), the same lane share, and a pause after a throttle storm (≥ 2 throttles making up ≥ 50 % of a 1 s window).
 
+### 5a. Rate budgets (RPM / TPM, `reliability/rate.py`)
+
+Concurrency (the limiter) bounds calls in flight; a rate budget bounds calls **started** per minute, and tokens per minute. Design and scenarios: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
+
+- **Scope.** One Valkey hash per model target (`P:{m:ALIAS:TARGET}:rate`) and per provider (`P:{m:@PROVIDER:shared}:rate`), so every pod shares the same minute. Unset `rpm` and `tpm` mean no hash and no extra Valkey call.
+- **Script `RATE`** (one call per scope per attempt). `take` checks RPM (cost 1) and TPM (cost = token estimate) together and commits both or neither. `smooth` is GCRA per budget: theoretical arrival time `rpm_tat` / `tpm_tat`, interval `60 / limit`, burst allowance `rate_burst` units (a single cost above the burst passes when the bucket is idle, so a big request is never refused forever). `fixed` keeps counters for the calendar minute of Valkey `TIME`. bg/bulk calls also pass a second bucket at `limit × (1 − rt_rate_share)`. A refusal returns the seconds until the next token. `give` returns a token (the call never got a slot) or corrects TPM by `reserved − usage`. `peek` reads `seen_calls` / `seen_tokens` of this minute and what is left (`llm-queue status`).
+- **Admission (`core._take_slot`).** Rate tokens come first (model target, then provider), then the concurrency slot (and the provider's shared slot); tokens go back when no slot follows. Patience for a token: rt `RT_ACQUIRE_SECS` (2 s), a queued bg/bulk call 1 s, a direct call its deadline.
+- **Out of budget (D3, D4).** rt: next fallback step (its own budget), then the rt wait loop until `rt_capacity_wait_secs`, then `rate_limited` (kind `throttle`, `retry_after_secs`). Queued bg/bulk: `_Requeue(ceil(wait))` on the same target, never a fallback step, and `rate_holds[alias]` makes this pod's receive budget 0 for the alias's bg/bulk queues until the token is due (C5).
+- **TPM.** `estimate_tokens(params)`: characters of every string in the params / 4 plus `inferenceConfig.maxTokens` / `max_tokens` / `max_completion_tokens` (1,000 if none; embeddings reserve their input only). After a successful call `usage_tokens(response)` (Converse `usage.totalTokens`, OpenAI `usage.total_tokens`, Titan `inputTextTokenCount`) corrects the reservation.
+- **Valkey down (C8).** `LocalRateBudget`: the same rules in process with every limit × `1 / live pods`.
+- **Sync path.** `call_sync` runs on its own loop with its own async Valkey client for `RATE` (and a local budget while Valkey is down), so sync calls take the same tokens.
+
 ---
 
 ## 6. Valkey key schema and wire format
@@ -517,6 +529,8 @@ Measured effect of the cut rules (CHANGELOG, scenario harness):
 | `P:{m:ALIAS:TARGET}:ac` | hash | `LIMITER_ACQUIRE` / `RELEASE` | none | `limit`, `ramp`, `ok_count`, `paused_until`, `last_decrease`, `last_increase`, `w_max`, `cut_ratio`, `last_hold`, `peak`, `peak_at`, window counters `win_start` `win_ok` `win_thr` `prev_ok` `prev_thr` |
 | `P:{m:ALIAS:TARGET}:lease` | sorted set | `LIMITER_ACQUIRE`, `LEASE_RENEW` | none on the key; members scored by expiry | Lease tokens |
 | `P:{m:ALIAS:TARGET}:cb` | hash | `BREAKER` | none | `state`, `opened_at`, `fail_count`, `window_start`, `probes`, `probe_at` |
+| `P:{m:ALIAS#LANE:TARGET}:ac` / `:lease` | hash / sorted set | `LIMITER_ACQUIRE` / `RELEASE` | as the model's | Lane bucket of `lane_max_concurrency.<lane>` (F19): a fixed limit (start = max = cap) that throttles never teach |
+| `P:{m:ALIAS:TARGET}:rate` | hash | `RATE` | 180 s after the last write | `rpm_tat` `rpm_bgtat` `tpm_tat` `tpm_bgtat` (smooth) or `win` `rpm_n` `rpm_bgn` `tpm_n` `tpm_bgn` (fixed); `seen_win` `seen_calls` `seen_tokens`. `ALIAS` is `@<provider>` and `TARGET` `shared` for a provider budget |
 | `P:{cfg}:routing` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `RoutingConfig` |
 | `P:{cfg}:fallback` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `FallbackConfig` (`chains`, `skip_targets`) |
 | `P:{cfg}:models` | string (JSON) | `LiveConfigStore.set` (CLI) | none | `ModelSettings` (live per-provider / per-model overrides, [section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)) |
@@ -710,6 +724,8 @@ Layers 3-4 come from `LLMQ_SETTINGS` (validated at boot; a bad value is a `Confi
 
 **Stays pod config only** (read when clients, queues and pools are built): Valkey / SQS / AWS settings, `models` (targets, queues, provider), credentials, `provider_*_timeout_secs`, `worker_slots`, `retry_attempts`, limiter window knobs and `max_limit` (which still bounds a live `max_concurrency`).
 
+**Lane buckets (F19).** `lane_max_concurrency.<lane>` resolves like any lane setting (per provider and model, env and live; no global value). `SettingsResolver.lane_caps()` turns each into a fixed limiter scope `<alias>#<lane>` (start = max = cap), added to `LimiterSettings` next to the provider shared caps. `core._take_slot` takes the model slot, then the lane slot, then the provider slot, all within one wait, and hands every slot back if one is refused; only the model slot learns from a throttle. `receive_budget` also takes the lane bucket's headroom for that lane's queue, so a full lane leaves its backlog in SQS. While Valkey is down the lane caps become per-pod local caps like the others.
+
 **Storage and reload.** The live value lives at `P:{cfg}:models` in the same `LiveConfigStore` as routing and fallback: validated by pydantic on `set` (a bad value never reaches Valkey), audited to `P:{cfg}:audit` with the actor (kept 90 days), reloaded by every pod each `cfg_reload_secs` (30 s). An invalid stored value, or Valkey being down, keeps the last good one; nothing stored means layers 1-4 apply. On a change `LLMQueue._apply_settings` swaps the resolver, the limiter's `LimiterSettings` (caps, starts, `bg_share` per model, shared caps), the breaker's per-model settings, the failover local caps and the sync-path limiter settings, and logs `model_settings_applied`. Settings the limiter rejects are logged as `model_settings_rejected` and the old ones stay. An alias or provider not in `LLMQ_MODELS` is rejected by the CLI and ignored by pods. While Valkey is down the provider shared cap becomes a per-pod local cap like every other limit ([section 4c](#4c-failover-to-the-direct-path-and-recovery)).
 
 **Operating it.** `llm-queue settings get [--model M | --provider P]` prints every setting with its effective value and source (`live:model`, `live:provider`, `env:model`, `env:provider`, `env`, `default`). `settings set --model M max_concurrency=30 timeout_secs.rt=60`, `settings set --provider openai shared_max_concurrency=40`, `settings unset --model M [NAME ...]` and `settings reset` edit the live layers. A database or admin UI that should own these values writes through the same store (`model_settings_store(...).set(value, actor=...)`) or the CLI; pods only read Valkey, so no new runtime dependency is added.
@@ -776,6 +792,7 @@ Reads connection settings from `LLMQ_*` (`QueueConfig.from_env`), prints JSON on
 | `limiter show [--model M] \| reset --model M [--target T]` | Learned limit, live leases, pause; `reset` forgets the learned state |
 | `breaker show [--model M] \| reset --model M [--target T]` | Breaker position; `reset` closes it |
 | `queues` | Visible / in-flight / delayed counts per configured queue and its DLQ (from `RedrivePolicy`) |
+| `status [--model M]` | Per model: `waiting` / `delayed` / `received` per lane queue; per target `working`, `limit`, `started` this minute, `rpm_left`, `tokens`, `tpm_left`; the provider's shared budget ([section 5a](#5a-rate-budgets-rpm--tpm-reliabilityratepy)) |
 | `job send NAME --payload-file F [--queue jobs-ingest] [--lane bulk]` | Send one job message with SQS send permission only |
 
 ---

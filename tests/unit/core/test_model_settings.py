@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from taskiq_llm_queue.cli import _setting_values
 from taskiq_llm_queue.config import (
     Lane,
+    ModelConfig,
     ModelSettings,
     Overrides,
     ProviderOverrides,
@@ -198,3 +199,29 @@ def test_validate_scope_knows_aliases_and_providers() -> None:
         validate_scope(config, "models", "nope")
     with pytest.raises(ValueError, match="provider"):
         validate_scope(config, "providers", "anthropic")
+
+
+def test_lane_caps_resolve_and_become_fixed_limiter_buckets() -> None:
+    """F19: `lane_max_concurrency.<lane>` per provider or model -> `<alias>#<lane>` fixed caps."""
+    from taskiq_llm_queue.lifecycle import limiter_settings
+
+    config = QueueConfig(
+        models={
+            "a": ModelConfig(provider="bedrock", model_id="a"),
+            "b": ModelConfig(provider="openai", model_id="b"),
+        },
+        settings_default=ModelSettings.model_validate(
+            {
+                "providers": {"openai": {"lane_max_concurrency": {"bulk": 4}}},
+                "models": {"a": {"lane_max_concurrency": {"bulk": 2, "bg": 5}}},
+            }
+        ),
+    )
+    resolver = SettingsResolver(config)
+    assert resolver.lane_caps() == {"a#bg": 5, "a#bulk": 2, "b#bulk": 4}
+    assert resolver.resolve("a", "lane_max_concurrency", Lane.RT) == (None, "default")
+    limits = limiter_settings(config, resolver)
+    assert (limits.start_for("a#bulk"), limits.max_for("a#bulk")) == (2, 2)
+    assert limits.max_for("b#bulk") == 4
+    with pytest.raises(ValueError, match="lane values"):
+        ModelSettings.model_validate({"models": {"a": {"lane_max_concurrency": {"bulk": 0}}}})
