@@ -57,7 +57,7 @@ class FailoverSettings:
     def from_env(
         cls, environ: Mapping[str, str] | None = None, *, live_pods: int = 0
     ) -> FailoverSettings:
-        """Read `LLMQ_SQS_FAILOVER_SECS` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise ConfigError."""
+        """Read `LLMQ_SQS_FAILOVER_SECS` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise errors."""
         env = os.environ if environ is None else environ
         values: dict[str, str] = {}
         errors: list[str] = []
