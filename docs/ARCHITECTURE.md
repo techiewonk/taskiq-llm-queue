@@ -523,7 +523,7 @@ Measured effect of the cut rules (CHANGELOG, scenario harness):
 | `P:{cfg}:audit` | stream | `CONFIG_SET`, CLI resets | trimmed to 90 days (`XTRIM MINID`) | `key`, `actor`, `before`, `after`, `ts` |
 | `P:pods` | sorted set | `PodRegistry.beat` | `EXPIRE` 60 s, members expire after 30 s | Live pod ids (for the local cap) |
 | `P:done:POD` | pub/sub channel | worker `PUBLISH` | — | Request id whose result is ready |
-| `P:schema` | — | **never written** | — | Defined in `KeySpace.schema` (`SCHEMA_VERSION = 2`) but no code writes or checks it |
+| `P:schema` | string | `LLMQueue.start` (`SET NX`) | none | `SCHEMA_VERSION` (2); a newer stored version refuses to start, an older one logs `schema_migration_needed` |
 
 `ID` is the request id (= the taskiq task id); `ALIAS` is the model alias and `TARGET` the target name from `ModelConfig.targets`, not the provider model id.
 
@@ -803,7 +803,6 @@ From CHANGELOG (0.1.0a1):
 
 Found while writing this document (verified in code):
 
-- `<prefix>:schema` is never written or checked, although [STABILITY.md](../STABILITY.md) describes the Redis schema as versioned under it.
 - `S3OffloadMiddleware` / `S3ResultBackend` are not wired into `LLMQueue`; large params use Valkey (`params_ref`), so DS18's "params > 200 KB need S3 offload or fail fast" is handled by `direct` failover instead.
 - Send batching (`Batching`, P8) is available on `SQSQueue` but `build_brokers` does not enable it: one `SendMessage` per call.
 - The limiter's cut/hold/probe knobs (window, loss tolerance, pause ratio, settle, probe, hold, peak half-life) and `utilisation` have no `LLMQ_*` variables.

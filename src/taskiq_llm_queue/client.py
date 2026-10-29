@@ -49,7 +49,7 @@ from taskiq_llm_queue.errors import (
     QueueUnavailable,
 )
 from taskiq_llm_queue.failover import FailoverSettings, FailoverState
-from taskiq_llm_queue.keys import KeySpace
+from taskiq_llm_queue.keys import SCHEMA_VERSION, KeySpace
 from taskiq_llm_queue.lifecycle import (
     BrokerSet,
     ClaimGroup,
@@ -290,6 +290,32 @@ class LLMQueue:
         if callable(report):
             safe_hook(report)
 
+    async def _check_schema(self, client: Redis) -> None:
+        """Write `<prefix>:schema` on first start; refuse state a newer version wrote (I15).
+
+        STABILITY.md versions the Valkey state under this key. A newer stored version raises
+        `ConfigError` (old code must not run on new state); an older one logs
+        `schema_migration_needed`. Valkey down at start: skipped, failover serves calls.
+        """
+        key = self.keys.schema
+        try:
+            await client.set(key, SCHEMA_VERSION, nx=True)
+            raw = await client.get(key)
+        except RedisError as exc:
+            logger.warning("schema_check_skipped", error_type=type(exc).__name__)
+            return
+        try:
+            stored = int(raw) if raw is not None else SCHEMA_VERSION
+        except (TypeError, ValueError):
+            raise ConfigError(f"{key} holds {raw!r}, not a schema version") from None
+        if stored > SCHEMA_VERSION:
+            raise ConfigError(
+                f"Valkey state schema {stored} is newer than this version's {SCHEMA_VERSION} "
+                f"({key}); upgrade taskiq-llm-queue or use another key_prefix"
+            )
+        if stored < SCHEMA_VERSION:
+            logger.error("schema_migration_needed", key=key, stored=stored, expected=SCHEMA_VERSION)
+
     async def _watch_limits(self, limiter: AdaptiveLimiter, breaker: CircuitBreaker) -> None:
         """Feed learned limits to the failover local cap; gauges per model target used here.
 
@@ -414,6 +440,7 @@ class LLMQueue:
         )
         started: list[Any] = []
         try:
+            await self._check_schema(client)
             for broker in brokers.all():
                 await broker.startup()
                 started.append(broker)
