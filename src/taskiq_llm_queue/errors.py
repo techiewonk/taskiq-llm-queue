@@ -8,10 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from taskiq_llm_queue.envelope import CallMeta
 
 
 class LLMQueueError(Exception):
-    """Base class for every error this package raises to callers."""
+    """Base class for every error this package raises to callers.
+
+    `meta` is how a worker served the failed call (attempts, queue wait, last target tried);
+    None when no worker answered (e.g. the caller timed out waiting).
+    """
+
+    meta: CallMeta | None = None
 
 
 class LLMQueueTimeout(LLMQueueError):  # public name is part of the frozen API

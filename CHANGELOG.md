@@ -15,6 +15,8 @@ a minor release may break the public API, with a deprecation announced one minor
 - Retry curve knobs `LLMQ_RETRY_MULTIPLIER` (4), `LLMQ_RETRY_SPREAD` (2.5), `LLMQ_RETRY_MAX_SECS` (30) and `LLMQ_THROTTLE_RETRY_MAX_SECS` (10).
 
 ### Changed
+- A received rt call keeps looking for a free slot for `rt_capacity_wait_secs` (30 s, env `LLMQ_RT_CAPACITY_WAIT_SECS`, live per provider/model, never past its deadline) instead of 3 passes; `core.RT_CAPACITY_PASSES` is gone. S35b: 36 of 6,043 rt calls had given up with 33–157 s of deadline left.
+- Failed calls raise with `.meta` (attempts, queue wait, last target tried) on every `LLMQueueError`; error replies fill `queue_wait_ms` and the last target.
 - Retry backoff: retry n sleeps a random time in `[base * multiplier^n, that * spread]`, i.e. 1-2.5 s, 4-10 s, 16-30 s, then 30 s (was `base * 2^n + uniform(0, base)`, capped at 20 s). After a throttle one sleep is capped at 10 s. `core.MAX_BACKOFF_SECS` is gone; `backoff_secs` takes a `Backoff` curve.
 
 ### Removed

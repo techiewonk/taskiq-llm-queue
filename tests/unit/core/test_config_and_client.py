@@ -284,3 +284,31 @@ async def test_stop_closes_sync_runner_without_start() -> None:
     assert runner.closed
     assert q._sync is None
     q.close_sync()  # idempotent
+
+
+def test_unwrap_puts_the_reply_meta_on_the_raised_error() -> None:
+    """Callers see attempts, queue wait and the last target on a failed call too."""
+    from taskiq_llm_queue.client import _unwrap
+    from taskiq_llm_queue.envelope import CallMeta, LLMReply
+    from taskiq_llm_queue.errors import LLMQueueError, LLMQueueTimeout, ProviderError
+
+    meta = CallMeta(served_model="big", served_target="apac", attempts=6, queue_wait_ms=1500)
+    throttled = LLMReply(
+        request_id="r",
+        ok=False,
+        meta=meta,
+        error={
+            "type": "ThrottlingException",
+            "message": "x",
+            "retryable": True,
+            "kind": "throttle",
+        },
+    )
+    with pytest.raises(ProviderError) as caught:
+        _unwrap(throttled)
+    assert caught.value.meta == meta
+    expired = throttled.model_copy(update={"error": {"type": "deadline_exceeded"}})
+    with pytest.raises(LLMQueueTimeout) as timed_out:
+        _unwrap(expired)
+    assert timed_out.value.meta == meta
+    assert LLMQueueError("plain").meta is None

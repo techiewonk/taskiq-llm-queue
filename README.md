@@ -129,6 +129,7 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `throttle_retry_attempts` | 6 | Tries per fallback step for throttles (backoff holds no slot) |
 | `retry_base_secs` / `retry_multiplier` / `retry_spread` / `retry_max_secs` | 1 / 4 / 2.5 / 30 | Retry n sleeps a random time in [base·4ⁿ, base·4ⁿ·2.5]: **1–2.5 s, 4–10 s, 16–30 s**, then 30 s; see [Retry backoff](#retry-backoff) |
 | `throttle_retry_max_secs` | 10 | Cap of one sleep after a throttle, so 6 throttle tries fit an rt deadline |
+| `rt_capacity_wait_secs` | 30 | How long a received rt call keeps looking for a free slot before `no_capacity` (never past its deadline) |
 | `valkey_wait_failover_secs` | 10 | Result reads failing this long make waiting callers run direct |
 | `redis_max_connections` | 32 | Raised automatically to worker slots + 16 |
 | `worker_slots` (`LLMQ_WORKER_SLOTS=gpt120b:50,jobs:4`) | 50 per model alias (4 for `jobs`) | Tasks one pod runs at once for that alias's queues |
@@ -175,6 +176,10 @@ llm-queue settings reset                    # drop all live overrides
 **Provider-wide cap.** `shared_max_concurrency` on a provider bounds the calls in flight across *all* its models and pods, e.g. one vLLM server hosting three models. Each call then holds two slots, its model's and the provider's. Measured (scenario S55): with a shared cap of 8 on `bedrock` and gpt20b and gpt120b allowed 20 each, 600 calls peaked at exactly 8 at the provider, all OK, none duplicated.
 
 **Live bucket change.** Measured (scenario S54): gpt20b ran at `max_concurrency` 20 on 3 workers; `settings set --model gpt20b max_concurrency=5` mid-run brought the provider peak from 20 to 5 after one reload, with 900/900 calls OK.
+
+**Models with a single target.** A model with only one target (no APAC profile, no `chain` fallback) has nowhere to go when it is throttled: after `throttle_retry_attempts` (6) throttles in a row the call fails. Under a 30 % throttle storm that is 0.3⁶ ≈ 0.07 % of calls (S35b: 4 of 3,020 gpt20b rt calls). Give such a model a fallback target or model, or raise its `throttle_retry_attempts` (10 tries: 0.3¹⁰ ≈ 0.0006 %).
+
+**Errors carry meta.** A failed call raises `ProviderError` / `LLMQueueTimeout` with `.meta` (attempts, queue wait, last target tried), the same fields a successful result has.
 
 Not live (needs a restart): connection settings, the model list (targets, queues, provider), credentials, provider HTTP timeouts, `worker_slots` and `retry_attempts`.
 
@@ -243,7 +248,7 @@ The queue depth is unbounded: SQS holds every request that is not running. How m
 
 `bg` and `bulk` may use `bg_share` (80 %) of the limit, so with a cap of 10, background work runs at most 8 at once and keeps 2 slots for `rt`. Set `LLMQ_AC_BG_SHARE=1` to give all lanes the whole bucket.
 
-A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received gets three 2 s tries per fallback step, then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. `max_concurrency` and `bg_share` can also be set per provider and changed live ([Settings per provider and model](#settings-per-provider-and-model)), and a provider can have one bucket shared by all its models. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
+A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received keeps walking its fallback chain for a free slot (2 s per step) for up to `rt_capacity_wait_secs` (30 s, never past its deadline), then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. `max_concurrency` and `bg_share` can also be set per provider and changed live ([Settings per provider and model](#settings-per-provider-and-model)), and a provider can have one bucket shared by all its models. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
 
 Measured (scenario S53, fakellm at 200 ms p50, 3 workers × 50 slots, `max_concurrency=10`, `bg_share=1`): 2,000 bg calls queued (2,000 visible in SQS at peak), peak provider concurrency exactly 10 (from the call log and fakellm's own counter), limiter never above 10, 2,000/2,000 done, 0 lost, 0 duplicates, 61 s wall time. SQS in-flight peaked at 40, which is 10 running plus finished messages waiting for the 0.5 s batched delete.
 

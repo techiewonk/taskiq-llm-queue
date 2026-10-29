@@ -1432,17 +1432,20 @@ def _unwrap(reply: LLMReply) -> LLMReply:
     error = reply.error or {}
     code = str(error.get("type", "error"))
     message = str(error.get("message", code))
+    exc: LLMQueueError
     if reply.cancelled or code == "cancelled":
-        raise LLMQueueCancelled(f"call {reply.request_id} was cancelled")
-    if code == "deadline_exceeded":
-        raise LLMQueueTimeout(f"call {reply.request_id} ran past its deadline")
-    retry_after = error.get("retry_after_secs")
-    exc = ProviderError(
-        _error_text(code, message),
-        retryable=bool(error.get("retryable", False)),
-        retry_after_secs=float(retry_after) if retry_after is not None else None,
-    )
-    exc.status_code = _STATUS_BY_KIND.get(str(error.get("kind", "")), 502)  # type: ignore[attr-defined]  # optional attribute read by http_transport
+        exc = LLMQueueCancelled(f"call {reply.request_id} was cancelled")
+    elif code == "deadline_exceeded":
+        exc = LLMQueueTimeout(f"call {reply.request_id} ran past its deadline")
+    else:
+        retry_after = error.get("retry_after_secs")
+        exc = ProviderError(
+            _error_text(code, message),
+            retryable=bool(error.get("retryable", False)),
+            retry_after_secs=float(retry_after) if retry_after is not None else None,
+        )
+        exc.status_code = _STATUS_BY_KIND.get(str(error.get("kind", "")), 502)  # type: ignore[attr-defined]  # optional attribute read by http_transport
+    exc.meta = reply.meta  # attempts, queue wait and last target, as on a success
     raise exc
 
 

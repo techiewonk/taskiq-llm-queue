@@ -261,7 +261,7 @@ flowchart TD
   DONE -->|"yes"| ERR["error reply with last error"]
   DONE -->|"no, bg or bulk from SQS"| RQ["release message with delay,<br/>remaining / 4, clamped 10 to 900 s"]
   DONE -->|"no, only open breakers"| IDLE["sleep 1 s, new pass"]
-  DONE -->|"no, rt, under 3 passes"| PASS["walk the chain again"]
+  DONE -->|"no, rt, within rt_capacity_wait_secs"| PASS["walk the chain again"]
 ```
 
 | Mechanism | Rule in code |
@@ -272,7 +272,7 @@ flowchart TD
 | Backoff | Retry *n* sleeps `uniform(base*mult^n, base*mult^n*spread)`: 1-2.5 s, 4-10 s, 16-30 s with the defaults; capped at `retry_max_secs` 30 s (`throttle_retry_max_secs` 10 s after a throttle); a larger `Retry-After` wins up to the cap; skipped if it would pass the deadline; no slot held while sleeping ([section 7a](#7a-settings-per-provider-and-per-model-model_settingspy)) |
 | Per-attempt timeout (S39) | `attempt_timeout_secs` (180). If it fired before the deadline: `attempt_timeout`, and with more steps the call moves on instead of retrying the hung target. If the deadline fired: `deadline_exceeded` |
 | SDK retries | Off: Bedrock `retries={"total_max_attempts": 1}`, OpenAI `max_retries=0`, so every 429 reaches the limiter |
-| rt capacity | rt waits 2 s per step for a slot; when no step got a slot it walks the chain up to 3 passes (`RT_CAPACITY_PASSES`) before `no_capacity` |
+| rt capacity | rt waits 2 s per step for a slot; when no step got a slot it walks the chain again until `rt_capacity_wait_secs` (30 s, live per model) has passed since the worker started it, never past the deadline, then `no_capacity` (S35b: 3 passes left 36 of 6,043 rt calls failing with 33–157 s to spare) |
 | bg / bulk capacity (DS4) | A queued call waits at most 15 s per step (`QUEUED_ACQUIRE_SECS`) when more than 30 s remain; if no step ran, the claim is released and the message goes back to SQS with a delay of `remaining / 4` clamped to 10–900 s |
 | Breaker | Per (alias, target), Lua `BREAKER`: opens after `CB_THRESHOLD` (5) counted failures within `CB_WINDOW_SECS` (30); half-open after `CB_COOLDOWN_SECS` (15) with one probe; probe success closes, failure reopens. Only `retryable` outcomes count; throttles and target errors are `neutral` (they free a half-open probe slot) |
 | Live changes | `LiveConfigStore` reloads chains every `cfg_reload_secs` (30); invalid JSON keeps the last good value |
@@ -619,6 +619,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `retry_attempts`, `retry_base_secs` | `LLMQ_RETRY_ATTEMPTS`, `LLMQ_RETRY_BASE_SECS` | 3, 1.0 |
 | `retry_multiplier`, `retry_spread`, `retry_max_secs` | `LLMQ_RETRY_MULTIPLIER`, `LLMQ_RETRY_SPREAD`, `LLMQ_RETRY_MAX_SECS` | 4, 2.5, 30 |
 | `throttle_retry_max_secs` | `LLMQ_THROTTLE_RETRY_MAX_SECS` | 10 |
+| `rt_capacity_wait_secs` | `LLMQ_RT_CAPACITY_WAIT_SECS` | 30 |
 | `throttle_retry_attempts` | `LLMQ_THROTTLE_RETRY_ATTEMPTS` | 6 |
 | `max_failures` | `LLMQ_MAX_FAILURES` | 3 (jobs) |
 | `state_ttl_secs`, `result_ttl_secs` | `LLMQ_STATE_TTL_SECS`, `LLMQ_RESULT_TTL_SECS` | 1800, 300 |
@@ -658,7 +659,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `utilisation` | none (constructor only) | 0.9 |
 | breaker `threshold`, `window_secs`, `cooldown_secs` | `LLMQ_CB_THRESHOLD`, `LLMQ_CB_WINDOW_SECS`, `LLMQ_CB_COOLDOWN_SECS` | 5, 30, 15 |
 
-Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter window / cut knobs († in [§5](#5-adaptive-limiter)), claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `RT_CAPACITY_PASSES` 3, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30.
+Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter window / cut knobs († in [§5](#5-adaptive-limiter)), claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30.
 
 ### 7a. Settings per provider and per model (`model_settings.py`)
 
@@ -695,6 +696,7 @@ Layers 3-4 come from `LLMQ_SETTINGS` (validated at boot; a bad value is a `Confi
 | `throttle_retry_attempts` | `LLMQ_THROTTLE_RETRY_ATTEMPTS` | `core.run_call`, per step alias | Next throttled step |
 | `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | `LLMQ_RETRY_BASE_SECS`, `LLMQ_RETRY_MULTIPLIER`, `LLMQ_RETRY_SPREAD`, `LLMQ_RETRY_MAX_SECS`, `LLMQ_THROTTLE_RETRY_MAX_SECS` | `core.backoff_secs`, per step alias | Next backoff sleep |
 | `breaker_threshold`, `breaker_cooldown_secs` | `LLMQ_CB_THRESHOLD`, `LLMQ_CB_COOLDOWN_SECS` | `CircuitBreaker._run` (`by_model`) | Next breaker call of that alias |
+| `rt_capacity_wait_secs` | `LLMQ_RT_CAPACITY_WAIT_SECS` | `core.run_call` (envelope alias) | Next rt call |
 | `shared_max_concurrency` (**provider only**) | none | `core._take_slot`, receive budget | Next acquire |
 
 **Provider shared cap.** `shared_max_concurrency` bounds the calls in flight across *every* model of the provider and every pod, e.g. one vLLM server hosting three models, or an account-wide quota. It is a fixed limit of the limiter key `P:{m:@<provider>:shared}` (start = cap; it never learns, because a throttle is fed only to the model's own limit). With it, each attempt holds two slots: the model's, then the provider's, taken within the same wait; if the shared slot is not free in time, the model slot is returned and the step counts as `no_capacity`. The receive budget also subtracts the shared headroom, so a full provider bucket leaves the backlog in SQS. Provider names are the `ModelConfig.provider` values (`bedrock`, `openai`, or a registered custom one); the `@` prefix cannot clash with an alias.

@@ -34,7 +34,6 @@ from taskiq_llm_queue import (
 )
 from taskiq_llm_queue.config import ModelSettings
 from taskiq_llm_queue.core import (
-    RT_CAPACITY_PASSES,
     CoreDeps,
     InfraError,
     backoff_secs,
@@ -553,11 +552,23 @@ async def test_redis_error_after_an_attempt_reports_attempted(world: World) -> N
     assert world.limiter.held == 0
 
 
+def _fake_clock(world: World) -> list[float]:
+    """Drive `deps.clock` from `deps.sleep`, so waits are counted without real time."""
+    now = [time.time()]
+
+    async def sleep(secs: float) -> None:
+        world.sleeps.append(secs)
+        now[0] += secs
+
+    world.deps.clock = lambda: now[0]
+    world.deps.sleep = sleep
+    return now
+
+
 async def test_rt_call_walks_the_chain_again_before_no_capacity(world: World) -> None:
     """Bug S35: an rt call failed `no_capacity` after one 2 s slot wait in a burst ramp.
 
-    rt walks the fallback chain RT_CAPACITY_PASSES times before giving up, so a slot that frees
-    up on the second pass serves it; a target that never frees up still fails retryable.
+    rt walks the fallback chain again, so a slot that frees up on the second pass serves it.
     """
     targets = {("big", "primary"), ("big", "apac")}
     world.limiter.deny.update(targets)
@@ -573,13 +584,57 @@ async def test_rt_call_walks_the_chain_again_before_no_capacity(world: World) ->
     assert reply is not None
     assert reply.ok
     assert reply.meta.served_target == "primary"
-    world.limiter.acquire = original  # type: ignore[method-assign]
-    world.limiter.deny.update(targets)
-    world.limiter.waits.clear()
+
+
+async def test_rt_waits_for_capacity_up_to_rt_capacity_wait_secs(world: World) -> None:
+    """Bug S35b: 36 of 6,043 rt calls gave up after 3 passes with 33-157 s of deadline left.
+
+    rt now keeps walking the chain for `rt_capacity_wait_secs` (30 s), 2 s per pass when the
+    limiter refuses at once, then fails retryable `no_capacity` with the queue wait in meta.
+    """
+    _fake_clock(world)
+    world.limiter.deny.update({("big", "primary"), ("big", "apac"), ("small", "primary")})
+    reply = (
+        await execute_job(envelope(lane="rt", deadline_at=time.time() + 300), world.deps)
+    ).reply
+    assert reply is not None
+    assert reply.error is not None
+    assert (reply.error["type"], reply.error["retryable"]) == ("no_capacity", True)
+    assert sum(world.sleeps) == pytest.approx(30, abs=2)
+    assert reply.meta.queue_wait_ms >= 200
+    assert reply.meta.attempts == 0
+
+
+async def test_rt_capacity_wait_is_per_model_and_bounded_by_deadline(world: World) -> None:
+    """A live `rt_capacity_wait_secs` of 0 fails after one pass; the deadline caps a long wait."""
+    _fake_clock(world)
+    world.limiter.deny.update({("big", "primary"), ("big", "apac"), ("small", "primary")})
+    _live(world, models={"big": {"rt_capacity_wait_secs": 0}})
+    await execute_job(envelope(lane="rt", deadline_at=time.time() + 300), world.deps)
+    assert world.sleeps == []
+    _live(world, models={"big": {"rt_capacity_wait_secs": 600}})
+    world.sleeps.clear()
     reply = (await execute_job(envelope(lane="rt", request_id="r-2"), world.deps)).reply
     assert reply is not None
+    assert reply.error is not None
+    assert 28 <= sum(world.sleeps) <= 30  # the envelope's 30 s deadline wins over 600 s
+
+
+async def test_error_reply_meta_names_last_target_and_attempts(world: World) -> None:
+    """Failed replies carry attempts, queue wait and the last target tried, like a success."""
+    error = FakeError(ErrorKind.RETRYABLE, "ServiceUnavailable")
+    world.provider.script = {
+        "primary": [error] * 3,
+        "apac": [error] * 3,
+        "small-primary": [error] * 3,
+    }
+    reply = (await execute_job(envelope(), world.deps)).reply
+    assert reply is not None
     assert not reply.ok
-    assert len(world.limiter.waits) == 2 * RT_CAPACITY_PASSES
+    assert (reply.meta.served_model, reply.meta.served_target) == ("big", "apac")
+    assert reply.meta.fallback_used
+    assert reply.meta.attempts == 6  # 3 per target; `small` needs the chain policy
+    assert reply.meta.queue_wait_ms >= 200
 
 
 async def test_queued_bg_call_without_capacity_is_requeued(world: World) -> None:

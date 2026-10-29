@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 import traceback
 import uuid
@@ -206,6 +207,7 @@ class Ctx:
         drain_secs: float | None = None,
     ) -> list[WorkerProc]:
         """Start `n` worker processes and wait until each is receiving."""
+        log_level = os.environ.get("SCN_WORKER_LOG_LEVEL", log_level)  # INFO traces calls
         cfg = config or self.base
         wanted = (
             list(names)

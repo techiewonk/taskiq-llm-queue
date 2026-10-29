@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import inspect
 import io
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -149,6 +150,8 @@ def build_config(settings: Settings, **overrides: Any) -> QueueConfig:
         "fallback_default": {"chains": {"gpt120b": ["gpt20b"]}},
         "job_queues": {"ingest": settings.queue("jobs-ingest")},
         **HARNESS_ENV,
+        # A/B runs: `SCN_CONFIG_OVERRIDES='{"rt_capacity_wait_secs": 6}'` changes any field.
+        **orjson.loads(os.environ.get("SCN_CONFIG_OVERRIDES") or "{}"),
     }
     fields.update(overrides)
     return QueueConfig.model_validate(fields)
@@ -309,7 +312,7 @@ async def converse(
             **_wait_kwargs(timeout_secs, deadline_at),
         )
     except LLMQueueError as exc:
-        return Reply(False, error=exc)
+        return Reply(False, meta=Meta.of(getattr(exc, "meta", None)), error=exc)
     return Reply(True, result.response, Meta.of(result.meta))
 
 
@@ -332,7 +335,7 @@ async def chat(
             **_wait_kwargs(timeout_secs, None),
         )
     except LLMQueueError as exc:
-        return Reply(False, error=exc)
+        return Reply(False, meta=Meta.of(getattr(exc, "meta", None)), error=exc)
     if isinstance(result, dict):
         return Reply(True, result)
     return Reply(True, result.response, Meta.of(getattr(result, "meta", None)))
@@ -360,7 +363,7 @@ async def embed(
             **extra,
         )
     except LLMQueueError as exc:
-        return Reply(False, error=exc)
+        return Reply(False, meta=Meta.of(getattr(exc, "meta", None)), error=exc)
     vectors = list(getattr(result, "vectors", result))
     return Reply(True, vectors, Meta.of(getattr(result, "meta", None)))
 
@@ -371,7 +374,7 @@ def converse_sync(q: LLMQueue, model: str, request: dict[str, Any], **kw: Any) -
     try:
         result = q.converse_sync(model, request, **kw, **_wait_kwargs(timeout, None))
     except LLMQueueError as exc:
-        return Reply(False, error=exc)
+        return Reply(False, meta=Meta.of(getattr(exc, "meta", None)), error=exc)
     return Reply(True, result.response, Meta.of(result.meta))
 
 
@@ -380,7 +383,7 @@ def embed_sync(q: LLMQueue, model: str, texts: list[str]) -> Reply:
     try:
         result: Any = q.embed_sync(model, texts)
     except LLMQueueError as exc:
-        return Reply(False, error=exc)
+        return Reply(False, meta=Meta.of(getattr(exc, "meta", None)), error=exc)
     return Reply(True, list(getattr(result, "vectors", result)))
 
 

@@ -152,6 +152,7 @@ class Overrides(BaseModel):
     retry_spread: float | None = Field(default=None, ge=1)
     retry_max_secs: float | None = Field(default=None, gt=0)
     throttle_retry_max_secs: float | None = Field(default=None, gt=0)
+    rt_capacity_wait_secs: float | None = Field(default=None, ge=0)
     breaker_threshold: int | None = Field(default=None, ge=1)
     breaker_cooldown_secs: float | None = Field(default=None, gt=0)
 
@@ -310,6 +311,13 @@ class QueueConfig(BaseModel):
         "`retry_attempts` when larger), each after a backoff that holds no limiter slot. "
         "At S35b's 30 % random 429 rate a step fails 0.3^3 = 2.7 % with 3 tries, 0.07 % with 6.",
     )
+    rt_capacity_wait_secs: float = Field(
+        default=30.0,
+        ge=0,
+        description="How long a received rt call keeps walking its fallback chain for a free "
+        "slot (2 s per step per pass) before `no_capacity`; never past its deadline. S35b: 36 of "
+        "6,043 rt calls gave up after 3 passes with 33-157 s of deadline left.",
+    )
     sqs_wait_time_secs: int = Field(default=20, ge=0, le=20)
     sqs_failover_secs: float = Field(default=300.0, gt=0)
     attempt_timeout_secs: float = Field(
@@ -448,6 +456,7 @@ class QueueConfig(BaseModel):
             ("RETRY_SPREAD", "retry_spread", float),
             ("RETRY_MAX_SECS", "retry_max_secs", float),
             ("THROTTLE_RETRY_MAX_SECS", "throttle_retry_max_secs", float),
+            ("RT_CAPACITY_WAIT_SECS", "rt_capacity_wait_secs", float),
             ("THROTTLE_RETRY_ATTEMPTS", "throttle_retry_attempts", int),
             ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
             ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),

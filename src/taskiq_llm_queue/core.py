@@ -49,9 +49,6 @@ logger = get_logger(__name__)
 
 # DS13: a live (rt) call that can't get a slot within 2 s moves to the next fallback step.
 RT_ACQUIRE_SECS = 2.0
-# S35: one 2 s wait failed an rt call with no fallback during a burst; rt walks the chain this
-# many times (each step waiting 2 s) before giving up with `no_capacity`.
-RT_CAPACITY_PASSES = 3
 # DS4/DS10: a queued bg/bulk call waits this long per step for a slot, then the message is
 # released with a delay instead of holding a worker slot until its deadline.
 QUEUED_ACQUIRE_SECS = 15.0
@@ -682,11 +679,12 @@ async def run_call(
     queue_wait_ms = max(0, round((started - envelope.enqueued_at) * 1000))
     safe_hook(deps.hooks.on_queue_wait_ms, envelope.model, envelope.lane.value, queue_wait_ms)
     progress = progress or _Progress()
+    tried: FallbackStep | None = None  # last step that got an attempt, for the error meta
     last = ErrorInfo(ErrorKind.RETRYABLE, "no_capacity")
     last_message = "no fallback step had capacity"
-    passes = 0
+    rt_wait = settings.value(envelope.model, "rt_capacity_wait_secs")
     while True:
-        passes += 1
+        pass_started = deps.clock()
         attempts_before = progress.attempts
         circuit_only = True
         for index, step in enumerate(steps):
@@ -721,6 +719,7 @@ async def run_call(
                     )
                     break  # DS13: next step
                 progress.attempts += 1
+                tried = step
                 deps.leases.update(leases)
                 info: ErrorInfo | None = None
                 target_error = False
@@ -790,6 +789,7 @@ async def run_call(
                         meta=CallMeta(
                             served_model=step.alias,
                             served_target=step.target,
+                            queue_wait_ms=queue_wait_ms,
                             attempts=progress.attempts,
                             worker=deps.worker,
                         ),
@@ -825,14 +825,19 @@ async def run_call(
                 await _check_live(envelope, deps, check_cancel)
                 await deps.sleep(_IDLE_RETRY_SECS)
                 continue
+            # S35/S35b: rt walks the chain again (each step waiting RT_ACQUIRE_SECS) until
+            # `rt_capacity_wait_secs` since the worker started it, never past the deadline.
             if (
                 envelope.lane is Lane.RT
                 and not circuit_only
-                and passes < RT_CAPACITY_PASSES
+                and deps.clock() - started < rt_wait
                 and deps.clock() + RT_ACQUIRE_SECS < envelope.deadline_at
             ):
                 await _check_live(envelope, deps, check_cancel)
-                continue  # every step waited RT_ACQUIRE_SECS for a slot: walk the chain again
+                spent = deps.clock() - pass_started
+                if spent < RT_ACQUIRE_SECS:  # refused at once (e.g. a pause): no busy loop
+                    await deps.sleep(RT_ACQUIRE_SECS - spent)
+                continue
         return error_reply(
             envelope,
             last.code or last.kind.value,
@@ -840,7 +845,14 @@ async def run_call(
             retryable=last.kind is not ErrorKind.FATAL,  # every target refused the model
             kind=last.kind.value,
             retry_after_secs=last.retry_after_secs,
-            meta=CallMeta(attempts=progress.attempts, worker=deps.worker),
+            meta=CallMeta(
+                served_model=tried.alias if tried else "",
+                served_target=tried.target if tried else "",
+                fallback_used=tried is not None and tried != steps[0],
+                queue_wait_ms=queue_wait_ms,
+                attempts=progress.attempts,
+                worker=deps.worker,
+            ),
         )
 
 
