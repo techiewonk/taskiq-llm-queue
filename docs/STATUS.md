@@ -1,6 +1,6 @@
 # Status: features, issues, solutions and results
 
-Snapshot **2026-10-29**, library `main` at `ad81729`. PyPI has
+Snapshot **2026-10-30**, library `main` at `1e09f08`. PyPI has
 `0.1.0a1`, which has **none** of the features marked "main only". Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
 v0.30 in the app repo; rate-limit design: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
 
@@ -40,10 +40,10 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | I3 | gpt20b `ThrottlingException` (3–4 per S35b run) | single target: 6 throttles in a row at 30 % = 0.07 % | give gpt20b a fallback, or `throttle_retry_attempts=10` (0.0006 %) | ✅ documented (README, integration guide) |
 | I4 | **One model's rt queue missed its 180 s deadline in some S35b runs** | Two causes found with a per-second timeline: (1) false "SQS down" at burst start: the sender's busy loop made its first sends look stalled against `_sent_at = -inf`, so both chat models failed over to direct for 300 s; (2) the limiter paused a model on chance windows (2 of 3 throttled ≈ 22 % of windows at 30 % random), pauses fed on themselves (failing runs paused 43–70 % of the time) | (1) a send wait the loop overran does not count; a send is judged from its own start. (2) pause only when the 95 % Wilson lower bound of the throttle ratio reaches `pause_ratio` (3 of 3 pauses, 2 of 3 / 5 of 6 do not), on every throttle; same rule in the local limiter | ✅ fixed (`ad81729`): pauses ~0 %, no false failovers |
 | I5 | New code failed S35b more often than old | Mostly I4 cause (1): the new per-call work tipped the sender's busy start past 5 s | Fixed by I4 (1) | ✅ fixed |
-| I6 | **S35b still fails 2 of 5 runs after both fixes** (806 and 1,267 rt timeouts; was up to 4,429) | No pauses, no failovers, limiter slots as full as in passing runs (in-flight ~15 of ~18), same provider latency and retries, yet half the calls/s (10–20 vs ~25). The harness's own 1 s sampler stalled up to 7 s in a failing run: points at machine / worker CPU, not library logic (unproven) | Next: record worker CPU and per-call slot time; run S35b with 2 workers vs 3 and on a quieter machine | ❌ open |
+| I6 | S35b failed 2 of 5 runs right after `ad81729` (806 and 1,267 rt timeouts; was up to 4,429) | Not reproduced since. Those runs had no pauses, no failovers and full slots but half the calls/s; per-process CPU (added `f29ed63`) shows workers ~0.55 core, sender ~0.3, fakellm ~0.08 of 8, so CPU is not the limit | 16 runs since the fixes: **14 pass**, the last **11 in a row** (99.90–99.96 % OK) | 🟡 watching |
 | I7 | A timed-out call cannot be traced | Library logs nothing per call (INFO only shows taskiq "Executing task") | Debug-level lifecycle logs: received, slot wait, attempt, throttle, backoff, released, done | 🔵 proposed |
-| I8 | Scenario gate passes on a single run | Flaky scenarios slip through | Repeat gate: every scenario 3 times in a row, S35b 5 times | 🔵 proposed |
-| I9 | `retry_attempts=5` (owner request) | Retries help calls that started and failed; the I4 timeouts never started | Run S35b with `SCN_CONFIG_OVERRIDES='{"retry_attempts": 5}'` to measure | 🔵 to run |
+| I8 | Scenario gate passes on a single run | Flaky scenarios slip through | Repeat gate run: full suite 3 times in a row, S35b 5 times. Found I21–I23 (failed all 3 passes); everything else passed 3 / 3 | ✅ done |
+| I9 | `retry_attempts=5` (owner request) | `retry_attempts` covers 5xx; the S35b leftovers are throttle runs on single-target gpt20b (`throttle_retry_attempts`) | Measured: 99.90 % and 99.95 % OK with 5 vs 99.91–99.95 % with 3: no difference. Keep 3 | ✅ measured |
 | I10 | `limiter_initial_clamped` warning when you only set `max_concurrency` below 20 | The warning fires for the *default* start (20), not only one you set | Warn only when `limiter_initial` was set explicitly | 🔵 proposed (small) |
 | I11 | First S35b failure was blamed on unscaled harness caps | That run had the same one-model pattern as I4 | Claim withdrawn; caps stay scaled (consistent shape) | ✅ corrected |
 | I12 | No per-minute limit: starts/min = bucket ÷ latency, so a 500 RPM quota is only respected after Bedrock throttles | Library limits concurrency, not rate | F17 rate budget (RPM + TPM, smooth or fixed window, rt falls back / bg waits) | 🔵 planned, T4.1–T4.11 |
@@ -55,15 +55,18 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | I18 | `cancel()` does not stop an attempt already in flight | by design so far | Cancel the attempt task on the cancel flag | 🔵 proposed |
 | I19 | Valkey without persistence can re-run in-flight calls (S50: 0–16) | claims are lost on restart | Keep ElastiCache persistence on (ops) | ✅ documented |
 | I20 | Limiter cut/hold/probe knobs have no `LLMQ_*` variables | only `LimiterSettings` fields | Add to `LimiterTuning` + live settings | 🔵 proposed |
+| I21 | S12: 3 calls reached a target while its breaker was open (limit 2) | Calls already in flight kept retrying after their own 5xx opened the breaker; the longer retry curve stretched those retries into the open window | A failure that opens the breaker ends the step at once (unit test + S12 3 / 3, `calls_while_open_8s` 2) | ✅ fixed (`1e09f08`) |
+| I22 | S11: new fallback chain "not used within 30 s" (took ~34 s) | Scenario timing: `throttle_retry_attempts` (6) overrode its one attempt per step, ~15 s of throttle retries per call | Scenario sets one throttle attempt and a 2 s rt wait; chain change takes effect in ~4.5 s (3 / 3) | ✅ fixed (`1e09f08`) |
+| I23 | S40: timeout after 1.28 s (want 1.0 ± 0.2) | Scenario timer included the fakellm script request (0.28 s); the queue call itself took 1.015 s | Clock starts at the call (3 / 3) | ✅ fixed (`1e09f08`) |
 
 ## 3. Results
 
-### Tests and checks (latest, `d3c11d6` + samples)
+### Tests and checks (latest, `1e09f08`)
 
 | Check | Result |
 |---|---|
-| ruff, ruff format, mypy strict | clean (161 files) |
-| Unit tests | 580 passed |
+| ruff, ruff format, mypy strict | clean (163 files) |
+| Unit tests | 583 passed |
 | Integration tests (Valkey + ElasticMQ) | 149 passed |
 | GitHub CI (3.11–3.14, lowest deps, langchain 1.x, integration) | green on `1af5ebb`; `d3c11d6` pushed |
 | Samples 01–15 on the local stack | 15 / 15 exit 0 (13 also passed 12/12 on real Bedrock earlier) |
@@ -76,7 +79,8 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | S53 | 2,000 queued, bucket 10 | PASS: peak exactly 10, 0 lost, 0 duplicates |
 | S54 | live bucket 20 → 5 on 3 workers | PASS: peak 20 before, 5 after one reload, 900/900 |
 | S55 | provider bucket 8 over two models | PASS: combined peak 8, 600/600, 0 duplicates |
-| S35b | 10K burst, 30 % random throttles, worker killed at 10 s | **3 of 5 pass** after fixes `ad81729` (was ~2 of 4), see below |
+| S35b | 10K burst, 30 % random throttles, worker killed at 10 s | **14 of 16 pass** since fixes `ad81729`, last 11 in a row (was ~2 of 4), see below |
+| Full suite × 3 | all 57 scenarios, 3 passes in a row (S04, S24, S33 skip: need LangChain / upstream / AWS) | 51 pass every pass; S11, S12, S40 failed every pass → I21–I23 fixed, then 3 / 3 each. Re-run after the breaker fix: S10, S12, S36, S39, S42, S44, S50, S35b pass |
 
 ### S35b runs (gate: ≥ 95 % OK, 0 lost, 0 duplicates)
 
@@ -95,24 +99,24 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | 11 | new (`d3c11d6`) | FAIL | 85.3 % | 1,417 | 51 | yes |
 | 12 | new (`d3c11d6`) | FAIL | 82.9 % | 1,631 | 83 | **no** (overlapped samples 01–13) |
 
-After `ad81729` (5 runs in a row, quiet stack): PASS 99.3 %, 99.96 %, 99.91 %; FAIL 91.9 % (806 rt timeouts), 87.1 % (1,267). Pauses ~0 %, false SQS failovers 0. S06, S07, S08, S35, S35c, S39, S53, S54, S55 re-run and pass.
+After `ad81729` (5 runs in a row, quiet stack): PASS 99.3 %, 99.96 %, 99.91 %; FAIL 91.9 % (806 rt timeouts), 87.1 % (1,267). Pauses ~0 %, false SQS failovers 0. Then 5 more with the CPU timeline: all pass (99.93–99.96 %). Full suite × 3: pass 99.95 %, 99.92 %, 99.93 %. `retry_attempts=5`: pass 99.90 %, 99.95 %. After `1e09f08`: pass 99.91 %. S06, S07, S08, S35, S35c, S39, S53, S54, S55 re-run and pass.
 
 In every run: **0 lost, 0 duplicate provider calls**; bg and bulk 100 % or close; all timeouts are rt calls of a single model (I4).
 
 ### Why S35b is not 100 %
 
-1. **Small, every run (~0.3–0.5 %)**: rt `no_capacity` (I1, now mitigated) and single-target throttle runs (I3). Clean errors to the caller.
-2. **Large, some runs (up to ~16 % on clean runs)**: I4: one model's limit collapses under random throttles and its rt tail misses the 180 s deadline. Present in old and new code; new code shows it more often (I5).
+1. **Small, every run (now ~0.05–0.1 %, 5–10 of 10,000)**: throttle runs on single-target gpt20b (I3) and the odd rt `no_capacity` (I1). Clean errors to the caller; `retry_attempts=5` does not change them (I9), a gpt20b fallback or `throttle_retry_attempts=10` does.
+2. **Large, some runs (was up to ~16 %)**: I4/I5 (limiter pauses on chance throttle windows, false SQS failover at burst start), fixed in `ad81729`. Not seen in the 11 runs since (I6 watching).
 3. Production differs: real Bedrock throttles track load (quota), not a fixed 30 % random rate, and bursts are not 10K in 2 s. S35b is a stress test; it still has to pass reliably (I8).
 
 ## 4. Next steps (proposed order)
 
 | # | Step | Size |
 |---|---|---|
-| N1 | Record limiter limit/inflight per model every second in S35b; confirm I4 | S |
-| N2 | Fix I4 (limiter behaviour under random throttles) and I5 (backoff without holding a worker for queued bg/bulk) | M |
-| N3 | Repeat gate (I8): S35b 5 runs in a row on a quiet stack, then the full suite 3 times | M (time) |
-| N4 | I9: S35b with `retry_attempts=5`, record the effect | S |
+| N1 | ✅ Record limiter limit/inflight per model every second in S35b; confirm I4 | S |
+| N2 | ✅ Fix I4 (limiter behaviour under random throttles) and I5 (backoff without holding a worker for queued bg/bulk) | M |
+| N3 | ✅ Repeat gate (I8): S35b 5 runs in a row on a quiet stack, then the full suite 3 times | M (time) |
+| N4 | ✅ I9: S35b with `retry_attempts=5`, record the effect | S |
 | N5 | Debug lifecycle logs (I7), `limiter_initial_clamped` fix (I10), metrics I13–I14 | S |
 | N6 | Release `0.1.0a2` with F9–F16 (owner go-ahead) | S |
 | N7 | Rate budget RPM/TPM + status view (F17–F18, T4.1–T4.11, scenarios R01–R12) | L |
