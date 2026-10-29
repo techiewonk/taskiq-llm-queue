@@ -17,6 +17,8 @@ a minor release may break the public API, with a deprecation announced one minor
 - `sqs_timeouts_to_failover` (`LLMQ_SQS_TIMEOUTS_TO_FAILOVER`, 3).
 - `llmq_inflight` and `llmq_breaker_open` gauges (per model target used by the pod) and SQS counters from every broker hook: `llmq_sqs_received_total`, `_sent_total`, `_acked_total`, `_released_total` (by reason), `_expired_total`, `_errors_total`, and `llmq_sqs_wait_seconds`.
 - The Valkey state schema key `<prefix>:schema` is written on start; state from a newer schema refuses to start.
+- `cancel()` (and a caller timeout) also stops a provider attempt already running: workers subscribe to `<prefix>:cancel` and cancel that attempt (scenario S56: slot freed 0.03–0.05 s after the cancel).
+- Send batching on bg (`default`) and bulk queues (`sqs_batch_wait_secs`, 0.02 s; 0 turns it off); rt still sends at once.
 - `s3_offload_bucket` / `s3_offload_prefix` / `s3_endpoint_url`: oversized messages carry their params in S3 (`S3OffloadMiddleware` on every broker) instead of a Valkey `params_ref`.
 
 ### Changed
@@ -26,6 +28,7 @@ a minor release may break the public API, with a deprecation announced one minor
 
 - A model fails over to direct after `sqs_timeouts_to_failover` SQS send timeouts within 60 s, not after one (a refused send still fails over at once); the timed-out call itself still runs direct. One timeout in a 10K burst used to cost the model 300 s of SQS.
 - A 5xx that opens a target's breaker ends the call's retries on that target; in-flight calls kept retrying the open target (S12).
+- A pod that lacks a model waits a random fraction of a second before handing the message back, so the message no longer comes back in phase with that pod's own polls (S48: the old pod had won 8 redeliveries in a row).
 - `limiter_initial_clamped` warns only for a start you set, not for the default start (20) above a small `max_concurrency`.
 
 ### Removed

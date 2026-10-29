@@ -104,6 +104,39 @@ async def s17(ctx: Ctx) -> None:
     await ctx.final_checks()
 
 
+@scenario("S56", "Cancel stops an attempt already running", aws_safe="no")
+async def s56(ctx: Ctx) -> None:
+    """A call hung 20 s at the provider is cancelled 2 s in (I18).
+
+    The caller gets `cancelled` at once and the worker stops the attempt via the cancel
+    channel: no lease or running claim is left within 2 s, long before the hang would end.
+    """
+    await ctx.workers(1)
+    q = await ctx.queue()
+    rid = ctx.rid(1)
+    await ctx.fake.script(rid, ["hang:20"])
+    task = asyncio.create_task(one(ctx, q, 1, lane="bg", timeout_secs=60))
+    await asyncio.sleep(2)
+    t0 = time.monotonic()
+    await q.cancel(rid)
+    reply = await task
+    ctx.metric("caller_after_cancel_s", round(time.monotonic() - t0, 2))
+    ctx.expect(reply.error_kind == "cancelled", f"got {reply.error!r}")
+    freed = None
+    while time.monotonic() - t0 < 10:
+        leaks = await stack.leak_report(ctx.settings)
+        if not leaks["live_leases"] and not leaks["running_claims"]:
+            freed = round(time.monotonic() - t0, 2)
+            break
+        await asyncio.sleep(0.2)
+    ctx.metric("worker_freed_after_s", freed)
+    ctx.expect(freed is not None and freed < 2, f"worker still busy after cancel: {freed}")
+    n_calls = len((await ctx.fake.calls(rid)).get(rid, []))
+    # fakellm logs a call when it answers; the stopped one never does (0), a retry would (2).
+    ctx.expect(n_calls <= 1, f"provider called {n_calls} times")
+    await ctx.final_checks()
+
+
 @scenario("S40", "Caller timeout shorter than processing", aws_safe="yes")
 async def s40(ctx: Ctx) -> None:
     """Timeout 1 s vs a 3 s provider call.

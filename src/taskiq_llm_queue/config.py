@@ -350,6 +350,13 @@ class QueueConfig(BaseModel):
         description="Connect timeout of the built-in providers (botocore `connect_timeout`, "
         "httpx connect for OpenAI-compatible servers).",
     )
+    sqs_batch_wait_secs: float = Field(
+        default=0.02,
+        ge=0,
+        le=10,
+        description="Send batching on bg (`default`) and bulk queues: sends within this window "
+        "go in one SendMessageBatch (up to 10 / 256 KB). 0 turns batching off; rt never batches.",
+    )
     sqs_send_timeout_secs: float = Field(
         default=5.0,
         gt=0,
@@ -479,6 +486,7 @@ class QueueConfig(BaseModel):
             ("PROVIDER_READ_TIMEOUT_SECS", "provider_read_timeout_secs", float),
             ("PROVIDER_CONNECT_TIMEOUT_SECS", "provider_connect_timeout_secs", float),
             ("SQS_SEND_TIMEOUT_SECS", "sqs_send_timeout_secs", float),
+            ("SQS_BATCH_WAIT_SECS", "sqs_batch_wait_secs", float),
             ("VALKEY_WAIT_FAILOVER_SECS", "valkey_wait_failover_secs", float),
             ("WORKER_SLOTS", "worker_slots", _int_map),
         ):

@@ -57,6 +57,10 @@ class KeySpace:
         """Circuit breaker state for one model target (hash, no TTL)."""
         return self._target(model, target, "cb")
 
+    def cancel_channel(self) -> str:
+        """Pub/sub channel naming request ids just cancelled (workers stop running attempts)."""
+        return f"{self.prefix}:cancel"
+
     def done_channel(self, pod: str) -> str:
         """Pub/sub channel that wakes one pod's result dispatcher."""
         return f"{self.prefix}:done:{pod}"

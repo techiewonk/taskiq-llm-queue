@@ -218,8 +218,15 @@ class RedisClaimStore:
         return FailureCount(count, count >= self.settings.max_failures)
 
     async def cancel(self, request_id: str) -> None:
-        """Set the cancel flag that workers check before every attempt and sleep (DS14)."""
-        await self._client.set(self._keys.cancel(request_id), b"1", ex=self.settings.state_ttl_secs)
+        """Set the cancel flag that workers check before every attempt and sleep (DS14).
+
+        Also published on the cancel channel so a worker stops an attempt already running
+        (I18); a lost message only means that attempt finishes and its result is dropped.
+        """
+        async with self._client.pipeline(transaction=False) as pipe:
+            pipe.set(self._keys.cancel(request_id), b"1", ex=self.settings.state_ttl_secs)
+            pipe.publish(self._keys.cancel_channel(), request_id)
+            await pipe.execute()
 
     async def is_cancelled(self, request_id: str) -> bool:
         """True when the caller cancelled or timed out on this task."""

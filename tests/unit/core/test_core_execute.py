@@ -35,6 +35,7 @@ from taskiq_llm_queue import (
 from taskiq_llm_queue.config import ModelSettings
 from taskiq_llm_queue.core import (
     CoreDeps,
+    InflightAttempts,
     InfraError,
     backoff_secs,
     execute_job,
@@ -764,6 +765,48 @@ async def test_deadline_cut_attempt_is_expired_not_provider_error(world: World) 
     assert reply.error["type"] == "deadline_exceeded"
     assert world.claims.log[-1] == "complete:expired"
     assert world.limiter.held == 0
+
+
+async def test_cancel_message_stops_a_running_attempt(world: World) -> None:
+    """I18: a cancel for a call whose attempt is running stops it at once: the reply is
+    `cancelled`, the claim ends cancelled and the slot is returned."""
+    world.deps.providers = lambda alias: HangingProvider()
+    world.deps.inflight = registry = InflightAttempts()
+    job = asyncio.create_task(execute_job(envelope(request_id="r-cx"), world.deps))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if registry.cancel("r-cx"):
+            break
+    t0 = time.monotonic()
+    reply = (await asyncio.wait_for(job, 2)).reply
+    assert time.monotonic() - t0 < 1
+    assert reply is not None
+    assert reply.cancelled
+    assert world.claims.log[-1] == "complete:cancelled"
+    assert world.limiter.held == 0
+    assert not registry.cancel("r-cx")  # nothing left running
+
+
+async def test_inflight_registry_leaves_timeouts_and_shutdown_alone() -> None:
+    """I18: only a cancel by request id becomes `_Stopped`; an attempt timeout stays a
+    timeout and a pod shutdown (outer cancel) stays a CancelledError."""
+    from taskiq_llm_queue.core import _Stopped
+
+    registry = InflightAttempts()
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await registry.run("t", asyncio.sleep(5))
+    outer = asyncio.create_task(registry.run("o", asyncio.sleep(5)))
+    await asyncio.sleep(0.01)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    stopped = asyncio.create_task(registry.run("c", asyncio.sleep(5)))
+    await asyncio.sleep(0.01)
+    assert registry.cancel("c")
+    with pytest.raises(_Stopped):
+        await stopped
+    assert not registry.cancel("unknown")
 
 
 async def test_provider_timeout_stays_retryable(world: World) -> None:

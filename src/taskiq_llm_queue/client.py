@@ -30,7 +30,7 @@ from taskiq_llm_queue.broker.errors import ErrorFamily, SQSSendError
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.config import Lane, ModelSettings, create_redis, create_sync_redis
 from taskiq_llm_queue.context import current_context
-from taskiq_llm_queue.core import CoreDeps, InfraError, JobResult, execute_job
+from taskiq_llm_queue.core import CoreDeps, InflightAttempts, InfraError, JobResult, execute_job
 from taskiq_llm_queue.envelope import (
     TASK_CALL,
     TASK_EMBED,
@@ -247,6 +247,7 @@ class LLMQueue:
         # of this pod (worker, direct and sync paths): both kept alive by the pod heartbeat.
         self._direct_claims: dict[str, int] = {}
         self._leases: set[Lease] = set()
+        self._inflight = InflightAttempts()  # worker attempts a cancel message can stop (I18)
         # Cancel flags that could not be set while Valkey was down; set once a probe succeeds.
         self._pending_cancels: set[str] = set()
         self._sent_at = -math.inf  # monotonic time the last SQS send completed (any queue)
@@ -289,6 +290,34 @@ class LLMQueue:
         report = getattr(self.failover, "report_redis_ok", None)
         if callable(report):
             safe_hook(report)
+
+    async def _listen_cancels(self, client: Redis) -> None:
+        """Stop running attempts of request ids published on the cancel channel (I18).
+
+        Best effort: while the channel is down an attempt finishes and its result is dropped
+        by the cancel flag, as before; the subscription is retried every 2 s.
+        """
+        channel = self.keys.cancel_channel()
+        while True:
+            pubsub = client.pubsub()
+            try:
+                await pubsub.subscribe(channel)
+                while True:
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if message is None:
+                        continue
+                    data = message.get("data")
+                    rid = data.decode() if isinstance(data, bytes) else str(data)
+                    if self._inflight.cancel(rid):
+                        logger.info("attempt_cancelled", request_id=rid, worker=self.pod_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("cancel_channel_failed", error_type=type(exc).__name__)
+                await asyncio.sleep(2.0)
+            finally:
+                with contextlib.suppress(Exception):
+                    await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis stub gap
 
     async def _check_schema(self, client: Redis) -> None:
         """Write `<prefix>:schema` on first start; refuse state a newer version wrote (I15).
@@ -421,6 +450,7 @@ class LLMQueue:
             worker=self.pod_id,
             hooks=self.hooks,
             leases=self._leases,
+            inflight=self._inflight,
         )
         runtime = WorkerRuntime(
             deps,
@@ -496,6 +526,9 @@ class LLMQueue:
             await dispatcher.start()
         if workers is not None:
             workers.start()
+            state.tasks.append(
+                asyncio.create_task(self._listen_cancels(client), name="llmq-cancels")
+            )
         self._state = state
         _set_default_queue(self)
 

@@ -135,6 +135,49 @@ class _Stopped(Exception):
         self.state = state
 
 
+class InflightAttempts:
+    """Provider attempts running on this pod by request id, so a cancel can stop them (I18).
+
+    `cancel(rid)` (from the cancel channel) marks the id and cancels its attempt tasks; the
+    attempt then ends as `_Stopped(CANCELLED)`, not as a provider error or a pod shutdown.
+    """
+
+    def __init__(self) -> None:
+        """Empty registry; one per pod, shared by every worker call."""
+        self._tasks: dict[str, set[asyncio.Future[Any]]] = {}
+        self._cancelled: set[str] = set()
+
+    def cancel(self, request_id: str) -> bool:
+        """Stop `request_id`'s running attempts; False when none runs here."""
+        tasks = self._tasks.get(request_id)
+        if not tasks:
+            return False
+        self._cancelled.add(request_id)
+        for task in tasks:
+            task.cancel()
+        return True
+
+    async def run(self, request_id: str, call: Awaitable[Any]) -> Any:
+        """Await one attempt as its own task; raises `_Stopped` when `cancel` stopped it."""
+        task = asyncio.ensure_future(call)
+        self._tasks.setdefault(request_id, set()).add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            outer = current is not None and current.cancelling() > 0  # timeout or shutdown
+            if request_id in self._cancelled and task.cancelled() and not outer:
+                raise _Stopped(ClaimState.CANCELLED) from None
+            raise
+        finally:
+            tasks = self._tasks.get(request_id)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    del self._tasks[request_id]
+                    self._cancelled.discard(request_id)
+
+
 @dataclass(slots=True)
 class CoreDeps:
     """Everything `execute_job` needs, injected so tests can pass fakes and clocks.
@@ -166,6 +209,8 @@ class CoreDeps:
     acquire_wait_secs: float = QUEUED_ACQUIRE_SECS
     store_retry_secs: float = STORE_RETRY_SECS
     reply_cache: ReplyCache = field(default_factory=ReplyCache)
+    # Running attempts by request id, for the cancel channel (I18); None: not stoppable.
+    inflight: InflightAttempts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +330,10 @@ async def execute_job(
             released_secs=delay,
         )
         if delay is not None:  # unclaimed: a pod configured for the model takes it
+            # S48: SQS delays are whole seconds, so the message came back in phase with this
+            # pod's own polls and it won 8 redeliveries in a row; a sub-second pause first
+            # puts the return at a random point of every pod's poll cycle.
+            await deps.sleep(deps.rng.random())
             return JobResult(ClaimDecision.RUN, requeue_secs=delay)
     if claims is not None:
         try:
@@ -764,8 +813,12 @@ async def run_call(
                 t0 = time.monotonic()
                 try:
                     async with cap:
-                        response = await provider.call(envelope.op, call_params, target)
-                except asyncio.CancelledError:
+                        attempt_call = provider.call(envelope.op, call_params, target)
+                        if deps.inflight is None:
+                            response = await attempt_call
+                        else:
+                            response = await deps.inflight.run(rid, attempt_call)
+                except (asyncio.CancelledError, _Stopped):
                     raise
                 except Exception as exc:
                     if cap.expired() and not by_deadline:  # S39: a hung target, not the call

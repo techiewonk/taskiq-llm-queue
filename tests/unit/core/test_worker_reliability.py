@@ -586,3 +586,34 @@ def test_built_brokers_use_the_wire_serializer(rig: Rig) -> None:
     for broker in brokers.all():
         assert isinstance(broker.serializer, WireSerializer)
         assert isinstance(broker.formatter, DeliveryFormatter)
+
+
+def test_built_brokers_batch_bg_and_bulk_sends_but_not_rt(rig: Rig) -> None:
+    """I17: bg/bulk queues batch sends (`sqs_batch_wait_secs`), rt never; 0 turns it off.
+
+    With an S3 bucket every broker also gets the offload middleware (I16).
+    """
+    from taskiq_llm_queue.broker.s3_offload import S3OffloadMiddleware
+    from taskiq_llm_queue.lifecycle import build_brokers
+    from taskiq_llm_queue.reliability import AdaptiveLimiter
+    from taskiq_llm_queue.tasks import WorkerResultBackend
+
+    models = {
+        "big": ModelConfig(
+            provider="bedrock",
+            model_id="big-id",
+            targets={"primary": Target(region="r1")},
+            queues={"rt": "q-rt", "default": "q-bg", "bulk": "q-bulk"},
+        )
+    }
+    limiter = AdaptiveLimiter(fakeredis.FakeAsyncRedis(), KeySpace("t"))
+    backend = WorkerResultBackend(cast(Any, Results()))
+    config = QueueConfig(models=models, s3_offload_bucket="b")
+    broker = build_brokers(config, rig.runtime, limiter, backend).by_alias["big"]
+    waits = {n: q.batching.timeout_secs if q.batching else None for n, q in broker.queues.items()}
+    assert waits == {"q-rt": None, "q-bg": 0.02, "q-bulk": 0.02}
+    assert any(isinstance(m, S3OffloadMiddleware) for m in broker.middlewares)
+    off = QueueConfig(models=models, sqs_batch_wait_secs=0)
+    broker = build_brokers(off, rig.runtime, limiter, backend).by_alias["big"]
+    assert all(q.batching is None for q in broker.queues.values())
+    assert not any(isinstance(m, S3OffloadMiddleware) for m in broker.middlewares)

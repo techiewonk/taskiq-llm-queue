@@ -23,7 +23,7 @@ from taskiq_llm_queue import metrics_names as mn
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import HybridSQSBroker
 from taskiq_llm_queue.broker.events import BrokerHooks
-from taskiq_llm_queue.broker.queue import SQSQueue
+from taskiq_llm_queue.broker.queue import Batching, SQSQueue
 from taskiq_llm_queue.broker.s3_offload import S3OffloadMiddleware
 from taskiq_llm_queue.broker.serializer import WireSerializer
 from taskiq_llm_queue.config import Lane
@@ -338,6 +338,8 @@ def build_brokers(
         "release_running_on_shutdown": True,
         "session": session,
     }
+    wait = config.sqs_batch_wait_secs
+    batching = Batching(timeout_secs=wait) if wait > 0 else None
     for alias, model in config.models.items():
         if not model.queues:
             continue
@@ -354,6 +356,7 @@ def build_brokers(
                 priority=QUEUE_PRIORITY[kind],
                 wait_time_secs=config.sqs_wait_time_secs,
                 gate=gate,
+                batching=batching if kind != "rt" else None,  # I17: rt sends at once
             )
             for kind, value in sorted(model.queues.items(), key=lambda kv: QUEUE_PRIORITY[kv[0]])
         ]
