@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import threading
-import warnings
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
@@ -308,7 +306,7 @@ class QueueConfig(BaseModel):
         env = os.environ if environ is None else environ
 
         def get(name: str) -> str | None:
-            return env_value(env, name)
+            return env.get(ENV_PREFIX + name)
 
         raw: dict[str, object] = {}
         errors: list[str] = []
@@ -405,43 +403,6 @@ _BREAKER_ENV: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ("CB_WINDOW_SECS", "window_secs", float),
     ("CB_COOLDOWN_SECS", "cooldown_secs", float),
 )
-# Deprecated `LLMQ_*` spellings (current name -> old name), read only when the new one is unset.
-DEPRECATED_ENV: Mapping[str, str] = {
-    "CFG_RELOAD_SECS": "CFG_RELOAD_S",
-    "CONSUMER_DRAIN_SECS": "CONSUMER_DRAIN_S",
-    "RETRY_BASE_SECS": "RETRY_BASE_S",
-    "SQS_WAIT_TIME_SECS": "SQS_WAIT_TIME_S",
-    "SQS_FAILOVER_SECS": "SQS_FAILOVER_S",
-    "AC_PAUSE_SECS": "AC_PAUSE_S",
-    "AC_LEASE_TTL_SECS": "AC_LEASE_TTL_S",
-    "CB_WINDOW_SECS": "CB_WINDOW_S",
-    "CB_COOLDOWN_SECS": "CB_COOLDOWN_S",
-    **{f"TIMEOUT_{lane.value.upper()}_SECS": f"TIMEOUT_{lane.value.upper()}" for lane in Lane},
-    **{
-        f"TIMEOUT_EMBED_{lane.value.upper()}_SECS": f"TIMEOUT_EMBED_{lane.value.upper()}"
-        for lane in Lane
-    },
-}
-_warned_env: set[str] = set()
-_warned_lock = threading.Lock()
-
-
-def env_value(env: Mapping[str, str], name: str) -> str | None:
-    """`LLMQ_<name>`, else its deprecated spelling (warned once per process), else None."""
-    value = env.get(ENV_PREFIX + name)
-    old = DEPRECATED_ENV.get(name)
-    if value is not None or old is None:
-        return value
-    value = env.get(ENV_PREFIX + old)
-    if value is not None:
-        with _warned_lock:
-            first = old not in _warned_env
-            _warned_env.add(old)
-        if first:
-            message = f"{ENV_PREFIX}{old} is deprecated; use {ENV_PREFIX}{name}"
-            warnings.warn(message, DeprecationWarning, stacklevel=3)
-            logger.warning("deprecated_env_name", old=ENV_PREFIX + old, new=ENV_PREFIX + name)
-    return value
 
 
 def _int_map(value: str) -> dict[str, int]:

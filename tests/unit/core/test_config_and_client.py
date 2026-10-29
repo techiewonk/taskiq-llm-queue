@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import json
-import warnings
 from typing import Any
 
 import pytest
@@ -229,20 +228,12 @@ def test_invoke_body_accepts_json_text_and_bytes() -> None:
         _invoke_body(b"\xff\xfe")
 
 
-def test_deprecated_env_names_still_work_and_warn_once() -> None:
-    """Old `_S` / suffix-less names are read when the new one is unset, with one warning."""
-    from taskiq_llm_queue import config as config_module
-
-    config_module._warned_env.discard("CB_WINDOW_S")
-    env = {"LLMQ_CB_WINDOW_S": "12", "LLMQ_TIMEOUT_RT": "33"}
-    with pytest.warns(DeprecationWarning, match="LLMQ_CB_WINDOW_S"):
-        cfg = QueueConfig.from_env(env)
-    assert (cfg.breaker.window_secs, cfg.timeout_secs[Lane.RT]) == (12.0, 33.0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        QueueConfig.from_env({"LLMQ_CB_WINDOW_S": "12"})  # second time: silent
-    new_wins = QueueConfig.from_env({"LLMQ_CB_WINDOW_SECS": "7", "LLMQ_CB_WINDOW_S": "12"})
-    assert new_wins.breaker.window_secs == 7.0
+def test_old_s_env_names_are_ignored() -> None:
+    """Old `_S` / suffix-less spellings are not read: 0.1 ships only the `_SECS` names."""
+    cfg = QueueConfig.from_env({"LLMQ_CB_WINDOW_S": "12", "LLMQ_TIMEOUT_RT": "33"})
+    default = QueueConfig.from_env({})
+    assert cfg.breaker.window_secs == default.breaker.window_secs
+    assert cfg.timeout_secs[Lane.RT] == default.timeout_secs[Lane.RT]
 
 
 def test_secrets_and_region_defaults() -> None:

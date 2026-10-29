@@ -243,7 +243,7 @@ No coverage gate: **every scenario must pass before a release.** Unit tests are 
 | S15 | Graceful shutdown | `docker compose stop worker` (30 s) | Unstarted messages released at once (picked up < 5 s by others) |
 | S16 | Expiry / deadline | `rt` deadline 2 s, workers paused 5 s | Expired messages deleted unrun; client got `LLMQueueTimeout` |
 | S17 | Cancellation | cancel 50 in-flight ids | Not executed if not started; no results stored |
-| S18 | Large params | 300 KB prompt | Stored by reference; result OK; `TTL llmq:local:req:<id>` within 1790–1800 s and the result key ≈ 300 s (no waiting); optional run with `LLMQ_STATE_TTL_S=10` shows real expiry |
+| S18 | Large params | 300 KB prompt | Stored by reference; result OK; `TTL llmq:local:req:<id>` within 1790–1800 s and the result key ≈ 300 s (no waiting); optional run with `LLMQ_STATE_TTL_SECS=10` shows real expiry |
 | S19 | Canary routing | `routing set gpt20b rt 10` | ~10 % of sessions on `sqs`, sticky per session; kill switch → 100 % `direct` in ≤ 30 s |
 | S20 | **SQS down** | `make chaos C=stop-sqs` | Calls switch to `direct` for that model within one send failure; alarm event; back to `sqs` after recovery + failover window |
 | S21 | **Valkey down** | `make chaos C=stop-valkey` | Calls run `direct` with the local per-pod cap; no crash; back to normal when Valkey returns |

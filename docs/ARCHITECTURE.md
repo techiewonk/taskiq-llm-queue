@@ -569,7 +569,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 
 ## 7. Configuration reference
 
-`QueueConfig.from_env()` reads `LLMQ_*`. All bad values are collected into one `ConfigError` at boot. Duration names end in `_SECS`; the old `_S` spellings are still read with a one-time `DeprecationWarning`. Every field can also be passed to `QueueConfig(...)` directly.
+`QueueConfig.from_env()` reads `LLMQ_*`. All bad values are collected into one `ConfigError` at boot. Duration names end in `_SECS`; older `_S` spellings are not read. Every field can also be passed to `QueueConfig(...)` directly.
 
 **Valkey / Redis**
 

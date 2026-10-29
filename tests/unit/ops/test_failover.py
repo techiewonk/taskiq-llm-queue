@@ -153,10 +153,10 @@ def test_local_cap_and_limiter() -> None:
 
 
 def test_settings_from_env_and_validation() -> None:
-    s = FailoverSettings.from_env({"LLMQ_SQS_FAILOVER_S": "60", "LLMQ_LOCAL_LIMIT_CAP": "5"})
+    s = FailoverSettings.from_env({"LLMQ_SQS_FAILOVER_SECS": "60", "LLMQ_LOCAL_LIMIT_CAP": "5"})
     assert (s.sqs_failover_secs, s.local_cap_fallback) == (60.0, 5)
     assert FailoverSettings.from_env({}).sqs_failover_secs == 300.0
-    with pytest.raises(ConfigError, match=r"LLMQ_SQS_FAILOVER_S.*LLMQ_LOCAL_LIMIT_CAP"):
-        FailoverSettings.from_env({"LLMQ_SQS_FAILOVER_S": "x", "LLMQ_LOCAL_LIMIT_CAP": "y"})
+    with pytest.raises(ConfigError, match=r"LLMQ_SQS_FAILOVER_SECS.*LLMQ_LOCAL_LIMIT_CAP"):
+        FailoverSettings.from_env({"LLMQ_SQS_FAILOVER_SECS": "x", "LLMQ_LOCAL_LIMIT_CAP": "y"})
     with pytest.raises(ConfigError):
         FailoverSettings(sqs_failover_secs=0)

@@ -8,7 +8,7 @@ Reference for the IDs used in code comments and tests: delivery-safety rules (**
 |---|---|---|
 | DS1 | Claim states `queued → running → done \| cancelled \| expired \| released`, plus a `failures` counter, all in `<prefix>:job:<id>` (Lua, Valkey `TIME`) | One place decides whether a message may run |
 | DS2 | `running` + fresh heartbeat seen by another pod → `ChangeMessageVisibility(heartbeat window)`, **never delete**. Delete only on `done` / `cancelled` / `expired` | Deleting would lose the task if the owning pod then crashes |
-| DS3 | Missing claim key → create `running` if `now < deadline_at`, else ack as `expired`. Claim TTL = `max(LLMQ_STATE_TTL_S, deadline_at − now + exec_max)`, refreshed by every heartbeat | Base queues keep messages 4 days; jobs can run > 30 min |
+| DS3 | Missing claim key → create `running` if `now < deadline_at`, else ack as `expired`. Claim TTL = `max(LLMQ_STATE_TTL_SECS, deadline_at − now + exec_max)`, refreshed by every heartbeat | Base queues keep messages 4 days; jobs can run > 30 min |
 | DS4 | Receive budget = `min(free worker slots, limiter headroom for the queue's lanes)`, so tasks aren't received and then released for lack of capacity | Releases add to `ApproximateReceiveCount` and push healthy work toward the DLQ |
 | DS5 | `maxReceiveCount` **10** on LLM queues; real failures are counted in `failures` and a task goes to the DLQ only after `LLMQ_MAX_FAILURES` (3) or as poison | Deploys and throttling must not fill DLQs |
 | DS6 | Heartbeat interval ≤ visibility / 3; heartbeat batch flushed ≤ 1 s; `max_extensions` derived from `deadline_at`; if an extend fails with `ReceiptHandleIsInvalid` / `MessageNotInflight`, the local task is cancelled and writes no result | Prevents silent redelivery while running |

@@ -50,9 +50,9 @@ LOCAL_ENV: dict[str, str] = {
     "LLMQ_AWS_REGION": REGION,
     # Sample-friendly timings: short long-polls and quick retries so scripts exit fast.
     # Production keeps the defaults (20 s long-poll, 1 s retry base, 45 s drain).
-    "LLMQ_SQS_WAIT_TIME_S": "2",
-    "LLMQ_RETRY_BASE_S": "0.2",
-    "LLMQ_CONSUMER_DRAIN_S": "5",
+    "LLMQ_SQS_WAIT_TIME_SECS": "2",
+    "LLMQ_RETRY_BASE_SECS": "0.2",
+    "LLMQ_CONSUMER_DRAIN_SECS": "5",
     "LLMQ_RESULT_DISPATCH_MS": "rt:50,bg:100,bulk:200",
 }
 

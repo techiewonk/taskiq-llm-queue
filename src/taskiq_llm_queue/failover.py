@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from taskiq_llm_queue._logging import get_logger
-from taskiq_llm_queue.config import env_value
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.metrics_names import FAILOVER_ACTIVE
 from taskiq_llm_queue.reliability.limiter import local_cap
@@ -58,15 +57,12 @@ class FailoverSettings:
     def from_env(
         cls, environ: Mapping[str, str] | None = None, *, live_pods: int = 0
     ) -> FailoverSettings:
-        """Read `LLMQ_SQS_FAILOVER_SECS` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise `ConfigError`.
-
-        The deprecated `LLMQ_SQS_FAILOVER_S` is still read (warned once).
-        """
+        """Read `LLMQ_SQS_FAILOVER_SECS` and `LLMQ_LOCAL_LIMIT_CAP`; bad values raise ConfigError."""
         env = os.environ if environ is None else environ
         values: dict[str, str] = {}
         errors: list[str] = []
         for name, conv in (("SQS_FAILOVER_SECS", float), ("LOCAL_LIMIT_CAP", int)):
-            raw = env_value(env, name)
+            raw = env.get(f"LLMQ_{name}")
             if raw is None:
                 continue
             try:

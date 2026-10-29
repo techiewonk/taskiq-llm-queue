@@ -20,7 +20,7 @@ First pre-release. Everything listed below is new.
 - `invoke_model(model, body, *, content_type=, accept=)` replaces guessing from a `"body"` key.
 - Cancellation raises `LLMQueueCancelled`.
 - `__all__` lists only the client surface; wire and plumbing names import from their submodules.
-- `aws_region` defaults to `None`; `redis_password` is a `SecretStr`; `_SECS` env names (old `_S` names warn once).
+- `aws_region` defaults to `None`; `redis_password` is a `SecretStr`; `_SECS` env names (the old `_S` spellings are no longer read).
 - Redis keys are hash-tagged for cluster mode (key schema 2); ids are hashed with keyed BLAKE2b (`LLMQ_ID_HASH_SALT`), and xxhash is no longer a dependency.
 - `QueuedChatBedrockConverse` takes `model_alias=`; an alias passed as `model=` raises.
 - The empty `s3` extra is gone.
