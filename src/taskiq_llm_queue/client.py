@@ -67,7 +67,7 @@ from taskiq_llm_queue.lifecycle import (
     queue_name,
 )
 from taskiq_llm_queue.metrics import MetricsSink, NullMetrics
-from taskiq_llm_queue.model_settings import SettingsResolver, model_settings_store
+from taskiq_llm_queue.model_settings import SHARED_PREFIX, SettingsResolver, model_settings_store
 from taskiq_llm_queue.protocols import ClaimDecision, ClaimState
 from taskiq_llm_queue.providers.embeddings import (
     batches,
@@ -76,7 +76,7 @@ from taskiq_llm_queue.providers.embeddings import (
     parse_embeddings,
 )
 from taskiq_llm_queue.providers.registry import ProviderRegistry
-from taskiq_llm_queue.reliability.breaker import CircuitBreaker
+from taskiq_llm_queue.reliability.breaker import BreakerState, CircuitBreaker
 from taskiq_llm_queue.reliability.claims import RedisClaimStore
 from taskiq_llm_queue.reliability.config_store import LiveConfigStore, fallback_store
 from taskiq_llm_queue.reliability.fallback import FallbackConfig
@@ -290,9 +290,16 @@ class LLMQueue:
         if callable(report):
             safe_hook(report)
 
-    async def _watch_limits(self, limiter: AdaptiveLimiter) -> None:
-        """Feed learned limits to the failover local cap and the `llmq_limit` gauge."""
+    async def _watch_limits(self, limiter: AdaptiveLimiter, breaker: CircuitBreaker) -> None:
+        """Feed learned limits to the failover local cap; gauges per model target used here.
+
+        `llmq_limit` from the last limiter reply; with a metrics sink also `llmq_inflight`
+        (cluster-wide leases) and `llmq_breaker_open` (1 open, 0.5 half-open, 0 closed),
+        read from Valkey once per `cfg_reload_secs` (I14).
+        """
         note = getattr(self.failover, "note_limit", None)
+        read_state = not isinstance(self.metrics, NullMetrics)
+        breaker_value = {BreakerState.OPEN: 1.0, BreakerState.HALF_OPEN: 0.5}
         while True:
             await asyncio.sleep(self.config.cfg_reload_secs)
             for (model, target), limit in list(limiter.last_limits.items()):
@@ -300,6 +307,16 @@ class LLMQueue:
                     safe_hook(note, model, target, limit)
                 labels = {"model": model, "target": target}
                 safe_hook(self.metrics.gauge, mn.LIMIT, float(limit), labels)
+                if not read_state or model.startswith(SHARED_PREFIX):
+                    continue
+                try:
+                    state = await limiter.state(model, target)
+                    position = await breaker.state(model, target)
+                except Exception:  # Valkey blip: the next round reports again
+                    continue
+                safe_hook(self.metrics.gauge, mn.INFLIGHT, float(state.inflight), labels)
+                value = breaker_value.get(position, 0.0)
+                safe_hook(self.metrics.gauge, mn.BREAKER_OPEN, value, labels)
 
     def _apply_settings(
         self, live: ModelSettings, limiter: AdaptiveLimiter, breaker: CircuitBreaker
@@ -434,7 +451,9 @@ class LLMQueue:
             asyncio.create_task(fallback.run_reload(config.cfg_reload_secs), name="llmq-fallback")
         )
         state.tasks.append(asyncio.create_task(heartbeat.run(), name="llmq-pod-heartbeat"))
-        state.tasks.append(asyncio.create_task(self._watch_limits(limiter), name="llmq-limits"))
+        state.tasks.append(
+            asyncio.create_task(self._watch_limits(limiter, breaker), name="llmq-limits")
+        )
         state.tasks.append(asyncio.create_task(self._watch_settings(state), name="llmq-settings"))
         if self.router is None and config.routing_enabled:
             default = RoutingConfig.model_validate(config.routing_default)

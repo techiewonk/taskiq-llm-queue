@@ -14,6 +14,14 @@ SYNC_FALLBACK_TOTAL = "llmq_sync_fallback_total"
 RELEASED_UNKNOWN_TOTAL = "llmq_released_unknown_total"
 CONFIG_INVALID_TOTAL = "llmq_config_invalid_total"
 FAILOVER_ACTIVE = "llmq_failover_active"
+# Broker (SQS) events, per queue (I14).
+SQS_RECEIVED_TOTAL = "llmq_sqs_received_total"
+SQS_SENT_TOTAL = "llmq_sqs_sent_total"
+SQS_ACKED_TOTAL = "llmq_sqs_acked_total"
+SQS_RELEASED_TOTAL = "llmq_sqs_released_total"  # kind = reason (shutdown, drain, unknown_task..)
+SQS_EXPIRED_TOTAL = "llmq_sqs_expired_total"
+SQS_ERRORS_TOTAL = "llmq_sqs_errors_total"  # step = SQS operation, kind = error family
+SQS_WAIT_SECONDS = "llmq_sqs_wait_seconds"  # time a message sat in SQS before receipt
 
 # Allowed labels; raw user/session ids are never metric labels (cardinality, privacy).
 LABELS = ("model", "target", "lane", "queue", "path", "kind", "step")

@@ -89,9 +89,37 @@ class MetricsHooks(QueueHooks, BrokerHooks):
         self.sink.incr(mn.SYNC_FALLBACK_TOTAL, 1.0, {"model": model})
 
     def on_release(self, queue: str, count: int, reason: str) -> None:
-        """Count messages released because this pod didn't know the task (DS9)."""
+        """Count released messages by reason; unknown tasks also on their own counter (DS9)."""
+        kind = reason.split(":", 1)[0]  # a reason may carry detail after ':' (cardinality)
+        self.sink.incr(mn.SQS_RELEASED_TOTAL, float(count), {"queue": queue, "kind": kind})
         if reason.startswith("unknown_task") or reason == "unsupported_envelope":
             self.sink.incr(mn.RELEASED_UNKNOWN_TOTAL, float(count), {"queue": queue})
+
+    def on_receive(self, queue: str, count: int) -> None:
+        """Count received messages (empty polls add nothing)."""
+        if count:
+            self.sink.incr(mn.SQS_RECEIVED_TOTAL, float(count), {"queue": queue})
+
+    def on_queue_wait(self, queue: str, wait_secs: float) -> None:
+        """Time one message sat in SQS before this pod received it."""
+        self.sink.observe(mn.SQS_WAIT_SECONDS, wait_secs, {"queue": queue})
+
+    def on_ack(self, queue: str, count: int) -> None:
+        """Count deleted (acked) messages."""
+        self.sink.incr(mn.SQS_ACKED_TOTAL, float(count), {"queue": queue})
+
+    def on_expired(self, queue: str, count: int) -> None:
+        """Count messages deleted unrun because their deadline passed."""
+        self.sink.incr(mn.SQS_EXPIRED_TOTAL, float(count), {"queue": queue})
+
+    def on_error(self, queue: str, operation: str, family: str) -> None:
+        """Count failed SQS calls by operation and error family."""
+        labels = {"queue": queue, "step": operation, "kind": family}
+        self.sink.incr(mn.SQS_ERRORS_TOTAL, 1.0, labels)
+
+    def on_send(self, queue: str, count: int) -> None:
+        """Count sent messages."""
+        self.sink.incr(mn.SQS_SENT_TOTAL, float(count), {"queue": queue})
 
 
 def limiter_settings(

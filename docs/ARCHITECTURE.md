@@ -751,9 +751,14 @@ Events worth alerting on:
 | `llmq_limit` | gauge | model, target | `LLMQueue._watch_limits` every `cfg_reload_secs` |
 | `llmq_failover_active` | gauge | model and kind=sqs, or kind=redis | `FailoverState` on enter / leave |
 | `llmq_config_invalid_total` | counter | kind=routing | `CanaryRouter.reload` |
-| `llmq_inflight`, `llmq_breaker_open` | — | — | **Defined in `metrics_names.py` but never emitted** |
+| `llmq_inflight` | gauge | model, target | `_watch_limits`: cluster-wide leases of each target this pod used (Valkey read, only with a metrics sink) |
+| `llmq_breaker_open` | gauge | model, target | `_watch_limits`: 1 open, 0.5 half-open, 0 closed |
+| `llmq_sqs_received_total`, `llmq_sqs_sent_total`, `llmq_sqs_acked_total`, `llmq_sqs_expired_total` | counter | queue | broker hooks `on_receive`, `on_send`, `on_ack`, `on_expired` |
+| `llmq_sqs_released_total` | counter | queue, kind=reason | `on_release` (shutdown, drain, unknown_task, ...) |
+| `llmq_sqs_errors_total` | counter | queue, step=operation, kind=family | `on_error` |
+| `llmq_sqs_wait_seconds` | observation | queue | `on_queue_wait`, time in SQS before receipt |
 
-`BrokerHooks` also has `on_receive`, `on_queue_wait`, `on_ack`, `on_heartbeat`, `on_expired`, `on_error`, `on_send`, but the default `MetricsHooks` only overrides `on_release`. Pass your own `hooks=` (a `QueueHooks` + `BrokerHooks` subclass) to export them.
+`on_heartbeat` is the only broker hook the default `MetricsHooks` leaves out; pass your own `hooks=` (a `QueueHooks` + `BrokerHooks` subclass) to export it.
 
 ### CLI (`llm-queue`)
 
@@ -798,7 +803,6 @@ From CHANGELOG (0.1.0a1):
 
 Found while writing this document (verified in code):
 
-- `llmq_inflight` and `llmq_breaker_open` are never emitted; broker hooks other than `on_release` are not exported by the default `MetricsHooks`.
 - `<prefix>:schema` is never written or checked, although [STABILITY.md](../STABILITY.md) describes the Redis schema as versioned under it.
 - `S3OffloadMiddleware` / `S3ResultBackend` are not wired into `LLMQueue`; large params use Valkey (`params_ref`), so DS18's "params > 200 KB need S3 offload or fail fast" is handled by `direct` failover instead.
 - Send batching (`Batching`, P8) is available on `SQSQueue` but `build_brokers` does not enable it: one `SendMessage` per call.

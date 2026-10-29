@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import subprocess
 import sys
+from collections.abc import Mapping
 
 import pytest
 
@@ -94,3 +96,80 @@ def test_importing_package_does_not_import_prometheus() -> None:
         "assert 'prometheus_client' not in sys.modules"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+class ListSink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, float, dict[str, str]]] = []
+
+    def incr(self, name: str, value: float = 1.0, labels: Mapping[str, str] | None = None) -> None:
+        self.events.append(("incr", name, value, dict(labels or {})))
+
+    def observe(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+        self.events.append(("observe", name, value, dict(labels or {})))
+
+    def gauge(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+        self.events.append(("gauge", name, value, dict(labels or {})))
+
+
+def test_metrics_hooks_report_every_broker_event() -> None:
+    """I14: every broker hook reaches the sink; empty polls and reason details add nothing."""
+    from taskiq_llm_queue import metrics_names as mn
+    from taskiq_llm_queue.lifecycle import MetricsHooks
+
+    sink = ListSink()
+    hooks = MetricsHooks(sink)
+    hooks.on_receive("q", 0)
+    hooks.on_receive("q", 3)
+    hooks.on_queue_wait("q", 1.5)
+    hooks.on_send("q", 2)
+    hooks.on_ack("q", 3)
+    hooks.on_expired("q", 1)
+    hooks.on_error("q", "receive", "throttled")
+    hooks.on_release("q", 1, "unknown_task:llmq.call")
+    names = [(e[1], e[2], e[3]) for e in sink.events]
+    assert names == [
+        (mn.SQS_RECEIVED_TOTAL, 3.0, {"queue": "q"}),
+        (mn.SQS_WAIT_SECONDS, 1.5, {"queue": "q"}),
+        (mn.SQS_SENT_TOTAL, 2.0, {"queue": "q"}),
+        (mn.SQS_ACKED_TOTAL, 3.0, {"queue": "q"}),
+        (mn.SQS_EXPIRED_TOTAL, 1.0, {"queue": "q"}),
+        (mn.SQS_ERRORS_TOTAL, 1.0, {"queue": "q", "step": "receive", "kind": "throttled"}),
+        (mn.SQS_RELEASED_TOTAL, 1.0, {"queue": "q", "kind": "unknown_task"}),
+        (mn.RELEASED_UNKNOWN_TOTAL, 1.0, {"queue": "q"}),
+    ]
+
+
+async def test_limit_watch_reports_inflight_and_breaker_per_used_target() -> None:
+    """I14: `llmq_inflight` and `llmq_breaker_open` per model target this pod used; the
+    provider's shared bucket only reports its limit."""
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from taskiq_llm_queue import LLMQueue, QueueConfig
+    from taskiq_llm_queue import metrics_names as mn
+    from taskiq_llm_queue.reliability.breaker import BreakerState
+
+    class Limiter:
+        def __init__(self) -> None:
+            self.last_limits = {("big", "primary"): 12, ("@bedrock", "shared"): 8}
+
+        async def state(self, model: str, target: str) -> Any:
+            return SimpleNamespace(inflight=5)
+
+    class Breaker:
+        async def state(self, model: str, target: str) -> BreakerState:
+            return BreakerState.HALF_OPEN
+
+    sink = ListSink()
+    q = LLMQueue(QueueConfig(cfg_reload_secs=0.01), metrics=sink)
+    task = asyncio.create_task(q._watch_limits(cast(Any, Limiter()), cast(Any, Breaker())))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    gauges = {(e[1], e[3]["model"]): e[2] for e in sink.events if e[0] == "gauge"}
+    assert gauges == {
+        (mn.LIMIT, "big"): 12.0,
+        (mn.INFLIGHT, "big"): 5.0,
+        (mn.BREAKER_OPEN, "big"): 0.5,
+        (mn.LIMIT, "@bedrock"): 8.0,
+    }
