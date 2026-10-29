@@ -330,8 +330,16 @@ async def s31(ctx: Ctx) -> None:
     ctx.metric("max_loop_lag_ms_submit_burst", round(submit_lag * 1000, 1))
     ctx.metric("top_cmds", dict(list(delta.items())[:6]))
     ctx.expect(all(r.ok for r in replies), "calls failed")
-    # bg dispatch interval is 100 ms in the harness: ~10 batched reads/s, not one per waiter.
-    ctx.expect(mget_rate <= 40, f"{mget_rate:.0f} MGET/s: result reads are not batched")
+    # Batched = one sweep per bg interval (100 ms here) plus at most one pub/sub-hinted take
+    # per finished call, never one read per waiter (1K waiters x 10/s = 10K reads/s). A fixed
+    # 40 MGET/s cap measured completion timing instead: 64ea8fe (passed at 32.5/s on 10-29)
+    # read 45/s on the same stack later; 653 MGETs = 133 sweeps + 520 hinted takes (2026-10-29).
+    mget_budget = wall / 0.1 + len(replies)
+    ctx.metric("mget_vs_budget", (delta.get("mget", 0), round(mget_budget)))
+    ctx.expect(
+        delta.get("mget", 0) <= mget_budget,
+        f"{mget_rate:.0f} MGET/s over sweeps + one per result: result reads are not batched",
+    )
     ctx.expect(max(lag) < 0.1, f"event-loop lag {max(lag) * 1000:.0f} ms")
     await ctx.final_checks(cfg)
 

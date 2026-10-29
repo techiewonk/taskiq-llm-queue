@@ -29,6 +29,7 @@ from tools.scenarios.env import (
     REGION,
     TITAN_ID,
     Settings,
+    aws_regions,
 )
 
 LLMQueueError = llmq.LLMQueueError
@@ -59,13 +60,33 @@ def api_flavour() -> str:
 
 
 def models(settings: Settings, *, llama_url: str | None = None) -> dict[str, ModelConfig]:
-    """Model aliases of the harness, on its own queue names (created by `stack.ensure_queues`)."""
+    """Model aliases of the harness, on its own queue names (created by `stack.ensure_queues`).
+
+    On real Bedrock (`settings.aws`) every alias has one regional target and there is no
+    OpenAI-compatible `llama` (it only exists in fakellm).
+    """
     q = settings.queue
     embed_queues: dict[Any, str] = {
         "rt": q("embed-rt"),
         "default": q("embed"),
         "bulk": q("embed-bulk"),
     }
+    if settings.aws:
+        chat, embed = aws_regions()
+        ids = {"gpt120b": GPT120B_ID, "gpt20b": GPT20B_ID, "titan": TITAN_ID, "cohere": COHERE_ID}
+        return {
+            alias: ModelConfig(
+                provider="bedrock",
+                model_id=model_id,
+                targets={"primary": Target(region=embed if alias in ("titan", "cohere") else chat)},
+                queues=(
+                    embed_queues
+                    if alias in ("titan", "cohere")
+                    else {"rt": q(f"{alias}-rt"), "default": q(alias)}
+                ),
+            )
+            for alias, model_id in ids.items()
+        }
     return {
         "gpt120b": ModelConfig(
             provider="bedrock",
@@ -109,15 +130,18 @@ def all_queue_names(config: QueueConfig) -> list[str]:
 
 
 def build_config(settings: Settings, **overrides: Any) -> QueueConfig:
-    """`QueueConfig` for the harness stack; keyword arguments override any field."""
+    """`QueueConfig` for the harness stack; keyword arguments override any field.
+
+    With `settings.aws` there is no Bedrock endpoint override, so calls reach real AWS.
+    """
     fields: dict[str, Any] = {
         "key_prefix": settings.prefix,
         "redis_host": settings.redis_host,
         "redis_port": settings.redis_port,
         "redis_password": settings.redis_password,
         "sqs_endpoint_url": settings.sqs_url,
-        "bedrock_endpoint_url": settings.fakellm_url,
-        "aws_region": REGION,
+        "bedrock_endpoint_url": None if settings.aws else settings.fakellm_url,
+        "aws_region": aws_regions()[0] if settings.aws else REGION,
         "models": models(settings),
         "fallback_default": {"chains": {"gpt120b": ["gpt20b"]}},
         "job_queues": {"ingest": settings.queue("jobs-ingest")},

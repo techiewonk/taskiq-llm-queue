@@ -368,3 +368,47 @@ async def test_deadline_wake_takes_due_ids_before_timing_out(clock: ManualClock)
         long.cancel()
     finally:
         await dispatcher.stop()
+
+
+async def test_new_same_lane_waiter_does_not_force_a_sweep(clock: ManualClock) -> None:
+    """Bug S31: a new waiter woke the loop when the bg interval (0.1) was < the nap length,
+    which float rounding made 0.10000000000002 at real clock values, so most new waiters cost
+    a full sweep (43 MGET/s for 1K waiters). Same-lane arrivals now wait for the planned poll."""
+    clock.now = 1000.3
+    store = DictStore()
+    dispatcher = ResultDispatcher(
+        store, clock=clock, sleep=clock.sleep, intervals_ms={Lane.BG: 100}
+    )
+    waits = [asyncio.create_task(dispatcher.wait("t0", 1e6, Lane.BG))]
+    await settle()
+    for i in range(1, 9):
+        await clock.advance(0.01)
+        waits.append(asyncio.create_task(dispatcher.wait(f"t{i}", 1e6, Lane.BG)))
+        await settle()
+    assert dispatcher.polls == 0  # 80 ms in: no sweep yet, whatever arrived
+    await clock.advance(0.03)
+    assert dispatcher.polls == 1
+    for i in range(9):
+        await store.put(reply(f"t{i}"), ttl_secs=60)
+    await clock.advance(0.1)
+    await asyncio.gather(*waits)
+    assert dispatcher.polls == 2
+    await dispatcher.stop()
+
+
+async def test_faster_lane_waiter_still_wakes_a_long_nap(clock: ManualClock) -> None:
+    """A rt waiter arriving while the loop naps for bulk gets its first poll at its own interval,
+    not after the bulk nap (the S31 wake fix compares absolute wake-up times)."""
+    store = DictStore()
+    dispatcher = ResultDispatcher(store, clock=clock, sleep=clock.sleep)
+    bulk = asyncio.create_task(dispatcher.wait("b", 1e6, Lane.BULK))
+    await settle()
+    await clock.advance(1.0)
+    await store.put(reply("r"), ttl_secs=60)
+    rt = asyncio.create_task(dispatcher.wait("r", 1e6, Lane.RT))
+    await settle()
+    await clock.advance(0.1)
+    assert (await rt).ok
+    assert dispatcher.polls == 1
+    bulk.cancel()
+    await dispatcher.stop()

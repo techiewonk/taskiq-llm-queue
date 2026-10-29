@@ -197,6 +197,8 @@ class WorkerRuntime:
             elif result.requeue_secs is not None:  # DS4 no capacity; S48 model not configured
                 await _release(broker, labels, result.requeue_secs)
         except InfraError as exc:
+            if owned:  # S50: a claim-loss cancel here skipped the release
+                self.unregister(owned[0])
             await self._infra_release(rid, exc, broker, labels, owned=bool(owned))
         except QueueUnavailable:  # DS8: reply cached on this pod, claim left running
             logger.warning(
@@ -227,7 +229,11 @@ class WorkerRuntime:
         *,
         owned: bool,
     ) -> None:
-        """Valkey failed: report it, hand our claim back if we hold it, release the message."""
+        """Valkey failed: report it, release the message, then hand our claim back if held.
+
+        The message goes first (S50): the claim release can hang reconnecting to a dead Valkey,
+        and a task cancelled there before releasing was acked by taskiq, losing the call.
+        """
         cause = exc.__cause__ or exc
         self._report_redis(cause)
         logger.warning(
@@ -236,11 +242,11 @@ class WorkerRuntime:
             error_type=type(cause).__name__,
             attempted=getattr(exc, "attempted", False),
         )
+        await _release(broker, labels, self.defer_secs)
         claims = self.deps.claims
         if owned and claims is not None:
             with contextlib.suppress(Exception):
                 await claims.release(request_id, worker=self.deps.worker)
-        await _release(broker, labels, self.defer_secs)
 
     def _report_redis(self, exc: BaseException) -> None:
         if self.failover is not None and isinstance(exc, RedisError):

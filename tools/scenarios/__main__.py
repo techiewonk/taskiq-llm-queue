@@ -4,6 +4,9 @@ run [S01 S35 ...] [--tag fast|slow|all] [--report out.json]   run scenarios, pri
 list [--tag ...]                                               show ids, tags and status hints
 load [--rate 500] [--minutes 15] [--workers 3]                 S27-style load (pure asyncio)
 chaos kill-worker|stop-sqs|start-sqs|stop-valkey|start-valkey|pause-fakellm
+
+SCN_PROVIDER=aws runs only `aws_safe="yes"` scenarios against real Bedrock (queue stays local);
+credentials come from `.env` / Secrets Manager per SCN_ENV_SOURCE (auto|dotenv|secrets|none).
 """
 
 from __future__ import annotations
@@ -22,6 +25,11 @@ def _run(args: argparse.Namespace) -> int:
 
     specs = harness.select(args.ids, args.tag)
     settings = Settings()
+    if settings.aws:
+        unsafe = [s.id for s in specs if s.aws_safe != "yes"]
+        if unsafe and args.ids:
+            raise SystemExit(f"SCN_PROVIDER=aws refuses scenarios that are not aws-safe: {unsafe}")
+        specs = [s for s in specs if s.aws_safe == "yes"]
     run_dir = Path(args.run_dir) if args.run_dir else harness.default_run_dir()
     print(f"run dir: {run_dir}  ({len(specs)} scenarios)", flush=True)
     results = asyncio.run(harness.run_many(specs, settings, run_dir))
@@ -29,9 +37,10 @@ def _run(args: argparse.Namespace) -> int:
     print(harness.table(results))
     report = {
         "settings": {
+            "provider": settings.provider,
             "prefix": settings.prefix,
             "sqs": settings.sqs_url,
-            "fakellm": settings.fakellm_url,
+            "fakellm": None if settings.aws else settings.fakellm_url,
             "redis": f"{settings.redis_host}:{settings.redis_port}",
         },
         "run_dir": str(run_dir),

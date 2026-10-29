@@ -293,6 +293,32 @@ async def test_lost_claim_releases_message_instead_of_acking(rig: Rig) -> None:
     assert cast(Results, rig.runtime.deps.results).replies == {}  # no result published
 
 
+async def test_valkey_error_release_survives_a_claim_loss_cancel(rig: Rig) -> None:
+    """Bug S50: Valkey restarted mid-call; the claim heartbeat then reported the claim lost and
+    cancelled the task while `_infra_release` hung on `claims.release`, so the message was never
+    released and taskiq acked it (8 callers timed out). The message is now released first."""
+    in_claim_release = asyncio.Event()
+    unblock = asyncio.Event()
+
+    async def limiter_down(*args: Any, **kwargs: Any) -> Lease | None:
+        raise redis_exceptions.ConnectionError("down")
+
+    async def hanging_release(request_id: str, *, worker: str | None = None) -> None:
+        in_claim_release.set()
+        await unblock.wait()  # a reconnect to a dead Valkey
+
+    rig.runtime.deps.limiter.acquire = limiter_down  # type: ignore[method-assign]
+    rig.claims.release = hanging_release  # type: ignore[method-assign]
+    task = asyncio.create_task(run_llm(rig, raw_envelope()))
+    await in_claim_release.wait()
+    assert rig.broker.releases == [("rh-1", 20)]  # released before the claim hand-back
+    assert rig.runtime.stop_running(CLAIM_LOST, ["r-1"]) == []  # no longer cancellable
+    unblock.set()
+    await task
+    assert not task.cancelled()
+    assert rig.failover.reported
+
+
 async def test_claim_loss_ends_quietly_but_shutdown_still_cancels(rig: Rig) -> None:
     """Bug: a genuine claim loss re-raised CancelledError, so taskiq printed an ERROR
     traceback. It now ends quietly, but a drain cancel or one on top of it still raises."""

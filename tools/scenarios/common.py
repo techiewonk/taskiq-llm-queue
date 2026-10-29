@@ -33,7 +33,7 @@ async def calls(
                 api.converse(
                     q,
                     model,
-                    api.converse_request(ctx.text(ctx.rid(i, tag))),
+                    api.converse_request(ctx.text(ctx.rid(i, tag)), max_tokens=ctx.max_tokens),
                     lane=lane,
                     request_id=ctx.rid(i, tag),
                     **kw,
@@ -48,9 +48,8 @@ async def one(ctx: Ctx, q: LLMQueue, n: int | str, *, tag: str = "", **kw: Any) 
     """One converse call (gpt20b, bg unless overridden) with rid `rid(n, tag)`."""
     kw.setdefault("lane", "bg")
     model = kw.pop("model", "gpt20b")
-    return await api.converse(
-        q, model, api.converse_request(ctx.text(ctx.rid(n, tag))), request_id=ctx.rid(n, tag), **kw
-    )
+    request = api.converse_request(ctx.text(ctx.rid(n, tag)), max_tokens=ctx.max_tokens)
+    return await api.converse(q, model, request, request_id=ctx.rid(n, tag), **kw)
 
 
 @dataclass(slots=True)
@@ -175,3 +174,27 @@ def log_events(paths: list[Path]) -> dict[str, int]:
             if len(parts) >= 5 and parts[2] in ("WARNING", "ERROR", "CRITICAL"):
                 found[parts[4]] += 1
     return dict(found)
+
+
+def converse_shape(response: Any) -> tuple[list[str], dict[str, int]]:
+    """Problems with a real Converse reply's shape, and its token usage.
+
+    Used in aws mode instead of comparing with fakellm's deterministic reply: the message
+    must carry a non-empty text or a tool-use block, a stop reason and token counts.
+    """
+    problems: list[str] = []
+    if not isinstance(response, dict):
+        return [f"response is {type(response).__name__}, not dict"], {}
+    content = response.get("output", {}).get("message", {}).get("content") or []
+    has_text = any(isinstance(b, dict) and str(b.get("text", "")).strip() for b in content)
+    has_tool = any(isinstance(b, dict) and "toolUse" in b for b in content)
+    if not (has_text or has_tool):
+        blocks = [list(b) for b in content]
+        problems.append(f"no text/toolUse block: {blocks} stopReason={response.get('stopReason')}")
+    if not response.get("stopReason"):
+        problems.append("no stopReason")
+    raw = response.get("usage") or {}
+    usage = {k: int(raw.get(k) or 0) for k in ("inputTokens", "outputTokens", "totalTokens")}
+    if usage["inputTokens"] <= 0 or usage["outputTokens"] <= 0:
+        problems.append(f"token usage missing: {raw}")
+    return problems, usage

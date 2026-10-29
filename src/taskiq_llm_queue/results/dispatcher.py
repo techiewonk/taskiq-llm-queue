@@ -36,6 +36,8 @@ DEFAULT_INTERVALS_MS: Mapping[Lane, int] = {Lane.RT: 100, Lane.BG: 500, Lane.BUL
 _PUBSUB_RETRY_SECS = 1.0
 # Rebuild the deadline heap once it holds this many entries and more stale than live ones.
 _COMPACT_MIN_ENTRIES = 64
+# A new waiter wakes the loop only if it needs a poll this much before the planned wake-up.
+_WAKE_SLACK_SECS = 0.001
 
 
 class ResultsUnavailable(QueueUnavailable):
@@ -101,7 +103,7 @@ class ResultDispatcher:
         self._seq = 0
         self._wake = asyncio.Event()  # poll now
         self._work = asyncio.Event()  # first waiter arrived while idle
-        self._nap_secs = math.inf
+        self._wake_at = math.inf  # clock time the current nap ends; inf while idle
         self._hinted: set[str] = set()  # ids announced on the done channel since the last take
         self._next_sweep: float | None = None  # when the next take over every waiter is due
         self._loop_task: asyncio.Task[None] | None = None
@@ -156,12 +158,14 @@ class ResultDispatcher:
         self._lanes[lane] += 1
         heapq.heappush(self._deadlines, (waiter.deadline, waiter.seq, task_id))
         self._maybe_compact()
-        if math.isinf(self._nap_secs):
+        if math.isinf(self._wake_at):
             self._work.set()
         elif (
-            self._intervals[lane] / 1000 < self._nap_secs
-            or waiter.deadline < self._clock() + self._nap_secs
+            min(self._clock() + self._intervals[lane] / 1000, waiter.deadline)
+            < self._wake_at - _WAKE_SLACK_SECS
         ):
+            # S31: comparing the interval with the nap *length* woke the loop for most new
+            # same-lane waiters ((t + 0.1) - t > 0.1 in floats): ~90 extra full sweeps per 1K.
             self._wake.set()  # loop naps longer than this waiter allows
         try:
             return await waiter.future
@@ -187,7 +191,7 @@ class ResultDispatcher:
         """
         while True:
             if not self._waiters:
-                self._nap_secs = math.inf
+                self._wake_at = math.inf
                 self._next_sweep = None
                 self._hinted.clear()
                 self._work.clear()
@@ -202,7 +206,7 @@ class ResultDispatcher:
             self._drop_stale_deadlines()
             if self._deadlines:
                 nap = min(nap, max(0.0, self._deadlines[0][0] - now))
-            self._nap_secs = nap
+            self._wake_at = now + nap
             woken = await self._nap(nap)
             if self._waiters:
                 await self._take(woken)

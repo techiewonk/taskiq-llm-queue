@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import time
 from collections import Counter
 from typing import Any
@@ -15,7 +16,14 @@ from typing import Any
 import orjson
 
 from tools.scenarios import api, stack
-from tools.scenarios.common import breaker_state, calls, one, redis_call, wait_until
+from tools.scenarios.common import (
+    breaker_state,
+    calls,
+    converse_shape,
+    one,
+    redis_call,
+    wait_until,
+)
 from tools.scenarios.env import GPT20B_PRIMARY, GPT120B_APAC, GPT120B_PRIMARY
 from tools.scenarios.harness import Ctx, scenario
 
@@ -36,14 +44,14 @@ async def s16(ctx: Ctx) -> None:
     await asyncio.sleep(3)
     await ctx.workers(1)
     await asyncio.sleep(4)
-    log = await ctx.fake.calls(ctx.rid_prefix())
+    n_calls, rids = await ctx.provider_calls()
     ctx.metric("caller_wait_s", round(waited, 2))
     ctx.metric("outcomes", dict(Counter(r.error_kind for r in replies)))
-    ctx.metric("provider_calls", sum(len(v) for v in log.values()))
+    ctx.metric("provider_calls", n_calls)
     ctx.expect(
         all(r.error_kind == "timeout" for r in replies), "callers did not get LLMQueueTimeout"
     )
-    ctx.expect(not log, f"expired calls reached the provider: {list(log)[:3]}")
+    ctx.expect(not n_calls, f"expired calls reached the provider: {n_calls} {rids[:3]}")
     await ctx.final_checks()
 
 
@@ -59,12 +67,18 @@ async def s41(ctx: Ctx) -> None:
     await asyncio.sleep(2)
     await ctx.workers(1)
     await asyncio.sleep(5)
-    log = await ctx.fake.calls(ctx.rid_prefix(""))
+    # Ids carry the lane tag (`s41r-`, `s41b-`, `s41e-`), so the untagged prefix never matches.
+    if ctx.aws:  # aws mode counts all worker attempts; the tag is ignored
+        n_calls, rids = await ctx.provider_calls()
+    else:
+        per_tag = [await ctx.provider_calls(tag) for tag in ("r", "b", "e")]
+        n_calls = sum(n for n, _ in per_tag)
+        rids = [rid for _, tagged in per_tag for rid in tagged]
     kinds = Counter(r.error_kind for r in [*r_rt, *r_bg, r_bulk])
     ctx.metric("outcomes", dict(kinds))
-    ctx.metric("provider_calls", sum(len(v) for v in log.values()))
+    ctx.metric("provider_calls", n_calls)
     ctx.expect(set(kinds) == {"timeout"}, f"outcomes {dict(kinds)}")
-    ctx.expect(not log, f"expired work reached the provider: {sorted(log)[:5]}")
+    ctx.expect(not n_calls, f"expired work reached the provider: {n_calls} {rids}")
     await ctx.final_checks()
 
 
@@ -79,12 +93,12 @@ async def s17(ctx: Ctx) -> None:
     await ctx.workers(1)
     replies = await asyncio.gather(*tasks)
     await asyncio.sleep(2)
-    log = await ctx.fake.calls(ctx.rid_prefix())
+    n_calls, _ = await ctx.provider_calls()
     kinds = Counter(r.error_kind for r in replies)
     ctx.metric("outcomes", dict(kinds))
-    ctx.metric("provider_calls", sum(len(v) for v in log.values()))
+    ctx.metric("provider_calls", n_calls)
     ctx.expect(kinds.get("cancelled", 0) == 50, f"outcomes {dict(kinds)}")
-    ctx.expect(not log, f"cancelled calls executed: {len(log)}")
+    ctx.expect(not n_calls, f"cancelled calls executed: {n_calls}")
     leaks = await stack.leak_report(ctx.settings)
     ctx.expect(leaks["results_unread"] == 0, f"results left behind: {leaks}")
     await ctx.final_checks()
@@ -100,20 +114,32 @@ async def s40(ctx: Ctx) -> None:
     await ctx.workers(1)
     q = await ctx.queue()
     rid = ctx.rid(1)
-    await ctx.fake.script(rid, ["hang:3"])
     t0 = time.monotonic()
-    reply = await one(ctx, q, 1, lane="rt", timeout_secs=1.0)
+    if ctx.aws:  # a real generation far longer than the 1 s budget instead of a scripted hang
+        request = api.converse_request(
+            ctx.text(rid, "Write a detailed 1500-word essay on the history of stock exchanges."),
+            max_tokens=2000,
+        )
+        reply = await api.converse(
+            q, "gpt20b", request, lane="rt", request_id=rid, timeout_secs=1.0
+        )
+    else:
+        await ctx.fake.script(rid, ["hang:3"])
+        reply = await one(ctx, q, 1, lane="rt", timeout_secs=1.0)
     took = time.monotonic() - t0
     await asyncio.sleep(4)
-    log = (await ctx.fake.calls(rid)).get(rid, [])
+    if ctx.aws:
+        n_calls = await ctx.provider_attempts()
+    else:
+        n_calls = len((await ctx.fake.calls(rid)).get(rid, []))
     rkey = api.keys(ctx.settings.prefix).result(rid)
     ttl = await redis_call(ctx, lambda r: r.ttl(rkey))
     ctx.metric("caller_wait_s", round(took, 3))
-    ctx.metric("provider_calls", len(log))
+    ctx.metric("provider_calls", n_calls)
     ctx.metric("late_result_ttl_s", ttl)
     ctx.expect(reply.error_kind == "timeout", f"got {reply.error!r}")
     ctx.expect(abs(took - 1.0) <= 0.2, f"timeout after {took:.3f}s (want 1.0 +- 0.2)")
-    ctx.expect(len(log) <= 1, f"provider called {len(log)} times")
+    ctx.expect(n_calls <= 1, f"provider called {n_calls} times")
     ctx.expect(ttl <= ctx.base.result_ttl_secs, f"late result kept with TTL {ttl}")
     await ctx.final_checks()
 
@@ -150,7 +176,11 @@ async def s42(ctx: Ctx) -> None:
 
 @scenario("S30", "SDK retries off + Retry-After honoured", aws_safe="no")
 async def s30(ctx: Ctx) -> None:
-    """One throttle per call (Bedrock and OpenAI): provider calls == attempts; limiter saw it."""
+    """One throttle per call (Bedrock and OpenAI): provider calls == attempts; limiter saw it.
+
+    A lone throttle is recorded in the limiter's outcome window but must not cut or pause it
+    (cuts need >= min_throttles clustered throttles, S35); OpenAI's Retry-After sets the gap.
+    """
     await ctx.workers(1)
     q = await ctx.queue()
     rid = ctx.rid(1)
@@ -162,8 +192,15 @@ async def s30(ctx: Ctx) -> None:
     from tools.scenarios.common import limiter_state
 
     state = await limiter_state(ctx, "gpt20b", "primary")
-    ctx.metric("limiter_after_throttle", {k: state.get(k) for k in ("ramp", "last_decrease")})
-    ctx.expect(state.get("ramp") == "0", f"limiter did not see the throttle: {state}")
+    seen = int(state.get("win_thr", 0) or 0) + int(state.get("prev_thr", 0) or 0)
+    keys = ("limit", "ramp", "win_thr", "prev_thr", "last_decrease", "paused_until")
+    ctx.metric("limiter_after_throttle", {k: state.get(k) for k in keys})
+    ctx.expect(seen >= 1, f"limiter did not record the throttle: {state}")
+    ctx.expect(
+        float(state.get("last_decrease", 0) or 0) == 0
+        and float(state.get("paused_until", 0) or 0) == 0,
+        f"a lone throttle cut or paused the limiter: {state}",
+    )
     rid2 = ctx.rid(2)
     await ctx.fake.script(rid2, ["ThrottlingException"])
     r2 = await api.chat(
@@ -507,7 +544,9 @@ async def s29(ctx: Ctx) -> None:
             api.converse(
                 q,
                 "gpt20b",
-                api.converse_request(ctx.text(ctx.rid(1), secret_prompt)),
+                api.converse_request(
+                    ctx.text(ctx.rid(1), secret_prompt), max_tokens=ctx.max_tokens
+                ),
                 request_id=ctx.rid(1),
             )
         )
@@ -529,10 +568,20 @@ async def s29(ctx: Ctx) -> None:
     ]
     in_msgs = [b for b in banned if any(b in body for body in bodies) and b != secret_prompt]
     in_logs = [b for b in banned if b in logs]
+    if ctx.aws:  # the real credential values, reported by variable name only
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            value = os.environ.get(name, "")
+            if len(value) >= 8 and any(value in body for body in bodies):
+                in_msgs.append(f"${name}")
+            if len(value) >= 8 and value in logs:
+                in_logs.append(f"${name}")
     labels = [json_labels(m["Body"]) for m in peeked]
     raw_ids = [x for x in ("sess-RAW-123", "user-RAW-456") if any(x in lb for lb in labels)]
     ctx.metric("messages_checked", len(bodies))
     ctx.metric("log_bytes", len(logs))
+    if reply.ok and ctx.aws:
+        ctx.metric("tokens", converse_shape(reply.response)[1])
+        ctx.metric("provider_ms", reply.meta.provider_ms)
     ctx.expect(reply.ok, f"call failed: {reply.error!r}")
     ctx.expect(bool(bodies), "no message captured")
     ctx.expect(not in_msgs, f"secrets in SQS messages: {in_msgs}")

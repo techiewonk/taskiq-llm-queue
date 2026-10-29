@@ -13,6 +13,7 @@ from typing import Any
 from aiobotocore.session import get_session
 
 from tools.scenarios import api
+from tools.scenarios.common import converse_shape
 from tools.scenarios.env import (
     GPT20B_ID,
     REGION,
@@ -57,6 +58,9 @@ async def s01(ctx: Ctx) -> None:
     """Rt converse through the queue equals the direct call (text and tool use)."""
     await ctx.workers(1)
     q = await ctx.queue()
+    if ctx.aws:
+        await _s01_aws(ctx, q)
+        return
     for n, tools in ((1, None), (2, TOOL_CONFIG)):
         request = api.converse_request(ctx.text(ctx.rid(n), "price of INFY?"))
         if tools:
@@ -73,6 +77,34 @@ async def s01(ctx: Ctx) -> None:
     await ctx.final_checks()
 
 
+async def _s01_aws(ctx: Ctx, q: Any) -> None:
+    """S01 on real Bedrock: reply shape and usage per call, exactly one attempt per call.
+
+    No direct reference call (it would double the cost and replies are not deterministic).
+    """
+    usage: Counter[str] = Counter()
+    provider_ms: list[int] = []
+    for n, tools in ((1, None), (2, TOOL_CONFIG)):
+        text = ctx.text(ctx.rid(n), "price of INFY?")
+        request = api.converse_request(text, max_tokens=ctx.max_tokens)
+        if tools:
+            request["toolConfig"] = tools
+        reply = await api.converse(q, "gpt20b", request, lane="rt", request_id=ctx.rid(n))
+        ctx.expect(reply.ok, f"queued call failed: {reply.error!r}")
+        problems, tokens = converse_shape(reply.response)
+        ctx.expect(not problems, f"call {n} reply shape: {problems}")
+        ctx.expect(reply.meta.served_model == "gpt20b", f"meta: {reply.meta}")
+        usage.update(tokens)
+        provider_ms.append(reply.meta.provider_ms)
+    attempts = await ctx.provider_attempts()
+    ctx.metric("provider_calls", attempts)
+    ctx.metric("provider_ms", provider_ms)
+    ctx.metric("queue_wait_ms", reply.meta.queue_wait_ms)
+    ctx.metric("tokens", dict(usage))
+    ctx.expect(attempts == 2, f"{attempts} provider attempts for 2 calls")
+    await ctx.final_checks()
+
+
 @scenario("S03", "Embeddings (Titan, Cohere, OpenAI-compatible)", aws_safe="yes")
 async def s03(ctx: Ctx) -> None:
     """100 texts per model: vectors equal fakellm's deterministic ones, batched per provider."""
@@ -80,6 +112,9 @@ async def s03(ctx: Ctx) -> None:
 
     await ctx.workers(1)
     q = await ctx.queue()
+    if ctx.aws:
+        await _s03_aws(ctx, q)
+        return
     calls_per_model: dict[str, int] = {}
     for model, tag, dims, expected_calls in (
         ("titan", "t", None, 100),
@@ -131,4 +166,37 @@ async def s05(ctx: Ctx) -> None:
     ctx.metric("min_share", round(min(shares.values()), 3))
     ctx.expect(len(served) == 3, f"workers used: {dict(served)}")
     ctx.expect(min(shares.values()) >= 0.15, f"a worker served < 15 %: {dict(served)}")
+    await ctx.final_checks()
+
+
+async def _s03_aws(ctx: Ctx, q: Any) -> None:
+    """S03 on real Bedrock: 100 vectors per model of the model's default size, finite, non-zero.
+
+    Batching is checked by worker attempts per alias (Titan one text per call, Cohere 96).
+    """
+    import math
+
+    attempts: dict[str, int] = {}
+    secs: dict[str, float] = {}
+    for model, tag, dims, expected_calls in (("titan", "t", 1024, 100), ("cohere", "c", 1024, 2)):
+        texts = [ctx.text(ctx.rid(i, tag), f"doc {i}") for i in range(100)]
+        t0 = asyncio.get_running_loop().time()
+        reply = await api.embed(q, model, texts, lane="bg", input_type="search_document")
+        secs[model] = round(asyncio.get_running_loop().time() - t0, 2)
+        ctx.expect(reply.ok, f"{model} embed failed: {reply.error!r}")
+        vectors = reply.response
+        ctx.expect(len(vectors) == 100, f"{model}: {len(vectors)} vectors")
+        sizes = Counter(len(v) for v in vectors)
+        ctx.expect(set(sizes) == {dims}, f"{model}: vector sizes {dict(sizes)}, want {dims}")
+        bad = [
+            i for i, v in enumerate(vectors) if not all(math.isfinite(x) for x in v) or not any(v)
+        ]
+        ctx.expect(not bad, f"{model}: non-finite or zero vectors at {bad[:5]}")
+        attempts[model] = await ctx.provider_attempts(model)
+        ctx.expect(
+            attempts[model] == expected_calls,
+            f"{model}: {attempts[model]} provider attempts, want {expected_calls}",
+        )
+    ctx.metric("provider_calls", attempts)
+    ctx.metric("embed_secs", secs)
     await ctx.final_checks()

@@ -58,6 +58,7 @@ First pre-release. Everything listed below is new.
 - 619 tests; CI on Python 3.11–3.14, oldest-dependency and LangChain 1.x jobs, integration on the Docker stack; trusted publishing to PyPI.
 
 ### Known gaps
+- Valkey restarted without persistence wipes all claims; in-flight calls are then treated as lost and may run a second time (S50: 0–16 re-runs). Keep Valkey persistence on.
 - A reply that can't be stored is cached per pod; a redelivery to a different pod calls the provider again.
 - Exhausted jobs reach a dead-letter queue only if their queue has one configured.
 - Cluster-mode Valkey is covered by key-slot tests, not yet by a real cluster run.
@@ -75,6 +76,10 @@ First pre-release. Everything listed below is new.
 - Per-attempt timeout `attempt_timeout_secs`; configurable provider read/connect timeouts (S39).
 - A worker missing a model alias releases the message unclaimed (jittered delay) instead of acking an `internal_error`; it answers `model_not_configured` only near the delivery budget or deadline (S48).
 
+- Valkey blip: a worker releasing work after a Valkey error is no longer cancelled by the claim heartbeat mid-release; the SQS message is released before the claim, so no call is lost (S50: 32/40 → 40/40 ok).
+- Result dispatcher: a new same-lane waiter no longer forces a full read of every pending result (float rounding woke the loop); 1K waiters 43 → 26 MGET/s (S31).
+
 ### Added before release
 - Scenario harness: 54 scenarios (work, retry, pause, cancel, purge, region change, timeouts, chaos, scale, 10K burst) on an isolated compose profile; `make scenarios`, `make load`, `make chaos`.
+- Scenario harness real-Bedrock mode (`SCN_PROVIDER=aws`): queues stay local, provider calls go to Bedrock; only AWS-safe scenarios run. S01, S03, S16, S17, S29, S40, S41 pass against real Bedrock (~108 calls).
 - Settings: `attempt_timeout_secs`, `provider_read_timeout_secs`, `provider_connect_timeout_secs`, `sqs_send_timeout_secs`, `valkey_wait_failover_secs`, limiter window settings.

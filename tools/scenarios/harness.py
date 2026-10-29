@@ -3,6 +3,8 @@
 A scenario is an async function taking a `Ctx`, registered with `@scenario(id, title, ...)`.
 It raises `ScenarioFailed` (via `ctx.expect`) on a failed criterion and records numbers with
 `ctx.metric`. `xfail=` marks a known library bug: the assertion stays, a failure is "xfail".
+With `SCN_PROVIDER=aws` only `aws_safe="yes"` scenarios run; they branch on `ctx.aws` to check
+reply shape and worker-counted provider attempts instead of fakellm's log and fixed replies.
 """
 
 from __future__ import annotations
@@ -19,12 +21,13 @@ from typing import Any
 
 from taskiq_llm_queue import LLMQueue, QueueConfig
 from tools.scenarios import api, stack
-from tools.scenarios.env import Settings, ensure_aws_env
+from tools.scenarios.env import AWS_MAX_TOKENS, Settings, ensure_aws_env, load_aws_settings
 from tools.scenarios.metrics import RecordingSink
 from tools.scenarios.procs import FakellmProc, WorkerProc
 
 ScenarioFn = Callable[["Ctx"], Awaitable[None]]
 BASE_FAKELLM = "scn_base"
+PROVIDER_SECONDS = "llmq_provider_seconds"  # worker metric: one observation per attempt
 
 
 class ScenarioFailed(AssertionError):
@@ -131,6 +134,9 @@ class Ctx:
         self._queues: list[LLMQueue] = []
         self._cleanups: list[Callable[[], Awaitable[None]]] = []
         self.base = api.build_config(settings)
+        self.aws = settings.aws
+        # Chat reply cap: None (fakellm default) unless the calls cost money.
+        self.max_tokens = AWS_MAX_TOKENS if settings.aws else None
 
     # ------------------------------------------------------------- helpers
 
@@ -155,6 +161,32 @@ class Ctx:
         """Fail the scenario with `message` unless `condition` holds."""
         if not condition:
             raise ScenarioFailed(message)
+
+    async def provider_attempts(self, model: str | None = None) -> int:
+        """Provider attempts made by this scenario's workers (all models, or one alias).
+
+        The aws-mode stand-in for fakellm's call log; waits one stats period so the count
+        includes attempts that just finished.
+        """
+        await asyncio.sleep(0.6)
+        total = 0
+        for proc in self._workers:
+            series = proc.stats().get("metrics", {}).get("observations", {})
+            for key, summary in series.items():
+                name, _, labels = key.partition("{")
+                if name == PROVIDER_SECONDS and (model is None or f"model={model}" in labels):
+                    total += int(summary.get("n", 0))
+        return total
+
+    async def provider_calls(self, tag: str = "") -> tuple[int, list[str]]:
+        """Provider calls for this run's `rid(..., tag)` ids and up to five of their rids.
+
+        fakellm mode reads the probe's call log; aws mode counts worker attempts (no rids).
+        """
+        if self.aws:
+            return await self.provider_attempts(), []
+        log = await self.fake.calls(self.rid_prefix(tag))
+        return sum(len(v) for v in log.values()), sorted(log)[:5]
 
     def config(self, **overrides: Any) -> QueueConfig:
         """Harness config with overrides."""
@@ -278,7 +310,7 @@ async def services_up(settings: Settings) -> bool:
 
 async def isolate(settings: Settings) -> None:
     """Before every scenario: services up, queues purged, prefix flushed, fakellm reset."""
-    if settings.chaos and not await services_up(settings):
+    if settings.chaos and not settings.aws and not await services_up(settings):
         for service in (settings.valkey_service, settings.sqs_service):
             await asyncio.to_thread(
                 stack.compose, "--profile", "scn", "unpause", service, check=False
@@ -289,8 +321,8 @@ async def isolate(settings: Settings) -> None:
     await stack.ensure_queues(settings, names)
     await stack.purge(settings, names)
     await stack.flush_prefix(settings)
-    fake = stack.FakeLLM(settings.fakellm_url)
-    await fake.load(BASE_FAKELLM)
+    if not settings.aws:
+        await stack.FakeLLM(settings.fakellm_url).load(BASE_FAKELLM)
 
 
 async def run_one(spec: Scenario, settings: Settings, run_dir: Path) -> Result:
@@ -300,6 +332,8 @@ async def run_one(spec: Scenario, settings: Settings, run_dir: Path) -> Result:
         return Result(spec.id, spec.title, "skip", 0.0, message=spec.skip)
     if spec.chaos and not settings.chaos:
         return Result(spec.id, spec.title, "skip", 0.0, message="chaos disabled (SCN_CHAOS=0)")
+    if settings.aws and spec.aws_safe != "yes":
+        return Result(spec.id, spec.title, "skip", 0.0, message="not aws-safe (SCN_PROVIDER=aws)")
     ctx = Ctx(settings, run_dir, spec.id)
     status, message = "pass", ""
     try:
@@ -333,11 +367,20 @@ async def run_one(spec: Scenario, settings: Settings, run_dir: Path) -> Result:
 async def run_many(
     specs: Sequence[Scenario], settings: Settings, run_dir: Path, *, echo: bool = True
 ) -> list[Result]:
-    """Run scenarios in order with a managed fakellm probe; prints a line per scenario."""
-    ensure_aws_env()
+    """Run scenarios in order with a managed fakellm probe (none on aws); a line per scenario."""
+    if settings.aws:
+        for line in await load_aws_settings(settings.env_source):
+            if echo:
+                print(f"settings: {line}", flush=True)
+    else:
+        ensure_aws_env()
     run_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240  # small local file, startup/teardown only
     fake_proc: FakellmProc | None = None
-    if settings.manage_fakellm and not await stack.FakeLLM(settings.fakellm_url).health():
+    if (
+        settings.manage_fakellm
+        and not settings.aws
+        and not await stack.FakeLLM(settings.fakellm_url).health()
+    ):
         fake_proc = FakellmProc(settings, run_dir)
         fake_proc.start()
         for _ in range(100):
