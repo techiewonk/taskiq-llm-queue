@@ -1,6 +1,6 @@
 # Architecture
 
-How `taskiq-llm-queue` 0.1.0a1 works end to end, for an engineer taking over the library. Every statement below was checked against `src/taskiq_llm_queue/**` at this release; anything not verified is marked **unverified**. The rule IDs used in code comments (DS1–DS19, P1–P17, A1–A9) are defined in [DESIGN.md](DESIGN.md) and are not repeated here. Scenario IDs (S01–S52) refer to the harness in `tools/scenarios` (see [§9](#9-testing-and-verification)).
+How `taskiq-llm-queue` 0.1.0a2 works end to end, for an engineer taking over the library. Every statement below was checked against `src/taskiq_llm_queue/**` at this release; anything not verified is marked **unverified**. The rule IDs used in code comments (DS1–DS19, P1–P17, A1–A9) are defined in [DESIGN.md](DESIGN.md) and are not repeated here. Scenario IDs (S01–S57, R01–R12) refer to the harness in `tools/scenarios` (see [§9](#9-testing-and-verification)).
 
 **Contents:** [1 Summary](#1-summary) · [2 Components](#2-components) · [3 Dependencies](#3-dependencies) · [4 Data flows](#4-data-flows) · [5 Adaptive limiter](#5-adaptive-limiter) · [6 Key schema and wire format](#6-valkey-key-schema-and-wire-format) · [7 Configuration](#7-configuration-reference) · [8 Observability](#8-observability) · [9 Testing](#9-testing-and-verification) · [10 Glossary](#10-glossary)
 

@@ -1,6 +1,6 @@
 # taskiq-llm-queue
 
-> **Status:** pre-alpha (`0.1.0a1`). Built and tested: the `LLMQueue` client, the SQS broker, adaptive limiter, claims, circuit breaker, retry and fallback, JSON and S3 result backends, Bedrock and OpenAI-compatible providers, LangChain/LangGraph adapters, canary routing, failover and the CLI. 619 tests on Valkey 8.1, ElasticMQ 1.7.1 and a fake LLM server; CI on Python 3.11–3.14. Breaking changes are still possible before 0.1 (see [CHANGELOG](https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md)).
+> **Status:** pre-alpha (`0.1.0a2`). Built and tested: the `LLMQueue` client, the SQS broker, adaptive limiter, claims, circuit breaker, retry and fallback, JSON and S3 result backends, Bedrock and OpenAI-compatible providers, LangChain/LangGraph adapters, canary routing, failover and the CLI. 760 tests on Valkey 8.1, ElasticMQ 1.7.1 and a fake LLM server; CI on Python 3.11–3.14. Breaking changes are still possible before 0.1 (see [CHANGELOG](https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md)).
 
 An LLM request client with its own durable queue, built on [taskiq](https://github.com/taskiq-python/taskiq) and Amazon SQS.
 
