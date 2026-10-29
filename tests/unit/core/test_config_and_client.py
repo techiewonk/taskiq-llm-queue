@@ -326,11 +326,11 @@ async def test_schema_key_written_once_and_newer_state_refused(
     q = LLMQueue(QueueConfig(models=MODELS))
     key = q.keys.schema
     await q._check_schema(redis)
-    assert int(await redis.get(key)) == SCHEMA_VERSION
+    assert await redis.get(key) == str(SCHEMA_VERSION).encode()
     await redis.set(key, SCHEMA_VERSION + 1)
     with pytest.raises(ConfigError, match="newer"):
         await q._check_schema(redis)
     await redis.set(key, SCHEMA_VERSION - 1)
     await q._check_schema(redis)
     assert "schema_migration_needed" in caplog.text
-    assert int(await redis.get(key)) == SCHEMA_VERSION - 1  # never overwritten
+    assert await redis.get(key) == str(SCHEMA_VERSION - 1).encode()  # never overwritten

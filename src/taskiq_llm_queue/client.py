@@ -1071,7 +1071,12 @@ class LLMQueue:
             await state.claims.cancel(request_id)
 
     async def _maybe_by_reference(self, state: _Started, envelope: Envelope) -> Envelope:
-        """Store params over `inline_max_bytes` in Valkey and send `params_ref` instead (D48)."""
+        """Store params over `inline_max_bytes` in Valkey and send `params_ref` instead (D48).
+
+        With `s3_offload_bucket` the broker's S3 offload middleware handles them (I16).
+        """
+        if self.config.s3_offload_bucket:
+            return envelope
         size = len(envelope.model_dump_json().encode())
         if size <= self.config.inline_max_bytes:
             return envelope

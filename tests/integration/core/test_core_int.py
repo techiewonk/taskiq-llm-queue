@@ -306,6 +306,56 @@ async def test_large_params_travel_by_reference(
     assert not await redis.exists(llmq.keys.params("big-params-1"))
 
 
+async def test_large_params_travel_through_s3_when_a_bucket_is_set(
+    make_queue: MakeQueue, fake: str, queues: Callable[[str], str], redis: Redis
+) -> None:
+    """I16: with `s3_offload_bucket`, an oversized message carries its args in S3, not in a
+    Valkey `params_ref`; the worker restores them and the object is deleted after the ack."""
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint = f"http://{host}:{port}"
+        bucket = f"llmq-{uuid.uuid4().hex[:10]}"
+        async with get_session().create_client(
+            "s3", region_name="us-east-1", endpoint_url=endpoint
+        ) as s3:
+            await s3.create_bucket(Bucket=bucket)
+            cfg = base_config(
+                fake,
+                queues,
+                inline_max_bytes=2048,
+                s3_offload_bucket=bucket,
+                s3_endpoint_url=endpoint,
+            )
+            sender = await make_queue("send", config=cfg)
+            big = {"messages": [{"role": "user", "content": [{"text": "x" * 20_000}]}]}
+            call = asyncio.create_task(sender.converse("big", big, request_id="s3-params-1"))
+
+            async def objects() -> int:
+                listed = await s3.list_objects_v2(Bucket=bucket, Prefix="llmq-offload/")
+                return int(listed.get("KeyCount", 0))
+
+            for _ in range(50):  # the send-only pod has no worker: the message waits in SQS
+                if await objects():
+                    break
+                await asyncio.sleep(0.1)
+            assert await objects() == 1
+            assert not await redis.exists(sender.keys.params("s3-params-1"))
+            await make_queue("work", config=cfg)
+            result = await asyncio.wait_for(call, 30)
+            assert result.response["output"]["message"]["role"] == "assistant"
+            for _ in range(50):
+                if not await objects():
+                    break
+                await asyncio.sleep(0.1)
+            assert await objects() == 0
+    finally:
+        server.stop()
+
+
 # ---------------------------------------------------------------- reliability
 
 

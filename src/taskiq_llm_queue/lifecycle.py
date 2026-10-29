@@ -24,6 +24,7 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.broker.broker import HybridSQSBroker
 from taskiq_llm_queue.broker.events import BrokerHooks
 from taskiq_llm_queue.broker.queue import SQSQueue
+from taskiq_llm_queue.broker.s3_offload import S3OffloadMiddleware
 from taskiq_llm_queue.broker.serializer import WireSerializer
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.model_settings import SHARED_PREFIX, SHARED_TARGET, SettingsResolver
@@ -368,6 +369,7 @@ def build_brokers(
             **common,
         ).with_result_backend(result_backend)
         broker.with_serializer(WireSerializer())
+        _add_offload(broker, config, session)
         register_tasks(broker, runtime)
         by_queues[key] = brokers.by_alias[alias] = broker
     job_queues = sorted(set(config.job_queues.values()))
@@ -386,9 +388,30 @@ def build_brokers(
             **common,
         ).with_result_backend(result_backend)
         jobs.with_serializer(WireSerializer())
+        _add_offload(jobs, config, session)
         register_tasks(jobs, runtime)
         brokers.jobs = jobs
     return brokers
+
+
+def _add_offload(broker: HybridSQSBroker, config: QueueConfig, session: AioSession | None) -> None:
+    """With `s3_offload_bucket`, oversized messages carry their args in S3 (I16).
+
+    One middleware per broker (taskiq binds it to its broker for the ack-aware delete); the
+    threshold is `inline_max_bytes`, the same limit the Valkey `params_ref` path uses.
+    """
+    if not config.s3_offload_bucket:
+        return
+    broker.add_middlewares(
+        S3OffloadMiddleware(
+            config.s3_offload_bucket,
+            threshold_bytes=config.inline_max_bytes,
+            base_path=config.s3_offload_prefix,
+            endpoint_url=config.s3_endpoint_url,
+            region_name=config.aws_region,
+            session=session,
+        )
+    )
 
 
 class Workers:

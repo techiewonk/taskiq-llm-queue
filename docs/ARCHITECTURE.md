@@ -97,7 +97,7 @@ flowchart LR
 Notes on the map:
 
 - **One process plays both roles** with `start(mode="both")`; `mode="send"` skips the receivers, `mode="work"` skips the dispatcher. The `PodHeartbeat` runs in every mode.
-- **S3 offload is not on this path.** `S3OffloadMiddleware` (P9) and `S3ResultBackend` (P10) ship in `taskiq_llm_queue.broker` / `.results` for direct broker users, but `lifecycle.build_brokers` does not install them. `LLMQueue` moves large params to **Valkey** instead (`params_ref`, [§4a](#4a-rt-converse-happy-path)).
+- **S3 offload is optional.** With `s3_offload_bucket` set, `lifecycle.build_brokers` installs `S3OffloadMiddleware` (P9) on every broker: a message over `inline_max_bytes` carries its args in `s3://<bucket>/<s3_offload_prefix>/<task_id>.json`, restored on the worker and deleted after the ack. Without a bucket, `LLMQueue` moves large params to **Valkey** (`params_ref`, [§4a](#4a-rt-converse-happy-path)). `S3ResultBackend` (P10) is still only for direct broker users.
 - **DLQs are SQS infrastructure.** The library never creates queues by default (`SQSQueue.is_declare=False`); DLQs and `maxReceiveCount` come from each queue's `RedrivePolicy` (10 for LLM queues, 5 for job queues in `docker/elasticmq.conf`).
 
 ### Source map
@@ -152,7 +152,7 @@ Notes on the map:
 |---|---|---|
 | SQS (standard queues) | For the queued path | Queues must exist (`GetQueueUrl`); per model `rt` / `default` / optional `bulk`, plus job queues. API calls: `ReceiveMessage`, `SendMessage`, `SendMessageBatch` (only with `Batching`), `DeleteMessage(Batch)`, `ChangeMessageVisibility(Batch)`, `GetQueueUrl`, `GetQueueAttributes`; `CreateQueue` only with `is_declare=True` |
 | Redis / Valkey | For the queued path | Limiter, leases, claims, cancel flags, breaker, results, pub/sub, live config, audit stream, pod registry. Production notes from DS18: Multi-AZ and persistence; without persistence a restart loses claims ([§9 gaps](#known-gaps)) |
-| S3 | Optional, not used by `LLMQueue` | Only via `S3OffloadMiddleware` / `S3ResultBackend` when a direct broker user installs them |
+| S3 | Optional | Oversized messages when `s3_offload_bucket` is set; `S3ResultBackend` only for direct broker users |
 | AWS credentials | Yes for AWS | Default chain (env, profile, IRSA / Pod Identity); one `AioSession` per pod is shared by the brokers and `BedrockProvider` |
 | IAM | Yes for AWS | The SQS actions above on the queues; Bedrock runtime `converse` / `invoke_model` on the model ids and inference profiles. **Unverified:** no IAM policy is checked in by this repo; derive it from the API list above |
 
@@ -215,7 +215,7 @@ sequenceDiagram
 
 1. **Envelope** (`LLMQueue._envelope`). `config.resolve(model)` rejects unknown `alias[@target]` with `ConfigError`. The lane is the `lane=` argument, else `current_context().lane` (default `bg`). `deadline_at = now + (timeout_secs or config.timeout_secs[lane])`, capped by the caller's `deadline_at`; embed calls use `embed_timeout_secs`. `reply_to` is this pod's `pod_id`; `request_id` defaults to `llm-<uuid4 hex>`.
 2. **Route** (`LLMQueue._route`). `direct` when the alias has no broker (no `queues` configured), when `failover.redis_down()`, or when `failover.path_override(alias)` (SQS window open). Otherwise an injected `PathRouter`, else the built-in `CanaryRouter` when `routing_enabled`, else `sqs`. The canary routes by kill switch → user allowlist → per-model × lane percentage, bucketed by keyed BLAKE2b of `session_id` (else `user_id`), so a session is sticky. With `routing_enabled` and no stored config, every model routes `direct` (0 %).
-3. **Params by reference** (`_maybe_by_reference`). If the envelope's JSON exceeds `inline_max_bytes` (200,000), params are stored at `<prefix>:{r:<id>}:params` with TTL `state_ttl_secs` and the envelope carries `params_ref` instead. A `RedisError` here reports Valkey failure and runs the call `direct`.
+3. **Params by reference** (`_maybe_by_reference`). Skipped when `s3_offload_bucket` is set (the S3 middleware offloads instead). If the envelope's JSON exceeds `inline_max_bytes` (200,000), params are stored at `<prefix>:{r:<id>}:params` with TTL `state_ttl_secs` and the envelope carries `params_ref` instead. A `RedisError` here reports Valkey failure and runs the call `direct`.
 4. **Send** (`_via_sqs`). The `call` task (or `embed`) is kicked with `task_id = request_id` and labels `lane`, `model`, hashed `session_id` / `user_id`, `reply_to`, `queue_name`, `expiry = repr(deadline_at)`. `HybridSQSBroker.kick` turns `expiry` into an SQS message attribute and checks the 1 MiB limit. `build_brokers` configures no send batching, so each call is one `SendMessage`. `_bounded_send` waits at most `sqs_send_timeout_secs` (5) while no other send has completed recently, and never more than half the remaining budget.
 5. **Wait.** `ResultDispatcher.wait(request_id, remaining, lane)` registers a future; see step 12.
 6. **Receive** (`HybridSQSBroker._poll_once`, one poller per queue). The poller skips while its `ChainGate` is closed (every target paused, or Valkey down). `receive_budget` = best `LimiterState.headroom(share)` across the model's targets minus messages already buffered (DS4). `SlotScheduler` reserves slots by strict priority: per model broker `max_inflight` = `worker_slots[alias]` (default 50), `reserve_for_priority0 = slots // 5`, `min_slots_for_lower = min(2, slots // 4)`. After an empty poll the next receive asks for 1 message, so idle long polls hold one slot.
@@ -625,6 +625,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `max_failures` | `LLMQ_MAX_FAILURES` | 3 (jobs) |
 | `state_ttl_secs`, `result_ttl_secs` | `LLMQ_STATE_TTL_SECS`, `LLMQ_RESULT_TTL_SECS` | 1800, 300 |
 | `inline_max_bytes` | `LLMQ_INLINE_MAX_BYTES` | 200,000 |
+| `s3_offload_bucket` / `s3_offload_prefix` / `s3_endpoint_url` | `LLMQ_S3_OFFLOAD_BUCKET` / `_PREFIX` / `LLMQ_S3_ENDPOINT_URL` | none / `llmq-offload` / none |
 | `result_dispatch_ms` | `LLMQ_RESULT_DISPATCH_MS` (`rt:100,bg:500`) | rt 100, bg 500, bulk 2000 |
 | `valkey_wait_failover_secs` | `LLMQ_VALKEY_WAIT_FAILOVER_SECS` | 10 |
 
@@ -803,7 +804,6 @@ From CHANGELOG (0.1.0a1):
 
 Found while writing this document (verified in code):
 
-- `S3OffloadMiddleware` / `S3ResultBackend` are not wired into `LLMQueue`; large params use Valkey (`params_ref`), so DS18's "params > 200 KB need S3 offload or fail fast" is handled by `direct` failover instead.
 - Send batching (`Batching`, P8) is available on `SQSQueue` but `build_brokers` does not enable it: one `SendMessage` per call.
 - The limiter's cut/hold/probe knobs (window, loss tolerance, pause ratio, settle, probe, hold, peak half-life) and `utilisation` have no `LLMQ_*` variables.
 - `cancel()` does not interrupt a provider attempt already in flight.

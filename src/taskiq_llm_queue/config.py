@@ -264,6 +264,11 @@ class QueueConfig(BaseModel):
     state_ttl_secs: int = Field(default=1800, ge=60)
     result_ttl_secs: int = Field(default=300, ge=10)
     inline_max_bytes: int = Field(default=200_000, ge=1024, le=1_000_000)
+    # I16: with a bucket, messages over `inline_max_bytes` carry their args in S3 instead of
+    # a Valkey `params_ref` (a lifecycle rule on the prefix should expire leftovers).
+    s3_offload_bucket: str | None = None
+    s3_offload_prefix: str = "llmq-offload"
+    s3_endpoint_url: str | None = None
     hash_ids: bool = True
     id_hash_salt: SecretStr = SecretStr(DEFAULT_ID_HASH_SALT)
     strict_async: bool = False
@@ -443,6 +448,9 @@ class QueueConfig(BaseModel):
             ("REDIS_RETRY_ATTEMPTS", "redis_retry_attempts", int),
             ("REDIS_CLIENT_NAME", "redis_client_name", str),
             ("SQS_ENDPOINT_URL", "sqs_endpoint_url", str),
+            ("S3_OFFLOAD_BUCKET", "s3_offload_bucket", str),
+            ("S3_OFFLOAD_PREFIX", "s3_offload_prefix", str),
+            ("S3_ENDPOINT_URL", "s3_endpoint_url", str),
             ("BEDROCK_ENDPOINT_URL", "bedrock_endpoint_url", str),
             ("AWS_REGION", "aws_region", str),
             ("STATE_TTL_SECS", "state_ttl_secs", int),
