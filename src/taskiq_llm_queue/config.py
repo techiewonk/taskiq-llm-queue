@@ -320,6 +320,12 @@ class QueueConfig(BaseModel):
     )
     sqs_wait_time_secs: int = Field(default=20, ge=0, le=20)
     sqs_failover_secs: float = Field(default=300.0, gt=0)
+    sqs_timeouts_to_failover: int = Field(
+        default=3,
+        ge=1,
+        description="SQS send timeouts within a minute before a model fails over to direct "
+        "(a refused send fails over at once). H17: one timeout in a burst cost 300 s of SQS.",
+    )
     attempt_timeout_secs: float = Field(
         default=180.0,
         gt=0,
@@ -460,6 +466,7 @@ class QueueConfig(BaseModel):
             ("THROTTLE_RETRY_ATTEMPTS", "throttle_retry_attempts", int),
             ("SQS_WAIT_TIME_SECS", "sqs_wait_time_secs", int),
             ("SQS_FAILOVER_SECS", "sqs_failover_secs", float),
+            ("SQS_TIMEOUTS_TO_FAILOVER", "sqs_timeouts_to_failover", int),
             ("ATTEMPT_TIMEOUT_SECS", "attempt_timeout_secs", float),
             ("PROVIDER_READ_TIMEOUT_SECS", "provider_read_timeout_secs", float),
             ("PROVIDER_CONNECT_TIMEOUT_SECS", "provider_connect_timeout_secs", float),

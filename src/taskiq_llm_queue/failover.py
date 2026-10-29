@@ -1,6 +1,7 @@
 """SQS and Valkey failover state for the sender side (D73, D74, DS17, DS18).
 
-A failed SQS send puts that model on `direct` for `sqs_failover_secs`; a Valkey failure puts the
+A failed SQS send puts that model on `direct` for `sqs_failover_secs` (a send *timeout* only
+after `sqs_timeouts_to_failover` of them within a minute); a Valkey failure puts the
 whole pod on `direct` with a local per-pod cap until a health probe (or a backoff window) says
 Valkey is back. `LLMQueue` calls the `FailoverPolicy` methods; nothing here blocks or raises.
 """
@@ -12,6 +13,7 @@ import contextlib
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 Probe = Callable[[], Awaitable[object]]
+# Send timeouts older than this no longer count towards `sqs_timeouts_to_failover`.
+_SQS_TIMEOUT_WINDOW_SECS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,9 +41,12 @@ class FailoverSettings:
     `last_known_limit` per pod, so an unknown pod count cannot overshoot the provider limit.
     A running `LLMQueue` replaces it with the pod-registry count (`FailoverState.set_live_pods`).
     `model_caps` (alias -> `max_concurrency`) bounds every local cap of that alias too.
+    `sqs_timeouts_to_failover`: send timeouts (ambiguous, unlike a refused send) within a
+    minute before the model fails over; the timed-out call itself still runs direct.
     """
 
     sqs_failover_secs: float = 300.0
+    sqs_timeouts_to_failover: int = 3
     redis_retry_min_secs: float = 1.0
     redis_retry_max_secs: float = 30.0
     local_cap_fallback: int = 20
@@ -50,6 +57,8 @@ class FailoverSettings:
         """Reject impossible values at construction (boot time)."""
         if self.sqs_failover_secs <= 0 or self.local_cap_fallback < 1:
             raise ConfigError("sqs_failover_secs must be > 0 and local_cap_fallback >= 1")
+        if self.sqs_timeouts_to_failover < 1:
+            raise ConfigError("sqs_timeouts_to_failover must be >= 1")
         if not 0 < self.redis_retry_min_secs <= self.redis_retry_max_secs:
             raise ConfigError("need 0 < redis_retry_min_secs <= redis_retry_max_secs")
 
@@ -104,6 +113,7 @@ class FailoverState:
         self._sleep = sleep
         self._lock = threading.Lock()
         self._sqs_until: dict[str, float] = {}
+        self._sqs_timeouts: dict[str, deque[float]] = {}  # alias -> recent send-timeout times
         self._redis_down = False
         self._redis_retry_at = 0.0
         self._redis_backoff = self.settings.redis_retry_min_secs
@@ -124,11 +134,32 @@ class FailoverState:
         return None
 
     def report_sqs_failure(self, model: str, exc: BaseException) -> None:
-        """Open (or extend) the model's SQS failover window after a failed or ambiguous send."""
+        """Open (or extend) the model's SQS failover window after a failed or ambiguous send.
+
+        H17: one send timeout in a busy burst flipped a model to direct for 300 s, so a
+        `TimeoutError` opens the window only once `sqs_timeouts_to_failover` happened within
+        a minute; any other send error (refused connection, SQS error) opens it at once.
+        """
         alias = model.partition("@")[0]
+        now = self._clock()
         with self._lock:
             entering = alias not in self._sqs_until
-            self._sqs_until[alias] = self._clock() + self.settings.sqs_failover_secs
+            if entering and isinstance(exc, TimeoutError):
+                recent = self._sqs_timeouts.setdefault(alias, deque())
+                recent.append(now)
+                while recent and now - recent[0] > _SQS_TIMEOUT_WINDOW_SECS:
+                    recent.popleft()
+                counted = len(recent)
+                if counted < self.settings.sqs_timeouts_to_failover:
+                    logger.warning(
+                        "sqs_send_timeout_counted",
+                        model=alias,
+                        timeouts=counted,
+                        failover_at=self.settings.sqs_timeouts_to_failover,
+                    )
+                    return
+            self._sqs_timeouts.pop(alias, None)
+            self._sqs_until[alias] = now + self.settings.sqs_failover_secs
         if entering:
             logger.error(
                 "sqs_failover_active",

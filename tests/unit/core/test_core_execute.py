@@ -520,6 +520,33 @@ async def test_breaker_opened_by_a_failure_stops_retries_on_that_target(world: W
     assert world.sleeps == []  # no backoff before giving up on the open target
 
 
+async def test_debug_trace_follows_one_call(world: World, caplog: pytest.LogCaptureFixture) -> None:
+    """I7: at DEBUG a call logs start, slot, attempts, backoff and end; nothing at INFO."""
+    import logging
+
+    world.provider.script["primary"] = [FakeError(ErrorKind.THROTTLE, "Throttling")]
+    with caplog.at_level(logging.INFO, logger="taskiq_llm_queue.core"):
+        await execute_job(envelope(request_id="r-info"), world.deps)
+    assert not [r for r in caplog.records if r.levelno == logging.DEBUG]
+    world.provider.script["primary"] = [FakeError(ErrorKind.THROTTLE, "Throttling")]
+    with caplog.at_level(logging.DEBUG, logger="taskiq_llm_queue.core"):
+        await execute_job(envelope(request_id="r-debug"), world.deps)
+    events = [
+        r.llmq["event"]  # type: ignore[attr-defined]
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and r.llmq.get("request_id") == "r-debug"  # type: ignore[attr-defined]
+    ]
+    assert events == [
+        "call_started",
+        "slot_acquired",
+        "attempt_done",
+        "backoff",
+        "slot_acquired",
+        "attempt_done",
+        "call_done",
+    ]
+
+
 async def test_throttles_do_not_trip_the_breaker(world: World) -> None:
     """Bug #5: throttles are neutral for the breaker; only 5xx/timeouts count as failures."""
     world.provider.script["primary"] = [

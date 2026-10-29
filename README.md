@@ -126,6 +126,7 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `attempt_timeout_secs` | 180 | One provider attempt; a hung target moves to the next fallback step |
 | `provider_read_timeout_secs` / `provider_connect_timeout_secs` | 300 / 10 | Bedrock botocore and OpenAI httpx timeouts |
 | `sqs_send_timeout_secs` | 5 | SQS counts as down only when no send completed for this long; then the call runs direct |
+| `sqs_timeouts_to_failover` | 3 | Send timeouts within 60 s before the model's later calls skip SQS for `sqs_failover_secs` (a refused send: at once) |
 | `throttle_retry_attempts` | 6 | Tries per fallback step for throttles (backoff holds no slot) |
 | `retry_base_secs` / `retry_multiplier` / `retry_spread` / `retry_max_secs` | 1 / 4 / 2.5 / 30 | Retry n sleeps a random time in [base·4ⁿ, base·4ⁿ·2.5]: **1–2.5 s, 4–10 s, 16–30 s**, then 30 s; see [Retry backoff](#retry-backoff) |
 | `throttle_retry_max_secs` | 10 | Cap of one sleep after a throttle, so 6 throttle tries fit an rt deadline |
@@ -325,6 +326,8 @@ logging.getLogger("taskiq_llm_queue").setLevel(logging.INFO)   # stdlib apps: th
 # loguru apps: the usual InterceptHandler picks these up like any stdlib logger.
 # structlog apps: use structlog.stdlib.ProcessorFormatter on your handler to render them.
 ```
+
+To trace one call on a worker, set `taskiq_llm_queue.core` to DEBUG. Each call then logs `call_started` (with `queue_wait_ms`), `slot_acquired` / `slot_unavailable` (`waited_ms`), `attempt_done` (target, outcome, `provider_ms`), `backoff` (`sleep_secs`), `rt_capacity_wait`, `call_requeued` and `call_done` (ok or error code, attempts, `total_ms`), all with the `request_id`. Below DEBUG these cost one level check per call.
 
 The `llm-queue` CLI logs warnings and errors to stderr, so its stdout is always plain JSON.
 

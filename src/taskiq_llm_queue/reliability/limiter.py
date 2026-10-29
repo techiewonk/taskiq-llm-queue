@@ -100,7 +100,9 @@ class LimiterSettings:
             raise ValueError(f"max_by_model values must be >= 1: {dict(caps)}")
         for model, cap in caps.items():  # a start above the cap is clamped, said once
             start = (self.initial or {}).get(model, self.default_initial)
-            if start > cap and (model, start, cap) not in _warned_clamps:
+            # Only a start someone chose: the default (20) above a small bucket is expected.
+            chosen = start != self.default_initial
+            if chosen and start > cap and (model, start, cap) not in _warned_clamps:
                 _warned_clamps.add((model, start, cap))
                 logger.warning("limiter_initial_clamped", model=model, initial=start, cap=cap)
 

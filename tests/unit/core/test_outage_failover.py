@@ -103,13 +103,18 @@ def envelope(q: LLMQueue, timeout_secs: float) -> Envelope:
 async def test_hung_sqs_send_fails_over_to_direct_within_the_send_timeout() -> None:
     """S20 bug: a send to an unreachable SQS hung ~50-70 s (dead pooled connection, 60 s read
     timeout), past the call budget, so the caller got LLMQueueTimeout. The send is now bounded
-    by `sqs_send_timeout_secs`, then the call runs direct (DS17 claim) and SQS is failed over."""
+    by `sqs_send_timeout_secs`, then the call runs direct (DS17 claim). H17: the model fails
+    over to direct only on the third send timeout within a minute, not on the first."""
     q, _, direct = make_queue(sqs_send_timeout_secs=0.1)
     t0 = time.monotonic()
     reply = await q._via_sqs("big", envelope(q, 30.0), embed=False)
     assert reply.ok
     assert time.monotonic() - t0 < 1.0
     assert direct == [("r-1", True)]
+    assert not cast(FailoverState, q.failover).sqs_failover_active("big")
+    for _ in range(2):
+        await q._via_sqs("big", envelope(q, 30.0), embed=False)
+    assert len(direct) == 3
     assert cast(FailoverState, q.failover).sqs_failover_active("big")
     assert q._route("big", envelope(q, 30.0)) == "direct"
 

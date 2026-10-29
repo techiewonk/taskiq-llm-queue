@@ -105,6 +105,18 @@ def test_max_by_model_clamps_start_max_and_min() -> None:
         LimiterSettings(max_by_model={"a": 0})
 
 
+def test_clamp_warning_only_for_a_chosen_start(caplog: pytest.LogCaptureFixture) -> None:
+    """I10: only `max_concurrency` set (default start 20 > cap 8) is quiet; a chosen 40 warns."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        LimiterSettings(initial={"quiet": 20}, max_by_model={"quiet": 8})
+        LimiterSettings(initial={"loud": 40}, max_by_model={"loud": 8})
+    clamped = [m for r in caplog.records if "limiter_initial_clamped" in (m := r.getMessage())]
+    assert len(clamped) == 1
+    assert "loud" in clamped[0]
+
+
 def test_model_caps_from_config_and_env() -> None:
     """`max_concurrency` per model, overridden per alias by `LLMQ_AC_MAX_BY_MODEL` JSON."""
     models = {

@@ -13,11 +13,17 @@ a minor release may break the public API, with a deprecation announced one minor
 - `shared_max_concurrency` on a provider: one bucket across all its models and pods (limiter key `{m:@<provider>:shared}`); each call holds its model slot and the shared slot. Scenario S55: shared cap 8 over two models, combined peak exactly 8, 600/600 OK.
 - `llm-queue settings get [--model M | --provider P] | set | unset | reset`; `get` shows every value with its source. Scenario S54: a live `max_concurrency` cut from 20 to 5 mid-run reached all 3 workers within one reload, 900/900 OK.
 - Retry curve knobs `LLMQ_RETRY_MULTIPLIER` (4), `LLMQ_RETRY_SPREAD` (2.5), `LLMQ_RETRY_MAX_SECS` (30) and `LLMQ_THROTTLE_RETRY_MAX_SECS` (10).
+- DEBUG trace per call on `taskiq_llm_queue.core`: `call_started`, `slot_acquired` / `slot_unavailable`, `attempt_done`, `backoff`, `rt_capacity_wait`, `call_requeued`, `call_done`, each with the `request_id`.
+- `sqs_timeouts_to_failover` (`LLMQ_SQS_TIMEOUTS_TO_FAILOVER`, 3).
 
 ### Changed
 - A received rt call keeps looking for a free slot for `rt_capacity_wait_secs` (30 s, env `LLMQ_RT_CAPACITY_WAIT_SECS`, live per provider/model, never past its deadline) instead of 3 passes; `core.RT_CAPACITY_PASSES` is gone. S35b: 36 of 6,043 rt calls had given up with 33–157 s of deadline left.
 - Failed calls raise with `.meta` (attempts, queue wait, last target tried) on every `LLMQueueError`; error replies fill `queue_wait_ms` and the last target.
 - Retry backoff: retry n sleeps a random time in `[base * multiplier^n, that * spread]`, i.e. 1-2.5 s, 4-10 s, 16-30 s, then 30 s (was `base * 2^n + uniform(0, base)`, capped at 20 s). After a throttle one sleep is capped at 10 s. `core.MAX_BACKOFF_SECS` is gone; `backoff_secs` takes a `Backoff` curve.
+
+- A model fails over to direct after `sqs_timeouts_to_failover` SQS send timeouts within 60 s, not after one (a refused send still fails over at once); the timed-out call itself still runs direct. One timeout in a 10K burst used to cost the model 300 s of SQS.
+- A 5xx that opens a target's breaker ends the call's retries on that target; in-flight calls kept retrying the open target (S12).
+- `limiter_initial_clamped` warns only for a start you set, not for the default start (20) above a small `max_concurrency`.
 
 ### Removed
 - The old `_S` / suffix-less env spellings (`LLMQ_CONSUMER_DRAIN_S`, `LLMQ_RETRY_BASE_S`, `LLMQ_SQS_WAIT_TIME_S`, `LLMQ_TIMEOUT_RT`, ...) are no longer read; the README lists each with its `_SECS` name.

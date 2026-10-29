@@ -117,7 +117,7 @@ async def s20(ctx: Ctx) -> None:
     await stack.stop_service(ctx.settings.sqs_service)
     t0 = time.monotonic()
     during = [await one(ctx, q, i, timeout_secs=30) for i in range(1, 6)]
-    ctx.metric("first_call_s", round(time.monotonic() - t0, 1))
+    ctx.metric("five_calls_s", round(time.monotonic() - t0, 1))  # 3 send timeouts, then direct
     ctx.metric("during", [r.meta.worker.split(":")[0] if r.ok else r.error_kind for r in during])
     ctx.expect(
         all(r.ok and r.meta.worker.startswith("direct") for r in during),

@@ -315,7 +315,7 @@ sequenceDiagram
 
 - Trigger: `SendTaskError`, `SQSSendError`, `QueueUnavailable` or `OSError` (including the `TimeoutError` from `_bounded_send`).
 - Deterministic errors do not fail over: a too-large message, a bad label, `ValueError` / `TypeError` / `ConfigError`. They raise `LLMQueueError` to the caller.
-- Otherwise `report_sqs_failure` opens a per-alias window of `sqs_failover_secs` (300). The call runs `_direct(envelope, claim=True)`: it takes the claim as `direct:<pod_id>` first (DS17), so if the ambiguous send did arrive, the queued copy is acked as done or deferred, never run twice.
+- Otherwise `report_sqs_failure` opens a per-alias window of `sqs_failover_secs` (300): at once for a refused send, after `sqs_timeouts_to_failover` (3) send timeouts within 60 s for a timeout (one timeout in a busy burst is not an outage, H17). The call runs `_direct(envelope, claim=True)`: it takes the claim as `direct:<pod_id>` first (DS17), so if the ambiguous send did arrive, the queued copy is acked as done or deferred, never run twice.
 - The DS17 claim is kept alive by the pod heartbeat's second `ClaimGroup`.
 - Measured: first call served in 5.7 s with SQS stopped (S20).
 - Recovery: the window simply expires (`sqs_failover_active` logs `sqs_failover_ended`); there is no SQS probe.
@@ -596,6 +596,7 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `sqs_wait_time_secs` | `LLMQ_SQS_WAIT_TIME_SECS` | 20 (long poll) |
 | `sqs_send_timeout_secs` | `LLMQ_SQS_SEND_TIMEOUT_SECS` | 5 |
 | `sqs_failover_secs` | `LLMQ_SQS_FAILOVER_SECS` | 300 |
+| `sqs_timeouts_to_failover` | `LLMQ_SQS_TIMEOUTS_TO_FAILOVER` | 3 |
 
 **Models and providers**
 

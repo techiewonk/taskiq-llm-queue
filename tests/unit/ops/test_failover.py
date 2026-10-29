@@ -50,7 +50,7 @@ def test_sqs_window_enters_and_expires_with_injected_clock() -> None:
     clock, gauges = Clock(), Gauges()
     state: FailoverPolicy = FailoverState(metrics=gauges, clock=clock)
     assert state.path_override("gpt20b") is None
-    state.report_sqs_failure("gpt20b@apac", TimeoutError())
+    state.report_sqs_failure("gpt20b@apac", OSError("connection refused"))
     assert state.path_override("gpt20b") == "direct"
     assert state.path_override("embed") is None  # per model
     clock.now += 299.9
@@ -61,6 +61,23 @@ def test_sqs_window_enters_and_expires_with_injected_clock() -> None:
         (1.0, {"model": "gpt20b", "kind": "sqs"}),
         (0.0, {"model": "gpt20b", "kind": "sqs"}),
     ]
+
+
+def test_send_timeouts_fail_over_only_after_the_threshold_within_a_minute() -> None:
+    """H17: one send timeout in a busy burst cost 300 s of SQS; now it takes 3 in 60 s."""
+    clock = Clock()
+    state = FailoverState(FailoverSettings(sqs_timeouts_to_failover=3), clock=clock)
+    state.report_sqs_failure("m", TimeoutError())
+    state.report_sqs_failure("m", TimeoutError())
+    assert not state.sqs_failover_active("m")
+    clock.now += 61  # both older than the window: the count starts again
+    state.report_sqs_failure("m", TimeoutError())
+    state.report_sqs_failure("m", TimeoutError())
+    assert not state.sqs_failover_active("m")
+    state.report_sqs_failure("m", TimeoutError())
+    assert state.sqs_failover_active("m")
+    with pytest.raises(ConfigError, match="sqs_timeouts_to_failover"):
+        FailoverSettings(sqs_timeouts_to_failover=0)
 
 
 def test_repeat_failure_extends_window_without_new_alarm() -> None:

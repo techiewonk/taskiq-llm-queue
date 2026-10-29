@@ -226,6 +226,7 @@ class LLMQueue:
         self.failover: FailoverPolicy = failover or FailoverState(
             FailoverSettings(
                 sqs_failover_secs=config.sqs_failover_secs,
+                sqs_timeouts_to_failover=config.sqs_timeouts_to_failover,
                 local_cap_fallback=config.local_limit_cap,
                 model_caps=model_caps(config),
             ),

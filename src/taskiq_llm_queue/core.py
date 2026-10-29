@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import random
 import time
 from collections import OrderedDict
@@ -684,6 +685,19 @@ async def run_call(
     last = ErrorInfo(ErrorKind.RETRYABLE, "no_capacity")
     last_message = "no fallback step had capacity"
     rt_wait = settings.value(envelope.model, "rt_capacity_wait_secs")
+    # I7: a per-call trace (start, slot, attempts, backoff, end) at DEBUG; one check when off.
+    debug = logger.isEnabledFor(logging.DEBUG)
+    rid = envelope.request_id
+    if debug:
+        logger.debug(
+            "call_started",
+            request_id=rid,
+            model=envelope.model,
+            lane=envelope.lane.value,
+            worker=deps.worker,
+            queue_wait_ms=queue_wait_ms,
+            steps=len(steps),
+        )
     while True:
         pass_started = deps.clock()
         attempts_before = progress.attempts
@@ -703,6 +717,7 @@ async def run_call(
             for attempt in itertools.count():
                 if attempt >= budget:
                     break
+                slot_t0 = deps.clock()
                 leases = await _take_slot(
                     envelope,
                     step,
@@ -713,13 +728,30 @@ async def run_call(
                     shared_cap=shared_cap,
                 )
                 fresh_claim = False
+                slot_ms = round((deps.clock() - slot_t0) * 1000)
                 if leases is None:
                     last, last_message = (
                         ErrorInfo(ErrorKind.RETRYABLE, "no_capacity"),
                         "no capacity",
                     )
+                    if debug:
+                        logger.debug(
+                            "slot_unavailable",
+                            request_id=rid,
+                            model=step.alias,
+                            target=step.target,
+                            waited_ms=slot_ms,
+                        )
                     break  # DS13: next step
                 progress.attempts += 1
+                if debug:
+                    logger.debug(
+                        "slot_acquired",
+                        request_id=rid,
+                        model=step.alias,
+                        target=step.target,
+                        waited_ms=slot_ms,
+                    )
                 tried = step
                 deps.leases.update(leases)
                 info: ErrorInfo | None = None
@@ -752,6 +784,16 @@ async def run_call(
                 secs = time.monotonic() - t0
                 kind = info.kind if info else "ok"
                 safe_hook(deps.hooks.on_attempt, step.alias, step.target, kind, secs)
+                if debug:
+                    logger.debug(
+                        "attempt_done",
+                        request_id=rid,
+                        model=step.alias,
+                        target=step.target,
+                        attempt=attempt + 1,
+                        outcome=info.code or info.kind.value if info else "ok",
+                        provider_ms=round(secs * 1000),
+                    )
                 if info is None:
                     await _record(deps, step, ok=True)
                     if index:
@@ -767,6 +809,15 @@ async def run_call(
                         attempts=progress.attempts,
                         worker=deps.worker,
                     )
+                    if debug:
+                        logger.debug(
+                            "call_done",
+                            request_id=rid,
+                            ok=True,
+                            served=f"{step.alias}@{step.target}",
+                            attempts=progress.attempts,
+                            total_ms=round((deps.clock() - started) * 1000),
+                        )
                     return LLMReply(
                         request_id=envelope.request_id, ok=True, response=response, meta=meta
                     )
@@ -821,9 +872,20 @@ async def run_call(
                     if deps.clock() + delay >= envelope.deadline_at:
                         break
                     await _check_live(envelope, deps, check_cancel)
+                    if debug:
+                        logger.debug(
+                            "backoff",
+                            request_id=rid,
+                            model=step.alias,
+                            target=step.target,
+                            attempt=attempt + 1,
+                            sleep_secs=round(delay, 3),
+                        )
                     await deps.sleep(delay)
         if progress.attempts == attempts_before:  # no step could run in this pass
             if requeue and (secs_to_requeue := _requeue_secs(envelope, deps)) is not None:
+                if debug:
+                    logger.debug("call_requeued", request_id=rid, delay_secs=secs_to_requeue)
                 raise _Requeue(secs_to_requeue)
             if circuit_only and deps.clock() + _IDLE_RETRY_SECS < envelope.deadline_at:
                 await _check_live(envelope, deps, check_cancel)
@@ -839,9 +901,25 @@ async def run_call(
             ):
                 await _check_live(envelope, deps, check_cancel)
                 spent = deps.clock() - pass_started
+                if debug:
+                    logger.debug(
+                        "rt_capacity_wait",
+                        request_id=rid,
+                        waited_secs=round(deps.clock() - started, 1),
+                        limit_secs=rt_wait,
+                    )
                 if spent < RT_ACQUIRE_SECS:  # refused at once (e.g. a pause): no busy loop
                     await deps.sleep(RT_ACQUIRE_SECS - spent)
                 continue
+        if debug:
+            logger.debug(
+                "call_done",
+                request_id=rid,
+                ok=False,
+                code=last.code or last.kind.value,
+                attempts=progress.attempts,
+                total_ms=round((deps.clock() - started) * 1000),
+            )
         return error_reply(
             envelope,
             last.code or last.kind.value,
