@@ -658,10 +658,13 @@ The SQS body is a taskiq message serialized by `WireSerializer` (orjson, UTF-8, 
 | `bg_share` | `LLMQ_AC_BG_SHARE` | 0.8 |
 | `ramp_cap` | `LLMQ_AC_RAMP_CAP` | None |
 | `lease_ttl_secs` | `LLMQ_AC_LEASE_TTL_SECS` | 60 |
-| `utilisation` | none (constructor only) | 0.9 |
+| `utilisation` | `LLMQ_AC_UTILISATION` | 0.9 |
+| `window_secs`, `loss_tolerance`, `min_throttles` (when a window of throttles cuts) | `LLMQ_AC_WINDOW_SECS`, `LLMQ_AC_LOSS_TOLERANCE`, `LLMQ_AC_MIN_THROTTLES` | 1.0, 0.05, 2 |
+| `pause_ratio` (pause when the 95 % lower bound of the throttle ratio reaches it) | `LLMQ_AC_PAUSE_RATIO` | 0.5 |
+| `settle_ratio`, `probe_secs`, `hold_ratio`, `peak_halflife_secs` | `LLMQ_AC_SETTLE_RATIO`, `LLMQ_AC_PROBE_SECS`, `LLMQ_AC_HOLD_RATIO`, `LLMQ_AC_PEAK_HALFLIFE_SECS` | 0.9, 5, 0.6, 300 |
 | breaker `threshold`, `window_secs`, `cooldown_secs` | `LLMQ_CB_THRESHOLD`, `LLMQ_CB_WINDOW_SECS`, `LLMQ_CB_COOLDOWN_SECS` | 5, 30, 15 |
 
-Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter window / cut knobs († in [§5](#5-adaptive-limiter)), claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30.
+Not configurable through `QueueConfig` (code constants or dataclass defaults): limiter `poll_secs` / `max_poll_secs`, claim heartbeat 10 s and staleness 3 beats (`ClaimSettings`), breaker `half_open_probes` 1, failover probe backoff 1–30 s (`FailoverSettings`), `RT_ACQUIRE_SECS` 2, `QUEUED_ACQUIRE_SECS` 15, `STORE_RETRY_SECS` 30.
 
 ### 7a. Settings per provider and per model (`model_settings.py`)
 

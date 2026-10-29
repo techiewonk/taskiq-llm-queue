@@ -15,6 +15,7 @@ a minor release may break the public API, with a deprecation announced one minor
 - Retry curve knobs `LLMQ_RETRY_MULTIPLIER` (4), `LLMQ_RETRY_SPREAD` (2.5), `LLMQ_RETRY_MAX_SECS` (30) and `LLMQ_THROTTLE_RETRY_MAX_SECS` (10).
 - DEBUG trace per call on `taskiq_llm_queue.core`: `call_started`, `slot_acquired` / `slot_unavailable`, `attempt_done`, `backoff`, `rt_capacity_wait`, `call_requeued`, `call_done`, each with the `request_id`.
 - `sqs_timeouts_to_failover` (`LLMQ_SQS_TIMEOUTS_TO_FAILOVER`, 3).
+- Limiter knobs as `LLMQ_AC_*` variables: `UTILISATION`, `WINDOW_SECS`, `LOSS_TOLERANCE`, `MIN_THROTTLES`, `PAUSE_RATIO`, `SETTLE_RATIO`, `PROBE_SECS`, `HOLD_RATIO`, `PEAK_HALFLIFE_SECS`.
 - `llmq_inflight` and `llmq_breaker_open` gauges (per model target used by the pod) and SQS counters from every broker hook: `llmq_sqs_received_total`, `_sent_total`, `_acked_total`, `_released_total` (by reason), `_expired_total`, `_errors_total`, and `llmq_sqs_wait_seconds`.
 - The Valkey state schema key `<prefix>:schema` is written on start; state from a newer schema refuses to start.
 - `cancel()` (and a caller timeout) also stops a provider attempt already running: workers subscribe to `<prefix>:cancel` and cancel that attempt (scenario S56: slot freed 0.03–0.05 s after the cancel).

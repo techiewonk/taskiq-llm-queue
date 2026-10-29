@@ -111,6 +111,15 @@ class LimiterTuning(BaseModel):
     # Renewed every pod heartbeat (10 s); a killed pod's slots return within it (S35b: 240 s
     # left a killed worker's leases blocking most of the limit for 4 minutes).
     lease_ttl_secs: float = Field(default=60.0, gt=0)
+    # I20: the cut / pause / hold / probe knobs (meaning: `reliability.LimiterSettings`).
+    peak_halflife_secs: float = Field(default=300.0, gt=0)
+    loss_tolerance: float = Field(default=0.05, ge=0, le=1)
+    min_throttles: int = Field(default=2, ge=1)
+    pause_ratio: float = Field(default=0.5, ge=0, le=1)
+    window_secs: float = Field(default=1.0, gt=0)
+    settle_ratio: float = Field(default=0.9, gt=0, le=1)
+    probe_secs: float = Field(default=5.0, ge=0)
+    hold_ratio: float = Field(default=0.6, ge=0)
 
     @model_validator(mode="after")
     def _min_le_max(self) -> LimiterTuning:
@@ -538,6 +547,15 @@ _LIMITER_ENV: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ("AC_BG_SHARE", "bg_share", float),
     ("AC_RAMP_CAP", "ramp_cap", int),
     ("AC_LEASE_TTL_SECS", "lease_ttl_secs", float),
+    ("AC_UTILISATION", "utilisation", float),
+    ("AC_PEAK_HALFLIFE_SECS", "peak_halflife_secs", float),
+    ("AC_LOSS_TOLERANCE", "loss_tolerance", float),
+    ("AC_MIN_THROTTLES", "min_throttles", int),
+    ("AC_PAUSE_RATIO", "pause_ratio", float),
+    ("AC_WINDOW_SECS", "window_secs", float),
+    ("AC_SETTLE_RATIO", "settle_ratio", float),
+    ("AC_PROBE_SECS", "probe_secs", float),
+    ("AC_HOLD_RATIO", "hold_ratio", float),
 )
 _BREAKER_ENV: tuple[tuple[str, str, Callable[[str], Any]], ...] = (
     ("CB_THRESHOLD", "threshold", int),

@@ -151,6 +151,14 @@ def limiter_settings(
         utilisation=tuning.utilisation,
         ramp_cap=tuning.ramp_cap,
         lease_ttl_secs=tuning.lease_ttl_secs,
+        peak_halflife_secs=tuning.peak_halflife_secs,
+        loss_tolerance=tuning.loss_tolerance,
+        min_throttles=tuning.min_throttles,
+        pause_ratio=tuning.pause_ratio,
+        window_secs=tuning.window_secs,
+        settle_ratio=tuning.settle_ratio,
+        probe_secs=tuning.probe_secs,
+        hold_ratio=tuning.hold_ratio,
     )
 
 

@@ -151,3 +151,35 @@ def test_local_caps_respect_model_caps() -> None:
     held = [shared.try_acquire("a", "primary", Lane.RT) for _ in range(3)]
     assert [h is not None for h in held] == [True, True, False]
     assert shared.try_acquire("b", "primary", Lane.RT) is not None
+
+
+def test_every_limiter_knob_reads_from_env() -> None:
+    """I20: the cut, pause, hold and probe knobs have `LLMQ_AC_*` variables too."""
+    env = {
+        "LLMQ_AC_UTILISATION": "0.8",
+        "LLMQ_AC_PEAK_HALFLIFE_SECS": "120",
+        "LLMQ_AC_LOSS_TOLERANCE": "0.1",
+        "LLMQ_AC_MIN_THROTTLES": "3",
+        "LLMQ_AC_PAUSE_RATIO": "0.6",
+        "LLMQ_AC_WINDOW_SECS": "2",
+        "LLMQ_AC_SETTLE_RATIO": "0.8",
+        "LLMQ_AC_PROBE_SECS": "10",
+        "LLMQ_AC_HOLD_RATIO": "0.5",
+    }
+    s = limiter_settings(QueueConfig.from_env(env))
+    assert (s.utilisation, s.peak_halflife_secs, s.loss_tolerance, s.min_throttles) == (
+        0.8,
+        120.0,
+        0.1,
+        3,
+    )
+    assert (s.pause_ratio, s.window_secs, s.settle_ratio, s.probe_secs, s.hold_ratio) == (
+        0.6,
+        2.0,
+        0.8,
+        10.0,
+        0.5,
+    )
+    assert limiter_settings(QueueConfig()).min_throttles == LimiterSettings().min_throttles
+    with pytest.raises(ConfigError):
+        QueueConfig.from_env({"LLMQ_AC_PAUSE_RATIO": "2"})
