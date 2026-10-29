@@ -153,12 +153,18 @@ async def add_script(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def cpu(request: web.Request) -> web.Response:
+    """`GET /scn/cpu`: CPU seconds this fakellm process used (one process serves all calls)."""
+    return web.json_response({"cpu_s": time.process_time()})
+
+
 def build_app(scenario: Scenario, seed: int | None) -> web.Application:
     """Fakellm app plus the probe middleware and `/scn/*` routes."""
     app = create_app(engine=Engine(scenario, seed=seed))
     app.middlewares.append(probe_middleware)
     app[PROBE] = Probe()
     app.router.add_get("/scn/calls", calls)
+    app.router.add_get("/scn/cpu", cpu)
     app.router.add_post("/scn/reset", reset)
     app.router.add_post("/scn/script", add_script)
     return app

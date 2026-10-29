@@ -182,7 +182,8 @@ async def _report_progress(path: Path | None, done: Any, total: int) -> None:
     if path is None:
         return
     while True:
-        path.write_text(f"{done()} {total} {time.time()}", encoding="utf-8")  # noqa: ASYNC240  # small local file, startup/teardown only
+        line = f"{done()} {total} {time.time()} {time.process_time():.3f}"
+        path.write_text(line, encoding="utf-8")  # noqa: ASYNC240  # small local file
         await asyncio.sleep(0.5)
 
 

@@ -7,6 +7,7 @@ exactly-once is proven by joining the sender's replies with the fakellm probe's 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import time
@@ -90,9 +91,11 @@ class Timeline:
     which model's limit collapsed and when (S35b investigation, STATUS.md I4).
     """
 
-    def __init__(self, ctx: Ctx, config: Any) -> None:
-        """Remember the model targets and queues of `config`; nothing is read yet."""
+    def __init__(self, ctx: Ctx, config: Any, procs: list[Any] | None = None) -> None:
+        """Remember the model targets, queues and worker processes; nothing is read yet."""
         self.ctx = ctx
+        self.procs = procs or []
+        self.cpu_last: dict[str, tuple[float, float]] = {}  # name -> (wall, cpu_s)
         self.keys = api.keys(ctx.settings.prefix)
         self.targets = [(alias, t) for alias, m in config.models.items() for t in m.targets]
         self.queues = sorted({q for m in config.models.values() for q in m.queues.values()})
@@ -121,8 +124,30 @@ class Timeline:
             await r.aclose()
         counts = await stack.queue_counts(self.ctx.settings, self.queues)
         row["queues"] = {q: counts.get(q, {}).get("visible", 0) for q in self.queues}
+        row["cpu"] = await self._cpu()
         with self.path.open("ab") as f:
             f.write(orjson.dumps(row) + b"\n")
+
+    async def _cpu(self) -> dict[str, float]:
+        """CPU seconds per wall second since the last sample, per worker, fakellm and sender."""
+        now = time.monotonic()
+        totals: dict[str, float] = {}
+        for p in self.procs:
+            cpu_s = p.stats().get("cpu_s")
+            if cpu_s is not None and p.alive:
+                totals[p.name] = float(cpu_s)
+        with contextlib.suppress(Exception):
+            totals["fakellm"] = float((await self.ctx.fake._req("GET", "/scn/cpu"))["cpu_s"])
+        progress = self.ctx.dir / "loadgen.progress"
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            totals["sender"] = float(progress.read_text(encoding="utf-8").split()[3])
+        out: dict[str, float] = {}
+        for name, cpu_s in totals.items():
+            last = self.cpu_last.get(name)
+            if last is not None and now > last[0]:
+                out[name] = round((cpu_s - last[1]) / (now - last[0]), 2)
+            self.cpu_last[name] = (now, cpu_s)
+        return out
 
 
 def _worker_counter(stats: dict[str, Any], name: str) -> float:
@@ -148,7 +173,7 @@ async def burst(
     spec = {"rid_prefix": prefix, "total": total, "mix": DEFAULT_MIX}
     ops_before = await stack.commandstats(ctx.settings)
     killed: dict[str, Any] = {}
-    timeline = Timeline(ctx, config)
+    timeline = Timeline(ctx, config, procs)
 
     async def during(elapsed: float, done: int) -> None:
         await timeline.sample(elapsed)

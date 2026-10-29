@@ -59,6 +59,7 @@ async def run(args: argparse.Namespace) -> None:
                 "state": "stopped" if final else state,
                 "uptime_s": round(time.time() - started, 2),
                 "peak_rss_mb": peak_rss_mb(),
+                "cpu_s": round(time.process_time(), 3),  # CPU used so far
                 "metrics": sink.snapshot(),
             },
         )
