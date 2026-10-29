@@ -6,6 +6,10 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+### Added
+- `ModelConfig.max_concurrency` (env `LLMQ_AC_MAX_BY_MODEL`, JSON `{"alias": N}`): a hard cluster-wide cap on calls in flight per model alias and target. The adaptive limiter still learns and cuts below it but never grows past it. Start limits above the cap are clamped (logged once), and a limit learned before the cap was set is clamped on next use. The cap also bounds the sync `direct` path (same Lua) and the per-pod local caps used while Valkey is down. Scenario S53 checks it: 2,000 queued, peak provider concurrency exactly 10.
+- The receive budget subtracts the pod's own callers already waiting for a limiter slot, so a full bucket leaves the backlog in SQS.
+
 ## [0.1.0a1] - 2026-10-29
 
 First pre-release. Everything listed below is new.

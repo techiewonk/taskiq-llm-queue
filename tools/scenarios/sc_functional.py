@@ -187,6 +187,93 @@ async def s08(ctx: Ctx) -> None:
     ctx.expect(first is not None and first <= 20, f"limit did not reach 45 in 20 s: {samples}")
 
 
+def _peak_concurrency(log: dict[str, list[list[Any]]]) -> int:
+    """Most provider calls open at once in a probe call log ([t_start, t_end, ...] per call)."""
+    edges = sorted(
+        (t, step) for calls in log.values() for c in calls for t, step in ((c[0], 1), (c[1], -1))
+    )  # at equal times the end (-1) sorts first, so back-to-back calls do not overlap
+    peak = live = 0
+    for _, step in edges:
+        live += step
+        peak = max(peak, live)
+    return peak
+
+
+@scenario("S53", "Fixed bucket: 2,000 queued, exactly N in flight", tags=("slow",))
+async def s53(ctx: Ctx) -> None:
+    """`max_concurrency` 10 on gpt20b, 3 workers x 50 slots: the backlog waits in SQS.
+
+    2,000 bg calls are sent before any worker runs. The provider never sees more than 10 calls
+    at once (call-log sweep and fakellm's own counter), every call completes exactly once, and
+    the backlog stays in SQS (peak visible > 1,000). `bg_share` 1.0 gives bg the whole bucket.
+    """
+    n, cap = int(os.environ.get("SCN_S53_TOTAL", "2000")), 10
+    await ctx.fake.patch(GPT20B_PRIMARY, {"latency_ms": {"p50": 200, "p95": 300}})
+    models = api.models(ctx.settings)
+    models["gpt20b"] = models["gpt20b"].model_copy(update={"max_concurrency": cap})
+    cfg = ctx.config(models=models, limiter={"bg_share": 1.0})
+    q = await ctx.queue(cfg)
+    queue = ctx.settings.queue("gpt20b")
+    leases_key = api.keys(ctx.settings.prefix).leases("gpt20b", "primary")
+    peaks = {"visible": 0, "sqs_inflight": 0, "leases": 0, "limit": 0}
+    stop = asyncio.Event()
+
+    async def sample() -> None:
+        while not stop.is_set():
+            counts = (await stack.queue_counts(ctx.settings, [queue])).get(queue, {})
+            state = await limiter_state(ctx, "gpt20b", "primary")
+            live = int(await redis_call(ctx, lambda r: r.zcount(leases_key, time.time(), "+inf")))
+            for key, value in (
+                ("visible", counts.get("visible", 0)),
+                ("sqs_inflight", counts.get("inflight", 0)),
+                ("leases", live),
+                ("limit", int(state.get("limit", 0) or 0)),
+            ):
+                peaks[key] = max(peaks[key], value)
+            await asyncio.sleep(0.5)
+
+    sampler = asyncio.create_task(sample())
+    t0 = time.monotonic()
+    sent = asyncio.create_task(calls(ctx, q, n, tag="b", lane="bg"))
+
+    async def backlogged() -> bool:
+        return peaks["visible"] > n // 2
+
+    ctx.metric("backlog_built_s", await wait_until(backlogged, timeout_secs=60))
+    await ctx.workers(3, cfg)
+    replies = await sent
+    wall = time.monotonic() - t0
+    stop.set()
+    await sampler
+    log = await ctx.fake.calls(ctx.rid_prefix("b"))
+    ok200 = stack.ok_calls(log)
+    stats = (await ctx.fake.stats()).get(GPT20B_PRIMARY, {})
+    failed = [r for r in replies if not r.ok]
+    dups = {rid: c for rid, c in ok200.items() if c > 1}
+    peak = _peak_concurrency(log)
+    ctx.metric("requests", n)
+    ctx.metric("ok", n - len(failed))
+    ctx.metric("lost_or_failed", len(failed))
+    ctx.metric("duplicate_provider_success", len(dups))
+    ctx.metric("provider_peak_concurrency", peak)
+    ctx.metric("fakellm_max_concurrent_seen", stats.get("max_concurrent_seen"))
+    ctx.metric("peak_sqs_visible", peaks["visible"])
+    ctx.metric("peak_sqs_inflight", peaks["sqs_inflight"])
+    ctx.metric("peak_live_leases", peaks["leases"])
+    ctx.metric("peak_limit", peaks["limit"])
+    ctx.metric("provider_calls", sum(len(c) for c in log.values()))
+    ctx.metric("wall_s", round(wall, 1))
+    ctx.metric("throughput_rps", round(n / wall, 1))
+    ctx.expect(not failed, f"{len(failed)} calls failed: {failed[0].error if failed else ''}")
+    ctx.expect(len(ok200) == n, f"{n - len(ok200)} requests never succeeded at the provider")
+    ctx.expect(not dups, f"{len(dups)} requests ran twice: {list(dups)[:5]}")
+    ctx.expect(peak == cap, f"provider peak concurrency {peak}, want exactly {cap}")
+    ctx.expect(int(stats.get("max_concurrent_seen", 0)) <= cap, f"fakellm saw {stats} above {cap}")
+    ctx.expect(peaks["leases"] <= cap and peaks["limit"] <= cap, f"limiter over cap: {peaks}")
+    ctx.expect(peaks["visible"] > n // 2, f"backlog not held in SQS: {peaks}")
+    await ctx.final_checks(cfg)
+
+
 @scenario("S09", "Pause gate: throttled model stops receiving, others unaffected")
 async def s09(ctx: Ctx) -> None:
     """gpt120b throttled 100 % for 15 s: its receives pause, gpt20b rate unchanged, then drains."""

@@ -13,8 +13,10 @@ from redis.asyncio.client import Pipeline
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from taskiq_llm_queue.config import Lane
+from taskiq_llm_queue.broker.queue import SQSQueue
+from taskiq_llm_queue.config import Lane, ModelConfig
 from taskiq_llm_queue.keys import KeySpace
+from taskiq_llm_queue.lifecycle import receive_budget
 from taskiq_llm_queue.protocols import Lease, Limiter, ReceiveGate
 from taskiq_llm_queue.reliability import AdaptiveLimiter, LimiterSettings, SyncAdaptiveLimiter, _lua
 
@@ -618,3 +620,89 @@ async def test_futile_cuts_stop_at_the_start_value(
         assert lease is not None
         await lim.release(lease, throttled=i in (4, 9))  # 20 % < 0.6 x 100 %: the cut helped
     assert await limit_of(lim) == 4
+
+
+async def test_model_cap_holds_under_busy_successes(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """`max_concurrency` 10: 1,000 busy successes at full use never lift the limit past 10.
+
+    The start (40) is clamped to the cap, ramp and additive growth stop there, and an 11th
+    concurrent acquire is refused; other models keep the global `max_limit`.
+    """
+    lim = make(valkey, keys, initial={M: 40}, max_by_model={M: 10}, max_limit=2000)
+    held = await take(lim, 9)
+    for _ in range(1000):  # every success at inflight 10 of 10: as busy as it gets
+        await succeed(lim, 1)
+        assert await limit_of(lim) == 10
+    held += await take(lim, 1)
+    assert await lim.try_acquire(M, T, Lane.RT) is None
+    assert (await lim.state(M, T)).inflight == 10
+    await release_all(lim, held)
+    assert lim.settings.max_for("other") == 2000
+
+
+async def test_model_cap_cuts_below_and_regrows_to_cap(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """Adaptive behaviour stays below the cap: a throttle storm cuts, busy successes grow back."""
+    lim = make(valkey, keys, initial={M: 10}, max_by_model={M: 10}, pause_secs=0, probe_secs=0)
+    await succeed(lim, 1)
+    await throttle(lim)
+    cut = await limit_of(lim)
+    assert cut is not None
+    assert cut < 10
+    for _ in range(200):
+        held = await take(lim, max(0, (await limit_of(lim) or 1) - 1))
+        await succeed(lim, 1)
+        await release_all(lim, held)
+    assert await limit_of(lim) == 10
+
+
+async def test_lowered_cap_clamps_learned_limit(
+    valkey: redis.asyncio.Redis, sync_valkey: redis.Redis, keys: KeySpace
+) -> None:
+    """A limit learned before the cap existed is read capped and rewritten on the next call.
+
+    The sync twin (direct path) sends the same bounds, so it sees the same cap.
+    """
+    await valkey.hset(keys.limiter(M, T), mapping={"limit": 40, "ramp": 0})
+    lim = make(valkey, keys, max_by_model={M: 6})
+    assert (await lim.state(M, T)).limit == 6  # PEEK capped in Python: receive budgets
+    sync = SyncAdaptiveLimiter(sync_valkey, keys, lim.settings)
+    leases = [sync.acquire(M, T, Lane.RT, timeout_secs=0) for _ in range(7)]
+    assert [lease is not None for lease in leases] == [True] * 6 + [False]
+    assert int(await valkey.hget(keys.limiter(M, T), "limit") or 0) == 6
+    for lease in leases:
+        if lease is not None:
+            sync.release(lease, throttled=False)
+    assert await limit_of(lim) == 6
+
+
+async def test_receive_budget_nets_out_local_waiters(
+    valkey: redis.asyncio.Redis, keys: KeySpace
+) -> None:
+    """A full bucket plus a waiting caller gives a 0 budget, so the backlog stays in SQS.
+
+    S53 measured 44 messages held out of SQS by 3 pods with a bucket of 10 before waiters were
+    subtracted (headroom alone let each pod receive what its own waiters would take).
+    """
+    lim = make(valkey, keys, initial={M: 2}, max_by_model={M: 2}, min_limit=1)
+    model = ModelConfig(provider="bedrock", model_id="x", targets={T: {}})
+    budget = receive_budget(M, model, lim, {"q": Lane.RT}, None)
+    queue = SQSQueue(name="q")
+    held = await take(lim, 1)
+    assert await budget(queue) == 1
+    held += await take(lim, 1)
+    waiter = asyncio.create_task(lim.acquire(M, T, Lane.RT, timeout_secs=5))
+    for _ in range(500):  # until the waiter has been refused once and sleeps
+        if lim.waiting(M, T):
+            break
+        await asyncio.sleep(0.01)
+    assert await budget(queue) == 0
+    await lim.release(held.pop(), throttled=False)
+    assert await budget(queue) == 0, "the freed slot is the waiter's, not a new receive's"
+    lease = await waiter
+    assert lease is not None
+    assert lim.waiting(M, T) == 0
+    await release_all(lim, [*held, lease])

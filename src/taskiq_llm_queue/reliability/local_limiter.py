@@ -10,7 +10,7 @@ import asyncio
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from taskiq_llm_queue.config import Lane
 from taskiq_llm_queue.protocols import Lease
@@ -20,15 +20,17 @@ from taskiq_llm_queue.reliability.limiter import PauseGate
 class LocalLimiter:
     """`Limiter` with a fixed per-pod cap per (model, target), lane share and throttle pause.
 
-    No learning: the cap is set by the caller from `local_cap`. A throttle storm (at least
-    `min_throttles` throttles making up `pause_ratio` of a `window_secs` window) pauses the model
-    target for `pause_secs`, closing its gate; a lone throttle does not (S35).
+    No learning: the cap is set by the caller from `local_cap`, lowered per alias by
+    `model_caps` (`max_concurrency`) when one instance serves every model. A throttle storm (at
+    least `min_throttles` throttles making up `pause_ratio` of a `window_secs` window) pauses the
+    model target for `pause_secs`, closing its gate; a lone throttle does not (S35).
     """
 
     def __init__(
         self,
         cap: int,
         *,
+        model_caps: Mapping[str, int] | None = None,
         bg_share: float = 0.8,
         pause_secs: float = 2.0,
         lease_ttl_secs: float = 60.0,
@@ -44,6 +46,7 @@ class LocalLimiter:
         if cap < 1:
             raise ValueError("cap must be >= 1")
         self.cap = cap
+        self._model_caps = dict(model_caps or {})
         self._bg_share = bg_share
         self._pause_secs = pause_secs
         self._lease_ttl = lease_ttl_secs
@@ -69,7 +72,7 @@ class LocalLimiter:
         if not self.gate(model, target).is_open():
             return None
         share = 1.0 if lane is Lane.RT else self._bg_share
-        allowed = max(1, int(self.cap * share))
+        allowed = max(1, int(min(self.cap, self._model_caps.get(model, self.cap)) * share))
         with self._lock:
             held = self._held.setdefault((model, target), set())
             if len(held) >= allowed:

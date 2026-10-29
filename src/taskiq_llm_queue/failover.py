@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from taskiq_llm_queue._logging import get_logger
@@ -37,6 +37,7 @@ class FailoverSettings:
     `live_pods` < 1 means unknown: the local cap is then `local_cap_fallback`, never
     `last_known_limit` per pod, so an unknown pod count cannot overshoot the provider limit.
     A running `LLMQueue` replaces it with the pod-registry count (`FailoverState.set_live_pods`).
+    `model_caps` (alias -> `max_concurrency`) bounds every local cap of that alias too.
     """
 
     sqs_failover_secs: float = 300.0
@@ -44,6 +45,7 @@ class FailoverSettings:
     redis_retry_max_secs: float = 30.0
     local_cap_fallback: int = 20
     live_pods: int = 0
+    model_caps: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Reject impossible values at construction (boot time)."""
@@ -250,10 +252,15 @@ class FailoverState:
         return self.settings.live_pods if live is None else live
 
     def local_cap(self, model: str, target: str) -> int:
-        """Per-pod cap while Valkey is down: last known limit / live pods, else the fallback."""
+        """Per-pod cap while Valkey is down: last known limit / live pods, else the fallback.
+
+        Never above the alias's `model_caps` entry (best effort: with the pod count unknown,
+        each pod may run up to that cap).
+        """
         with self._lock:
             last = self._limits.get((model, target))
-        return local_cap(last, self.live_pods, self.settings.local_cap_fallback)
+        cap = local_cap(last, self.live_pods, self.settings.local_cap_fallback)
+        return min(cap, self.settings.model_caps.get(model, cap))
 
     def local_limiter(self, model: str, target: str) -> LocalLimiter:
         """The pod's `LocalLimiter` for a model target, built once per Valkey outage."""

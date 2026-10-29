@@ -60,6 +60,7 @@ from taskiq_llm_queue.lifecycle import (
     build_brokers,
     claim_settings,
     limiter_settings,
+    model_caps,
     queue_for_lane,
     queue_name,
 )
@@ -217,6 +218,7 @@ class LLMQueue:
             FailoverSettings(
                 sqs_failover_secs=config.sqs_failover_secs,
                 local_cap_fallback=config.local_limit_cap,
+                model_caps=model_caps(config),
             ),
             probe=self._probe_redis,
             metrics=self.metrics,
@@ -1115,6 +1117,7 @@ class _LocalLimiters:
             config.local_limit_cap,
             bg_share=config.limiter.bg_share,
             pause_secs=config.limiter.pause_secs,
+            model_caps=model_caps(config),
         )
         self._issued: dict[str, LocalLimiter] = {}
 

@@ -60,7 +60,8 @@ class ModelConfig(BaseModel):
     """One model alias: provider, provider model id, named targets and its queues.
 
     `queues` maps `rt` / `default` / optional `bulk` to SQS queue names or URLs. The first entry
-    in `targets` is the primary target.
+    in `targets` is the primary target. `max_concurrency` is a hard cluster-wide cap on calls in
+    flight per (alias, target); None leaves the adaptive limit free up to `LimiterTuning.max_limit`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -70,6 +71,15 @@ class ModelConfig(BaseModel):
     targets: dict[str, Target] = Field(default_factory=lambda: {"primary": Target()})
     queues: dict[Literal["rt", "default", "bulk"], str] = Field(default_factory=dict)
     limiter_initial: int = Field(default=20, ge=1)
+    max_concurrency: int | None = Field(
+        default=None,
+        ge=1,
+        description="Hard cap on this alias's calls in flight across all pods, per target "
+        "(the limiter key is per alias and target). The adaptive limit still learns and cuts "
+        "below it but never grows past it; `limiter_initial` above it is clamped to it. "
+        "`limiter_initial == max_concurrency` gives a fixed bucket that only shrinks on "
+        "clustered throttles.",
+    )
     api_key_env: str | None = None
 
     @field_validator("targets")
@@ -83,12 +93,14 @@ class ModelConfig(BaseModel):
 class LimiterTuning(BaseModel):
     """Adaptive limiter tuning (`LLMQ_AC_*`), mapped onto `reliability.LimiterSettings`.
 
-    `initial` overrides a model's `limiter_initial` by alias (`LLMQ_AC_INITIAL`, JSON).
+    `initial` overrides a model's `limiter_initial` by alias (`LLMQ_AC_INITIAL`, JSON);
+    `max_by_model` overrides its `max_concurrency` (`LLMQ_AC_MAX_BY_MODEL`, JSON, same shape).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     initial: dict[str, int] = Field(default_factory=dict)
+    max_by_model: dict[str, int] = Field(default_factory=dict)
     min_limit: int = Field(default=2, ge=1)
     max_limit: int = Field(default=2000, ge=1)
     ramp_window: int = Field(default=50, ge=1)
@@ -106,6 +118,9 @@ class LimiterTuning(BaseModel):
     def _min_le_max(self) -> LimiterTuning:
         if self.min_limit > self.max_limit:
             raise ValueError("limiter.min_limit must be <= limiter.max_limit")
+        bad = {k: v for k, v in self.max_by_model.items() if v < 1}
+        if bad:
+            raise ValueError(f"limiter.max_by_model values must be >= 1: {bad}")
         return self
 
 
@@ -466,7 +481,7 @@ def _lanes_from_env(get: _Getter, raw: dict[str, object], errors: list[str]) -> 
 
 
 def _tuning_from_env(get: _Getter, raw: dict[str, object], errors: list[str]) -> None:
-    """Nested `limiter` (`LLMQ_AC_*`, `LLMQ_AC_INITIAL` JSON) and `breaker` (`LLMQ_CB_*`)."""
+    """Nested `limiter` (`LLMQ_AC_*`, JSON `LLMQ_AC_INITIAL` / `_MAX_BY_MODEL`) and `breaker`."""
     for field, table in (("limiter", _LIMITER_ENV), ("breaker", _BREAKER_ENV)):
         values: dict[str, Any] = {}
         for name, key, conv in table:
@@ -477,11 +492,12 @@ def _tuning_from_env(get: _Getter, raw: dict[str, object], errors: list[str]) ->
                 values[key] = conv(value)
             except ValueError as exc:
                 errors.append(f"{ENV_PREFIX}{name}: {exc}")
-        if field == "limiter" and (initial := get("AC_INITIAL")):
-            try:
-                values["initial"] = orjson.loads(initial)
-            except orjson.JSONDecodeError as exc:
-                errors.append(f"{ENV_PREFIX}AC_INITIAL: invalid JSON ({exc})")
+        for name, key in (("AC_INITIAL", "initial"), ("AC_MAX_BY_MODEL", "max_by_model")):
+            if field == "limiter" and (raw_json := get(name)):
+                try:
+                    values[key] = orjson.loads(raw_json)
+                except orjson.JSONDecodeError as exc:
+                    errors.append(f"{ENV_PREFIX}{name}: invalid JSON ({exc})")
         if values:
             raw[field] = values
 

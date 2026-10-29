@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _MAX_ORPHANS = 4096  # past this, leases left by failed calls just expire (lease_ttl_secs)
+_warned_clamps: set[tuple[str, int, int]] = set()  # (model, initial, cap) already warned
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,12 +40,15 @@ class LimiterSettings:
     """Tuning of the adaptive limiter (`LLMQ_AC_*`); defaults are recommended production starts.
 
     `initial` maps a model alias to its start limit (a stored learned limit always wins).
+    `max_by_model` is a hard per-alias cap on each (model, target) limit below `max_limit`:
+    start, growth and a stored limit are all clamped to it (`ModelConfig.max_concurrency`).
     DS12: growth needs `inflight >= utilisation x allowed` and stops at 2x the peak inflight,
     which decays with `peak_halflife_secs`; `ramp_cap` is an extra hard cap on ramp doubling.
     Cuts need clustered throttles (`loss_tolerance` of a `window_secs` window, see `_lua`).
     """
 
     initial: Mapping[str, int] | None = None
+    max_by_model: Mapping[str, int] | None = None
     default_initial: int = 20
     min_limit: int = 2
     max_limit: int = 2000
@@ -90,6 +94,14 @@ class LimiterSettings:
             raise ValueError("settle_ratio must be in (0, 1]")
         if self.hold_ratio < 0:
             raise ValueError("hold_ratio must be >= 0")
+        caps = self.max_by_model or {}
+        if any(cap < 1 for cap in caps.values()):
+            raise ValueError(f"max_by_model values must be >= 1: {dict(caps)}")
+        for model, cap in caps.items():  # a start above the cap is clamped, said once
+            start = (self.initial or {}).get(model, self.default_initial)
+            if start > cap and (model, start, cap) not in _warned_clamps:
+                _warned_clamps.add((model, start, cap))
+                logger.warning("limiter_initial_clamped", model=model, initial=start, cap=cap)
 
     def retry_delay(self, attempt: int, paused_secs: float, rng: random.Random) -> float:
         """Sleep before the next acquire try: the pause remaining, else jittered backoff.
@@ -102,8 +114,12 @@ class LimiterSettings:
         return rng.uniform(base / 2, base)
 
     def start_for(self, model: str) -> int:
-        """Start limit for a model alias before anything was learned."""
-        return (self.initial or {}).get(model, self.default_initial)
+        """Start limit for a model alias before anything was learned (never above its cap)."""
+        return min(self.max_for(model), (self.initial or {}).get(model, self.default_initial))
+
+    def max_for(self, model: str) -> int:
+        """Highest limit a model alias may reach: its `max_by_model` cap, else `max_limit`."""
+        return min(self.max_limit, (self.max_by_model or {}).get(model, self.max_limit))
 
     def share_for(self, lane: Lane) -> float:
         """Fraction of the limit a lane may use: rt the full limit, bg/bulk `bg_share`."""
@@ -111,9 +127,10 @@ class LimiterSettings:
 
     @classmethod
     def from_config(cls, config: QueueConfig, **overrides: Any) -> LimiterSettings:
-        """Settings whose start limits come from each model's `limiter_initial`."""
+        """Settings whose start limits and caps come from each model's config."""
         initial = {alias: m.limiter_initial for alias, m in config.models.items()}
-        return cls(initial=initial, **overrides)
+        caps = {a: m.max_concurrency for a, m in config.models.items() if m.max_concurrency}
+        return cls(initial=initial, max_by_model=caps, **overrides)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,11 +193,15 @@ class PauseGate:
             await self._sleep(max(0.01, self._closed_until - self._clock()))
 
 
+def _bounds(settings: LimiterSettings, model: str) -> list[Any]:
+    """Lua ARGV[1..3]: start, min and max limit; min drops to the cap when the cap is lower."""
+    cap = settings.max_for(model)
+    return [settings.start_for(model), min(settings.min_limit, cap), cap]
+
+
 def _acquire_args(settings: LimiterSettings, model: str, lane: Lane, token: str) -> list[Any]:
     return [
-        settings.start_for(model),
-        settings.min_limit,
-        settings.max_limit,
+        *_bounds(settings, model),
         settings.share_for(lane),
         settings.lease_ttl_secs,
         token,
@@ -190,17 +211,16 @@ def _acquire_args(settings: LimiterSettings, model: str, lane: Lane, token: str)
 def _release_args(
     settings: LimiterSettings, lease: Lease, throttled: bool, share: float = 1.0
 ) -> list[Any]:
+    cap = settings.max_for(lease.model)
     return [
-        settings.start_for(lease.model),
-        settings.min_limit,
-        settings.max_limit,
+        *_bounds(settings, lease.model),
         lease.token,
         1 if throttled else 0,
         settings.ramp_window,
         settings.increase_every,
         settings.decrease_factor,
         settings.pause_secs,
-        min(settings.ramp_cap or settings.max_limit, settings.max_limit),
+        min(settings.ramp_cap or cap, cap),
         settings.utilisation,
         settings.peak_halflife_secs,
         share,
@@ -255,6 +275,7 @@ class AdaptiveLimiter:
         self._shares: dict[str, float] = {}  # lease token -> lane share, for DS12 at release
         self._orphans: set[tuple[str, str, str]] = set()  # (model, target, token) to drop
         self._rng = random.Random()
+        self._waiting: dict[tuple[str, str], int] = {}  # callers in `acquire` without a slot
         self.last_limits: dict[tuple[str, str], int] = {}
 
     def _key_pair(self, model: str, target: str) -> list[str]:
@@ -304,20 +325,32 @@ class AdaptiveLimiter:
         """Take a slot, waiting until one frees up or `timeout_secs` passes (then None).
 
         Sleeps out a pause, else backs off with jitter; `should_abort` (e.g. the cancel flag)
-        is checked before every sleep and returning True gives up with None.
+        is checked before every sleep and returning True gives up with None. While it sleeps the
+        caller counts in `waiting`, which the receive budget subtracts.
         """
         deadline = self._clock() + max(0.0, timeout_secs)
         attempt = 0
-        while True:
-            lease, paused = await self._attempt(model, target, lane)
-            if lease is not None:
-                return lease
-            remaining = deadline - self._clock()
-            if remaining <= 0 or (should_abort is not None and await should_abort()):
-                return None
-            delay = self.settings.retry_delay(attempt, paused, self._rng)
-            await self._sleep(min(delay, remaining))
-            attempt += 1
+        key = (model, target)
+        try:
+            while True:
+                lease, paused = await self._attempt(model, target, lane)
+                if lease is not None:
+                    return lease
+                remaining = deadline - self._clock()
+                if remaining <= 0 or (should_abort is not None and await should_abort()):
+                    return None
+                if attempt == 0:
+                    self._waiting[key] = self._waiting.get(key, 0) + 1
+                delay = self.settings.retry_delay(attempt, paused, self._rng)
+                await self._sleep(min(delay, remaining))
+                attempt += 1
+        finally:
+            if attempt:
+                self._waiting[key] -= 1
+
+    def waiting(self, model: str, target: str) -> int:
+        """Callers on this pod sleeping in `acquire` for a slot of this model target."""
+        return self._waiting.get((model, target), 0)
 
     async def release(self, lease: Lease, *, throttled: bool) -> None:
         """Return the slot and grow or shrink the limit, in one Lua call.
@@ -396,9 +429,9 @@ class AdaptiveLimiter:
 
     def _peeked(self, model: str, target: str, reply: Any) -> LimiterState:
         limit, inflight, paused = reply
-        state = LimiterState(
-            None if int(limit) < 0 else int(limit), int(inflight), float(_lua.as_text(paused))
-        )
+        # PEEK does not clamp; a limit stored before the cap was lowered must not widen budgets.
+        capped = None if int(limit) < 0 else min(int(limit), self.settings.max_for(model))
+        state = LimiterState(capped, int(inflight), float(_lua.as_text(paused)))
         self._note(model, target, state.limit, state.paused_secs)
         return state
 

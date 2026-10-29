@@ -2,6 +2,7 @@
 
 Runnable examples live in [`samples/`](../samples/README.md). Every script runs against the local
 Docker stack (`make up`), and `13_research_assistant_flow.py` can also run against real Bedrock.
+What each call does inside the library is described in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | Sample | Shows |
 |---|---|

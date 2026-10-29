@@ -13,6 +13,8 @@ your code ──> client / LangChain adapter ──> SQS (per model: -rt queue f
             (per-pod dispatcher)          (adaptive limiter, retry, fallback)
 ```
 
+**How it works:** [docs/ARCHITECTURE.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/ARCHITECTURE.md) walks through the components, every data flow (happy path, fallback, failover, jobs, cancellation, crash recovery), the adaptive limiter, the Valkey key schema and the full configuration reference.
+
 ## Why
 
 - **Spikes wait in a queue instead of failing.** Throttled calls aren't lost or retried in a storm.
@@ -127,6 +129,11 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 | `throttle_retry_attempts` | 6 | Tries per fallback step for throttles (backoff holds no slot) |
 | `valkey_wait_failover_secs` | 10 | Result reads failing this long make waiting callers run direct |
 | `redis_max_connections` | 32 | Raised automatically to worker slots + 16 |
+| `worker_slots` (`LLMQ_WORKER_SLOTS=gpt120b:50,jobs:4`) | 50 per model alias (4 for `jobs`) | Tasks one pod runs at once for that alias's queues |
+| `ModelConfig.limiter_initial` (`LLMQ_AC_INITIAL='{"gpt120b": 40}'`) | 20 | Start of the adaptive limit before anything was learned |
+| `ModelConfig.max_concurrency` (`LLMQ_AC_MAX_BY_MODEL='{"gpt120b": 30}'`) | `None` (adaptive up to `LLMQ_AC_MAX`) | Hard cap on calls in flight across all pods, per alias **and target**; see below |
+| `limiter.max_limit` (`LLMQ_AC_MAX`) | 2000 | Global ceiling of every adaptive limit |
+| `limiter.bg_share` (`LLMQ_AC_BG_SHARE`) | 0.8 | Fraction of a limit `bg`/`bulk` may use; `rt` may use all of it |
 
 Redis keys are cluster-safe (hash-tagged per request and per model+target), so cluster-mode Valkey (e.g. ElastiCache Serverless) works.
 
@@ -150,6 +157,20 @@ A custom provider implements `async call(op, params, target) -> dict` and `class
 | `bulk` | `llm-<model>-bulk` if configured (e.g. embeddings), else base | Ingestion/batch; lowest priority |
 
 A queued `bg`/`bulk` call waits at most 15 s for a slot, then goes back to the queue with a delay instead of holding a worker.
+
+### Concurrency: queue depth vs bucket size
+
+The queue depth is unbounded: SQS holds every request that is not running. How many run at once is set by three knobs:
+
+- **`worker_slots`** (per pod, per model alias, default 50): tasks one pod runs at once. Total pod capacity is `pods × worker_slots`.
+- **The limiter** (cluster-wide, per model alias and target, in Valkey): the number of provider calls in flight across all pods. It starts at `limiter_initial` (20), grows on busy successes, is cut on clustered throttles, and never exceeds `LLMQ_AC_MAX` (2000).
+- **`max_concurrency`** (cluster-wide, per model alias **and target**, default unset): a hard cap on that limit. With `max_concurrency=10`, at most 10 calls of that alias run against each of its targets at once, whatever the pod count. A model with two targets can therefore have 2 × 10 in flight. The limiter still adapts below the cap. Set `limiter_initial == max_concurrency` for a fixed bucket that only shrinks under real throttling; a `limiter_initial` above the cap is clamped to it (logged once as `limiter_initial_clamped`). Lowering the cap also clamps a limit learned earlier, on its next use.
+
+`bg` and `bulk` may use `bg_share` (80 %) of the limit, so with a cap of 10, background work runs at most 8 at once and keeps 2 slots for `rt`. Set `LLMQ_AC_BG_SHARE=1` to give all lanes the whole bucket.
+
+A pod receives at most min(free worker slots, limiter headroom − its own calls already waiting for a slot), so a full bucket leaves the backlog in SQS rather than in pod memory. The rest wait in SQS until their lane deadline (`timeout_secs`: rt 90 s, bg 300 s, bulk 900 s). `bg`/`bulk` calls that do get received but find no slot within 15 s go back to SQS with a delay. An `rt` call that is received gets three 2 s tries per fallback step, then fails with `no_capacity`. Size the bucket so that `cap × calls per second per slot × deadline` covers the backlog you expect. While Valkey is down, each pod runs under a local cap of `last limit / live pods`, never above `max_concurrency`. This is best effort: with the pod count unknown, each pod may run up to the cap.
+
+Measured (scenario S53, fakellm at 200 ms p50, 3 workers × 50 slots, `max_concurrency=10`, `bg_share=1`): 2,000 bg calls queued (2,000 visible in SQS at peak), peak provider concurrency exactly 10 (from the call log and fakellm's own counter), limiter never above 10, 2,000/2,000 done, 0 lost, 0 duplicates, 61 s wall time. SQS in-flight peaked at 40, which is 10 running plus finished messages waiting for the 0.5 s batched delete.
 
 ## Results
 

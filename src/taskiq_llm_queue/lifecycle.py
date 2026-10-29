@@ -94,12 +94,17 @@ class MetricsHooks(QueueHooks, BrokerHooks):
 
 
 def limiter_settings(config: QueueConfig) -> LimiterSettings:
-    """`LimiterSettings` from `QueueConfig.limiter`; per-model starts from `limiter_initial`."""
+    """`LimiterSettings` from `QueueConfig.limiter`; per-model starts and caps from the models.
+
+    `limiter.initial` / `limiter.max_by_model` (env JSON) win over `limiter_initial` /
+    `max_concurrency` of the same alias.
+    """
     tuning = config.limiter
     initial = {alias: m.limiter_initial for alias, m in config.models.items()}
     initial.update(tuning.initial)
     return LimiterSettings(
         initial=initial,
+        max_by_model=model_caps(config),
         min_limit=tuning.min_limit,
         max_limit=tuning.max_limit,
         ramp_window=tuning.ramp_window,
@@ -111,6 +116,15 @@ def limiter_settings(config: QueueConfig) -> LimiterSettings:
         ramp_cap=tuning.ramp_cap,
         lease_ttl_secs=tuning.lease_ttl_secs,
     )
+
+
+def model_caps(config: QueueConfig) -> dict[str, int]:
+    """Hard per-alias concurrency caps: `max_concurrency`, overridden by `limiter.max_by_model`.
+
+    Feeds the shared limiter and the per-pod local caps used while Valkey is down.
+    """
+    caps = {a: m.max_concurrency for a, m in config.models.items() if m.max_concurrency}
+    return {**caps, **config.limiter.max_by_model}
 
 
 def breaker_settings(config: QueueConfig) -> BreakerSettings:
@@ -189,6 +203,8 @@ def receive_budget(
 ) -> Callable[[SQSQueue], Any]:
     """DS4 budget for one model's queues: the best limiter headroom across its targets.
 
+    Headroom is net of this pod's callers already waiting for a slot of that target, so a full
+    bucket (e.g. `max_concurrency`) leaves the backlog in SQS instead of in waiting tasks.
     Returns 0 while Valkey is down or unreachable, so nothing is received that can't run.
     """
 
@@ -202,7 +218,14 @@ def receive_budget(
             if failover is not None:
                 failover.report_redis_failure(exc)
             return 0
-        return max((state.headroom(share) for state in states), default=0)
+        best = max(
+            (
+                state.headroom(share) - limiter.waiting(alias, target)
+                for target, state in zip(model.targets, states, strict=True)
+            ),
+            default=0,
+        )
+        return max(0, best)
 
     return budget
 
