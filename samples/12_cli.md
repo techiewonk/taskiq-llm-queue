@@ -101,3 +101,17 @@ docker exec llmq-test-valkey-1 valkey-cli -a localdev --no-auth-warning \
     XREVRANGE llmq:local:cfg:audit + - COUNT 5      # last 5 config changes with actor
 .venv/Scripts/python samples/_local.py reset         # wipe llmq:local:* keys + default fakellm scenario
 ```
+
+## Settings per provider and model (live, every pod within `LLMQ_CFG_RELOAD_SECS`)
+
+```bash
+uv run llm-queue settings get --model gpt20b                       # every setting: value + source
+uv run llm-queue settings get --provider bedrock                   # its models, shared cap, overrides
+uv run llm-queue settings set --model gpt20b max_concurrency=5 timeout_secs.rt=45
+uv run llm-queue settings set --provider bedrock shared_max_concurrency=40 retry_multiplier=3
+uv run llm-queue settings set --model gpt20b rt_capacity_wait_secs=10 throttle_retry_attempts=10
+uv run llm-queue settings unset --model gpt20b max_concurrency     # back to .env / default
+uv run llm-queue settings reset                                    # drop every live override
+```
+
+Sources in `get`: `live:model`, `live:provider`, `env:model`, `env:provider` (`LLMQ_SETTINGS`), `env` (`LLMQ_*`), `default`. Every change is audited (`--actor`, default the OS user); a bad name, value, alias or provider is refused before anything is written.
