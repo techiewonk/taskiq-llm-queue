@@ -137,6 +137,26 @@ await llmq.cancel("req-1")      # not run if not started; the caller gets LLMQue
 
 Redis keys are cluster-safe (hash-tagged per request and per model+target), so cluster-mode Valkey (e.g. ElastiCache Serverless) works.
 
+### Renamed settings
+
+Duration variables now end in `_SECS`. The old names below are still read when the new one is unset, with a one-time warning; a later minor release may remove them, so rename them in your `.env`, Helm values and Secrets Manager entries.
+
+| Old name (deprecated) | New name |
+|---|---|
+| `LLMQ_CFG_RELOAD_S` | `LLMQ_CFG_RELOAD_SECS` |
+| `LLMQ_CONSUMER_DRAIN_S` | `LLMQ_CONSUMER_DRAIN_SECS` |
+| `LLMQ_RETRY_BASE_S` | `LLMQ_RETRY_BASE_SECS` |
+| `LLMQ_SQS_WAIT_TIME_S` | `LLMQ_SQS_WAIT_TIME_SECS` |
+| `LLMQ_SQS_FAILOVER_S` | `LLMQ_SQS_FAILOVER_SECS` |
+| `LLMQ_AC_PAUSE_S` | `LLMQ_AC_PAUSE_SECS` |
+| `LLMQ_AC_LEASE_TTL_S` | `LLMQ_AC_LEASE_TTL_SECS` |
+| `LLMQ_CB_WINDOW_S` | `LLMQ_CB_WINDOW_SECS` |
+| `LLMQ_CB_COOLDOWN_S` | `LLMQ_CB_COOLDOWN_SECS` |
+| `LLMQ_TIMEOUT_RT` / `_BG` / `_BULK` | `LLMQ_TIMEOUT_RT_SECS` / `_BG_SECS` / `_BULK_SECS` |
+| `LLMQ_TIMEOUT_EMBED_RT` / `_BG` / `_BULK` | `LLMQ_TIMEOUT_EMBED_RT_SECS` / `_BG_SECS` / `_BULK_SECS` |
+
+If both names are set, the new one wins and the old one is ignored.
+
 ## Providers
 
 ```python
