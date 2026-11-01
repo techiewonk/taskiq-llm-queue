@@ -1,4 +1,7 @@
-"""Broker integration tests on the real ElasticMQ container (docker/compose.yaml).
+"""Broker integration tests on the real ElasticMQ container and on Valkey Streams.
+
+Every test runs twice: `sqs` (ElasticMQ, docker/compose.yaml) and `valkey` (`ValkeyQueueClient`
+on the stack's Valkey), the parity gate of docs/VALKEY_QUEUE_PLAN.md (V2).
 
 Covers both directions: kick -> listen -> ack with taskiq's own Receiver in-process,
 priority, capacity, gates, long polls, heartbeat, release, delay, expiry, FIFO, batching
@@ -17,6 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
+import redis.asyncio as redis_asyncio
 from aiobotocore.config import AioConfig
 from aiobotocore.session import get_session
 from botocore.exceptions import ClientError
@@ -40,12 +44,16 @@ from taskiq_llm_queue.broker import (
     SQSQueue,
     classify_error,
 )
+from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
 from taskiq_llm_queue.envelope import ENVELOPE_VERSION
 
 pytestmark = pytest.mark.integration
 MakeQueue = Callable[..., Awaitable[str]]
 
 ENDPOINT = os.environ.get("LLMQ_TEST_SQS_ENDPOINT", "http://localhost:9324")
+VALKEY_HOST = os.environ.get("LLMQ_TEST_REDIS_HOST", "localhost")
+VALKEY_PORT = int(os.environ.get("LLMQ_TEST_REDIS_PORT", "6379"))
+VALKEY_PASSWORD = os.environ.get("LLMQ_TEST_REDIS_PASSWORD", "localdev")
 REGION = "ap-south-1"
 KEY = "test"
 
@@ -84,10 +92,22 @@ class Recorder(BrokerHooks):
         self.sends.append((queue, count))
 
 
+# Set by the `sqs` fixture: the Valkey client factory when the test runs on `valkey`.
+BACKEND: dict[str, Any] = {}
+
+
+def valkey_client(prefix: str) -> ValkeyQueueClient:
+    """A `ValkeyQueueClient` on the stack's Valkey that owns its connection."""
+    redis = redis_asyncio.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PASSWORD)
+    return ValkeyQueueClient(redis, prefix=prefix, owns_redis=True)
+
+
 def make_broker(queues: list[SQSQueue], **kwargs: Any) -> HybridSQSBroker:
-    """Broker wired to the test endpoint with short backoff."""
+    """Broker wired to the test endpoint (or Valkey) with short backoff."""
     kwargs.setdefault("backoff_base_secs", 0.05)
     kwargs.setdefault("backoff_cap_secs", 0.5)
+    if "valkey_prefix" in BACKEND:
+        kwargs.setdefault("client_factory", lambda: valkey_client(BACKEND["valkey_prefix"]))
     return HybridSQSBroker(
         queues,
         endpoint_url=ENDPOINT,
@@ -140,9 +160,28 @@ async def wait_for(predicate: Callable[[], bool], within: float = 10.0) -> None:
         await asyncio.sleep(0.02)
 
 
-@pytest.fixture
-async def sqs() -> AsyncIterator[Any]:
-    """Raw SQS client for setup and out-of-band checks; skips if ElasticMQ is down."""
+@pytest.fixture(params=["sqs", "valkey"])
+async def sqs(request: pytest.FixtureRequest) -> AsyncIterator[Any]:
+    """Raw queue client for setup and out-of-band checks: ElasticMQ, or Valkey Streams.
+
+    Skips when the backend is not reachable.
+    """
+    BACKEND.clear()
+    if request.param == "valkey":
+        prefix = f"llmqit:{uuid.uuid4().hex[:10]}"
+        valkey = valkey_client(prefix)
+        try:
+            await valkey.list_queues()
+        except Exception as exc:
+            await valkey.close()
+            pytest.skip(f"no Valkey at {VALKEY_HOST}:{VALKEY_PORT}: {exc}")
+        BACKEND["valkey_prefix"] = prefix
+        try:
+            yield valkey
+        finally:
+            BACKEND.clear()
+            await valkey.close()
+        return
     session = get_session()
     async with session.create_client(
         "sqs",
@@ -502,6 +541,8 @@ async def test_expired_messages_deleted_unrun(sqs: Any, make_queue: MakeQueue) -
 
 
 async def test_fifo_dedup_group_and_delay_rejected(sqs: Any, make_queue: MakeQueue) -> None:
+    if "valkey_prefix" in BACKEND:
+        pytest.skip("FIFO queues are SQS-only (VALKEY_QUEUE_PLAN.md §1); refusal is unit-tested")
     name = await make_queue("fifo", fifo=True)
     url = (await sqs.get_queue_url(QueueName=name))["QueueUrl"]
     broker = make_broker([SQSQueue(name, wait_time_secs=1)])

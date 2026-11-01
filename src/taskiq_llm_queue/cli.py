@@ -3,7 +3,7 @@
 Connection settings come from `QueueConfig.from_env()` (`LLMQ_*`). Live config starts from the
 app's defaults (`LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT`) while nothing is stored, and
 `set` edits merge into it. Every change is validated and audited with `actor` (`--actor`,
-default the OS user). `job send` and `queues` touch only SQS.
+default the OS user). `job send` and `queues` touch only the queue backend (SQS or Valkey).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from redis.exceptions import RedisError
 
 from taskiq_llm_queue.config import LANE_SETTINGS, Lane, ModelSettings, QueueConfig, create_redis
-from taskiq_llm_queue.envelope import TASK_JOB
+from taskiq_llm_queue.envelope import JOB_NAME_LABEL, TASK_JOB
 from taskiq_llm_queue.errors import ConfigError, LLMQueueError
 from taskiq_llm_queue.keys import KeySpace
 from taskiq_llm_queue.model_settings import (
@@ -131,7 +131,20 @@ def build_parser() -> argparse.ArgumentParser:
     b_reset.add_argument("--model", required=True, help="alias or alias@target")
     b_reset.add_argument("--target", help="one target (default: every target of the model)")
 
-    groups.add_parser("queues", help="message counts per configured SQS queue and its DLQ")
+    queues = groups.add_parser("queues", help="message counts per configured queue and its DLQ")
+    q_cmd = queues.add_subparsers(dest="queues_cmd")
+    q_cmd.add_parser("list", help="message counts (the default)")
+    q_create = q_cmd.add_parser(
+        "create", help="create every configured queue and its DLQ (queue_backend=valkey only)"
+    )
+    q_create.add_argument("--visibility-secs", type=int, default=60)
+    q_create.add_argument("--max-receives", type=int, default=10)
+    q_create.add_argument("--retention-secs", type=int, default=345_600)
+    q_redrive = q_cmd.add_parser("redrive", help="move a queue's DLQ messages back (valkey)")
+    q_redrive.add_argument("--queue", required=True, help="source queue name (not the -dlq)")
+    q_purge = q_cmd.add_parser("purge", help="delete every message of one queue")
+    q_purge.add_argument("--queue", required=True)
+    q_purge.add_argument("--yes", action="store_true", help="required: purging cannot be undone")
     status = groups.add_parser(
         "status", help="waiting / working / started this minute / budget left per model"
     )
@@ -191,7 +204,7 @@ async def _dispatch(args: argparse.Namespace, config: QueueConfig) -> int:
     if args.group == "job":
         return await _job_send(args, config)
     if args.group == "queues":
-        return await _queues(config)
+        return await _queues(args, config)
     keys = KeySpace(config.key_prefix)
     async with _valkey(config) as client:
         if args.group == "status":
@@ -525,14 +538,54 @@ def _counts(attrs: Mapping[str, Any]) -> dict[str, int]:
     return {"visible": visible, "in_flight": inflight, "delayed": delayed}
 
 
-async def _queues(config: QueueConfig) -> int:
-    from aiobotocore.session import get_session  # SQS client only for this command
+def _queue_client(config: QueueConfig) -> Any:
+    """Async context manager for the queue backend: SQS client or `ValkeyQueueClient`."""
+    if config.queue_backend == "valkey":
+        from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+        from taskiq_llm_queue.config import create_queue_redis
 
-    queues = _configured_queues(config)
-    async with get_session().create_client(
+        redis = create_queue_redis(config, client_name="llmq-cli")
+        return ValkeyQueueClient(redis, prefix=config.key_prefix, owns_redis=True)
+    from aiobotocore.session import get_session  # SQS client only for queue commands
+
+    return get_session().create_client(
         "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
-    ) as sqs:
-        rows = list(await asyncio.gather(*(_queue_row(sqs, q) for q in queues)))
+    )
+
+
+async def _queues(args: argparse.Namespace, config: QueueConfig) -> int:
+    command = getattr(args, "queues_cmd", None) or "list"
+    queues = _configured_queues(config)
+    valkey = config.queue_backend == "valkey"
+    if command in ("create", "redrive") and not valkey:
+        raise ConfigError(f"queues {command} is for queue_backend=valkey; SQS queues are infra")
+    if command == "purge" and not args.yes:
+        raise ConfigError("purge deletes every message of the queue; pass --yes")
+    async with _queue_client(config) as client:
+        if command == "create":
+            for name in queues:
+                await client.create_queue(QueueName=f"{name}-dlq")
+                policy = {
+                    "maxReceiveCount": args.max_receives,
+                    "deadLetterTargetArn": f"arn:valkey:{name}-dlq",
+                }
+                attributes = {
+                    "VisibilityTimeout": str(args.visibility_secs),
+                    "MessageRetentionPeriod": str(args.retention_secs),
+                    "RedrivePolicy": orjson.dumps(policy).decode(),
+                }
+                await client.create_queue(QueueName=name, Attributes=attributes)
+            _print_json({"created": queues})
+            return 0
+        if command == "redrive":
+            _print_json({"queue": args.queue, "moved": await client.redrive(args.queue)})
+            return 0
+        if command == "purge":
+            url = (await client.get_queue_url(QueueName=args.queue))["QueueUrl"]
+            await client.purge_queue(QueueUrl=url)
+            _print_json({"queue": args.queue, "purged": True})
+            return 0
+        rows = list(await asyncio.gather(*(_queue_row(client, q) for q in queues)))
     _print_json(rows)
     return 0
 
@@ -546,8 +599,6 @@ async def _status(
     `received` those a worker holds; per target `working` is the cluster-wide in-flight count
     and `started` / `tokens` what the rate budget counted this calendar minute.
     """
-    from aiobotocore.session import get_session  # SQS client only for this command
-
     aliases = [args.model] if args.model else list(config.models)
     unknown = [a for a in aliases if a not in config.models]
     if unknown:
@@ -556,9 +607,7 @@ async def _status(
     resolver = SettingsResolver(config, live)
     limiter = AdaptiveLimiter(client, keys, LimiterSettings.from_config(config))
     rate = ValkeyRateBudget(client, keys)
-    async with get_session().create_client(
-        "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
-    ) as sqs:
+    async with _queue_client(config) as sqs:
         rows = []
         for alias in aliases:
             model = config.models[alias]
@@ -629,7 +678,13 @@ def job_message(
     return {
         "task_id": job_id,
         "task_name": TASK_JOB,
-        "labels": {"lane": lane, "job": name, "sender": actor, "queue_name": queue},
+        "labels": {
+            "lane": lane,
+            "job": name,
+            JOB_NAME_LABEL: name,
+            "sender": actor,
+            "queue_name": queue,
+        },
         "labels_types": None,
         "args": [body],
         "kwargs": {},
@@ -637,8 +692,6 @@ def job_message(
 
 
 async def _job_send(args: argparse.Namespace, config: QueueConfig) -> int:
-    from aiobotocore.session import get_session  # SQS client only for this command
-
     payload = orjson.loads(args.payload_file.read_bytes())
     queue: str = args.queue
     queue_name = queue.rstrip("/").rsplit("/", 1)[-1]
@@ -652,11 +705,8 @@ async def _job_send(args: argparse.Namespace, config: QueueConfig) -> int:
         queue=queue_name,
         deadline_at=time.time() + config.state_ttl_secs,
     )
-    session = get_session()
-    async with session.create_client(
-        "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
-    ) as sqs:
-        if queue.startswith(("http://", "https://")):
+    async with _queue_client(config) as sqs:
+        if queue.startswith(("http://", "https://")) and config.queue_backend == "sqs":
             url = queue
         else:
             url = (await sqs.get_queue_url(QueueName=queue))["QueueUrl"]

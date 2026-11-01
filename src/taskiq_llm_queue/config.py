@@ -271,6 +271,11 @@ class QueueConfig(BaseModel):
     redis_retry_attempts: int = Field(default=3, ge=0, le=10)
     redis_client_name: str | None = "taskiq-llm-queue"
     sqs_endpoint_url: str | None = None
+    # Where queues live: Amazon SQS, or Valkey Streams (docs/VALKEY_QUEUE_PLAN.md). With
+    # `valkey`, `queue_redis_url` (redis:// or rediss://) puts the queues on their own Valkey;
+    # unset, they share the state Valkey (`redis_*`).
+    queue_backend: Literal["sqs", "valkey"] = "sqs"
+    queue_redis_url: SecretStr | None = None
     bedrock_endpoint_url: str | None = None
     # None lets the AWS chain decide (AWS_REGION, profile, IRSA / Pod Identity).
     aws_region: str | None = None
@@ -475,6 +480,8 @@ class QueueConfig(BaseModel):
         for name, key, conv in (
             ("KEY_PREFIX", "key_prefix", str),
             ("REDIS_URL", "redis_url", str),
+            ("QUEUE_BACKEND", "queue_backend", str),
+            ("QUEUE_REDIS_URL", "queue_redis_url", str),
             ("REDIS_HOST", "redis_host", str),
             ("REDIS_PORT", "redis_port", int),
             ("REDIS_USERNAME", "redis_username", str),
@@ -731,6 +738,24 @@ def create_redis(config: QueueConfig, *, client_name: str | None = None) -> redi
             port=config.redis_port,
             **kwargs,
         )
+    return Redis(connection_pool=pool)
+
+
+def create_queue_redis(
+    config: QueueConfig, *, client_name: str | None = None
+) -> redis.asyncio.Redis:
+    """Async client for Valkey-backed queues: `queue_redis_url` when set, else the state Valkey.
+
+    Same pool, timeout and retry settings as `create_redis`; long polls never block a
+    connection (they wait on pub/sub), so the bounded pool is enough.
+    """
+    if config.queue_redis_url is None:
+        return create_redis(config, client_name=client_name)
+    from redis.asyncio import BlockingConnectionPool, Redis
+    from redis.asyncio.retry import Retry
+
+    kwargs = _redis_kwargs(config, Retry(_backoff(), config.redis_retry_attempts), client_name)
+    pool = BlockingConnectionPool.from_url(config.queue_redis_url.get_secret_value(), **kwargs)
     return Redis(connection_pool=pool)
 
 

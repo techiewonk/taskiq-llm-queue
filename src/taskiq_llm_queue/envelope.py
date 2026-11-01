@@ -21,6 +21,8 @@ ENVELOPE_VERSION = 1
 TASK_CALL = "taskiq_llm_queue.call"
 TASK_EMBED = "taskiq_llm_queue.embed"
 TASK_JOB = "taskiq_llm_queue.job"
+# Job name as a message label: survives S3 offload, which empties the args (S24).
+JOB_NAME_LABEL = "llmq_job"
 
 Op = Literal["converse", "invoke_model", "chat", "embeddings"]
 FallbackPolicy = Literal["same_model", "chain"]

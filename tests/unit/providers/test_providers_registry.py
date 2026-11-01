@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,14 @@ CUSTOM_PROVIDER = textwrap.dedent(
     NOT_A_PROVIDER = object
     '''
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_plugin_scan() -> Iterator[None]:
+    """Tests patch `entry_points`; the per-process cache must not leak between them."""
+    registry_module.plugin_entry_points.cache_clear()
+    yield
+    registry_module.plugin_entry_points.cache_clear()
 
 
 def _config(**overrides: Any) -> QueueConfig:
@@ -261,3 +269,19 @@ def test_embedding_batch_limits_and_bodies() -> None:
     assert parse_embeddings({"embeddings": {"float": [[2.0]]}}) == [[2.0]]
     with pytest.raises(ValueError, match="no 'embedding'"):
         parse_embeddings({})
+
+
+def test_entry_point_scan_runs_once_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S22: the metadata scan held the GIL ~0.5 s per new registry; it is cached now."""
+    from taskiq_llm_queue.providers import registry as module
+
+    calls: list[str] = []
+
+    def fake_entry_points(*, group: str) -> list[object]:
+        calls.append(group)
+        return []
+
+    monkeypatch.setattr(module, "entry_points", fake_entry_points)
+    ProviderRegistry(_config())
+    ProviderRegistry(_config())
+    assert calls == [module.ENTRY_POINT_GROUP]

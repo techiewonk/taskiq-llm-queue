@@ -100,9 +100,11 @@ def load_all() -> None:
     """Import every scenario module (registration is a side effect of import)."""
     from tools.scenarios import (  # noqa: F401  # imported for registration
         sc_basic,
+        sc_broker,
         sc_chaos,
         sc_failures,
         sc_functional,
+        sc_langchain,
         sc_load,
         sc_rate,
     )
@@ -328,6 +330,12 @@ async def isolate(settings: Settings) -> None:
         await stack.FakeLLM(settings.fakellm_url).load(BASE_FAKELLM)
 
 
+def aws_allowed(spec: Scenario) -> bool:
+    """`aws_safe="yes"`, or `"low-volume"` when `SCN_AWS_LOW_VOLUME=1` opts in (a few calls)."""
+    low_volume = os.environ.get("SCN_AWS_LOW_VOLUME") == "1"
+    return spec.aws_safe == "yes" or (low_volume and spec.aws_safe == "low-volume")
+
+
 async def run_one(spec: Scenario, settings: Settings, run_dir: Path) -> Result:
     """Isolate, run and classify one scenario."""
     t0 = time.monotonic()
@@ -335,7 +343,7 @@ async def run_one(spec: Scenario, settings: Settings, run_dir: Path) -> Result:
         return Result(spec.id, spec.title, "skip", 0.0, message=spec.skip)
     if spec.chaos and not settings.chaos:
         return Result(spec.id, spec.title, "skip", 0.0, message="chaos disabled (SCN_CHAOS=0)")
-    if settings.aws and spec.aws_safe != "yes":
+    if settings.aws and not aws_allowed(spec):
         return Result(spec.id, spec.title, "skip", 0.0, message="not aws-safe (SCN_PROVIDER=aws)")
     ctx = Ctx(settings, run_dir, spec.id)
     status, message = "pass", ""

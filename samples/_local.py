@@ -46,6 +46,8 @@ LOCAL_ENV: dict[str, str] = {
     "LLMQ_REDIS_PASSWORD": "localdev",
     "LLMQ_REDIS_SSL": "false",
     "LLMQ_SQS_ENDPOINT_URL": "http://localhost:9324",
+    # `valkey` runs every queue on Valkey Streams (same Valkey); the samples create the queues.
+    "LLMQ_QUEUE_BACKEND": "sqs",
     "LLMQ_BEDROCK_ENDPOINT_URL": FAKELLM_URL,
     "LLMQ_AWS_REGION": REGION,
     # Sample-friendly timings: short long-polls and quick retries so scripts exit fast.
@@ -146,12 +148,22 @@ def local_config(**overrides: Any) -> QueueConfig:
 
 
 async def ensure_queues(config: QueueConfig) -> None:
-    """Create any SQS queue the config names that does not exist yet (ElasticMQ only).
+    """Create any queue the config names that does not exist yet (ElasticMQ or Valkey).
 
-    The library never creates queues: on AWS they come from your infrastructure code.
+    The library never creates queues: on AWS they come from your infrastructure code, and on
+    `LLMQ_QUEUE_BACKEND=valkey` from `llm-queue queues create`, which this mirrors.
     """
     names = {q for m in config.models.values() for q in m.queues.values()}
     names |= set(config.job_queues.values())
+    if config.queue_backend == "valkey":
+        from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+        from taskiq_llm_queue.config import create_queue_redis
+
+        redis = create_queue_redis(config)
+        async with ValkeyQueueClient(redis, prefix=config.key_prefix, owns_redis=True) as client:
+            for name in sorted(names):
+                await client.create_queue(QueueName=name, Attributes={"VisibilityTimeout": "60"})
+        return
     async with get_session().create_client(
         "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
     ) as sqs:
@@ -387,14 +399,25 @@ def _print_env(powershell: bool) -> None:
             print(f"export {name}='{value}'")
 
 
+def _queue_admin(config: QueueConfig) -> Any:
+    """Queue client for the configured backend: ElasticMQ (SQS API) or `ValkeyQueueClient`."""
+    if config.queue_backend == "valkey":
+        from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+        from taskiq_llm_queue.config import create_queue_redis
+
+        redis = create_queue_redis(config)
+        return ValkeyQueueClient(redis, prefix=config.key_prefix, owns_redis=True)
+    return get_session().create_client(
+        "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
+    )
+
+
 async def _print_queues() -> None:
     """Print visible / in-flight message counts of every sample queue and its DLQ."""
     config = local_config(job_queues={"ingest": "jobs-ingest"})
     names = {q for m in config.models.values() for q in m.queues.values()}
     names |= set(config.job_queues.values())
-    async with get_session().create_client(
-        "sqs", region_name=config.aws_region, endpoint_url=config.sqs_endpoint_url
-    ) as sqs:
+    async with _queue_admin(config) as sqs:
         print(f"{'queue':24s} {'visible':>8s} {'in flight':>9s}")
         for name in sorted(names | {f"{n}-dlq" for n in names}):
             try:
@@ -438,6 +461,8 @@ async def _reset(scenario: Any) -> None:
     client = Redis(host=config.redis_host, port=config.redis_port, password=password)
     try:
         keys = [k async for k in client.scan_iter(match=f"{config.key_prefix}:*", count=500)]
+        # Valkey-backed queues live under `{<prefix>:q:<name>}:*` (hash-tagged keys).
+        keys += [k async for k in client.scan_iter(match=f"{{{config.key_prefix}:q:*", count=500)]
         if keys:
             await client.delete(*keys)
     finally:

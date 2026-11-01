@@ -197,6 +197,7 @@ def test_job_send_puts_taskiq_message_on_jobs_ingest(
     assert body["labels"] == {
         "lane": "bulk",
         "job": "ingest",
+        "llmq_job": "ingest",  # survives S3 offload (S24)
         "sender": "tester",
         "queue_name": "jobs-ingest",
     }
@@ -381,3 +382,52 @@ def test_status_shows_waiting_working_and_this_minutes_budget(
     assert {"waiting", "delayed", "received"} <= set(row["queues"]["default"])
     assert row["provider_budget"]["provider"] == "openai"
     assert row["provider_budget"]["rpm"] == 500
+
+
+def test_queues_on_valkey_create_list_redrive_purge(
+    cli_env: dict[str, str], prefix: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """queue_backend=valkey: the CLI creates the queues (no CloudFormation), lists counts,
+    redrives a DLQ and purges; the SQS-only refusals do not apply."""
+    from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient, queue_url
+
+    env = {
+        **cli_env,
+        "LLMQ_QUEUE_BACKEND": "valkey",
+        "LLMQ_JOB_QUEUES": json.dumps({"ingest": "jobs-ingest"}),
+    }
+    created = json.loads(run(env, capsys, "queues", "create", "--max-receives", "1"))["created"]
+    assert "jobs-ingest" in created
+
+    async def poison() -> None:
+        r = redis.asyncio.Redis(
+            host=cli_env["LLMQ_REDIS_HOST"],
+            port=int(cli_env["LLMQ_REDIS_PORT"]),
+            password=cli_env["LLMQ_REDIS_PASSWORD"],
+        )
+        async with ValkeyQueueClient(r, prefix=prefix, owns_redis=True) as client:
+            url = queue_url("jobs-ingest")
+            await client.send_message(QueueUrl=url, MessageBody="x")
+            await client.receive_message(QueueUrl=url, VisibilityTimeout=0)
+            await client.receive_message(QueueUrl=url)  # 2nd receive > max 1: dead-lettered
+
+    try:
+        asyncio.run(poison())
+        rows = json.loads(run(env, capsys, "queues"))
+        (row,) = [r for r in rows if r["queue"] == "jobs-ingest"]
+        assert row["dlq"]["visible"] == 1
+        moved = json.loads(run(env, capsys, "queues", "redrive", "--queue", "jobs-ingest"))
+        assert moved["moved"] == 1
+        run(env, capsys, "queues", "purge", "--queue", "jobs-ingest", "--yes")
+        (row,) = [r for r in json.loads(run(env, capsys, "queues")) if r["queue"] == "jobs-ingest"]
+        assert (row["visible"], row["dlq"]["visible"]) == (0, 0)
+    finally:
+        client = redis.Redis(
+            host=cli_env["LLMQ_REDIS_HOST"],
+            port=int(cli_env["LLMQ_REDIS_PORT"]),
+            password=cli_env["LLMQ_REDIS_PASSWORD"],
+        )
+        leftover = list(client.scan_iter(match=f"*{prefix}*", count=500))
+        if leftover:
+            client.delete(*leftover)
+        client.close()

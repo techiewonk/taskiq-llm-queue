@@ -50,6 +50,10 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _valkey_queues() -> bool:
+    return _env("SCN_QUEUE_BACKEND", "sqs").strip().lower() == "valkey"
+
+
 def _provider() -> str:
     provider = _env("SCN_PROVIDER", "fakellm").strip().lower()
     if provider not in PROVIDERS:
@@ -70,7 +74,12 @@ class Settings:
     env_source: str = field(default_factory=lambda: _env("SCN_ENV_SOURCE", "auto"))
 
     redis_host: str = field(default_factory=lambda: _env("SCN_REDIS_HOST", "localhost"))
-    redis_port: int = field(default_factory=lambda: int(_env("SCN_REDIS_PORT", "16379")))
+    # Valkey-backed queues default to the persistent twin, like a production queue server.
+    redis_port: int = field(
+        default_factory=lambda: int(
+            _env("SCN_REDIS_PORT", "16380" if _valkey_queues() else "16379")
+        )
+    )
     redis_password: str = field(default_factory=lambda: _env("SCN_REDIS_PASSWORD", "localdev"))
     sqs_url: str = field(default_factory=lambda: _env("SCN_SQS_URL", "http://localhost:19324"))
     fakellm_url: str = field(
@@ -78,6 +87,8 @@ class Settings:
     )
     prefix: str = field(default_factory=lambda: _env("SCN_PREFIX", "llmq:scn"))
     queue_prefix: str = field(default_factory=lambda: _env("SCN_QUEUE_PREFIX", "scn"))
+    # `sqs` (ElasticMQ) or `valkey` (Valkey Streams on the harness Valkey, VALKEY_QUEUE_PLAN.md).
+    queue_backend: str = field(default_factory=lambda: _env("SCN_QUEUE_BACKEND", "sqs"))
     manage_fakellm: bool = field(
         default_factory=lambda: _env("SCN_MANAGE_FAKELLM", "1") not in ("0", "false")
     )
@@ -86,7 +97,11 @@ class Settings:
             _env("SCN_CHAOS", "0" if _provider() == "aws" else "1") not in ("0", "false")
         )
     )
-    valkey_service: str = field(default_factory=lambda: _env("SCN_VALKEY_SERVICE", "valkey-scn"))
+    valkey_service: str = field(
+        default_factory=lambda: _env(
+            "SCN_VALKEY_SERVICE", "valkey-scn-persist" if _valkey_queues() else "valkey-scn"
+        )
+    )
     sqs_service: str = field(default_factory=lambda: _env("SCN_SQS_SERVICE", "sqs-scn"))
     python: str = sys.executable
 

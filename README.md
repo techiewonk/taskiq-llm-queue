@@ -1,6 +1,6 @@
 # taskiq-llm-queue
 
-> **Status:** pre-alpha (`0.1.0a2`). Built and tested: the `LLMQueue` client, the SQS broker, adaptive limiter, claims, circuit breaker, retry and fallback, JSON and S3 result backends, Bedrock and OpenAI-compatible providers, LangChain/LangGraph adapters, canary routing, failover and the CLI. 761 tests on Valkey 8.1, ElasticMQ 1.7.1 and a fake LLM server; CI on Python 3.11–3.14. Breaking changes are still possible before 0.1 (see [CHANGELOG](https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md)).
+> **Status:** alpha (`0.2.0`). Built and tested: the `LLMQueue` client, the queue broker on Amazon SQS or Valkey Streams, adaptive limiter, claims, circuit breaker, retry and fallback, JSON and S3 result backends, Bedrock and OpenAI-compatible providers, LangChain/LangGraph adapters, canary routing, failover and the CLI. 869 tests (unit, integration and the scenario harness) on Valkey 8.1, ElasticMQ 1.7.1 and a fake LLM server; CI on Python 3.11–3.14. Breaking changes are still possible before 0.1 (see [CHANGELOG](https://github.com/techiewonk/taskiq-llm-queue/blob/main/CHANGELOG.md)).
 
 An LLM request client with its own durable queue, built on [taskiq](https://github.com/taskiq-python/taskiq) and Amazon SQS.
 
@@ -119,6 +119,8 @@ await llmq.cancel("req-1")      # not run if queued, stopped if running; caller 
 | Setting | Default | Note |
 |---|---|---|
 | `aws_region` | `None` | Left to the AWS credential chain / IRSA |
+| `queue_backend` (`LLMQ_QUEUE_BACKEND`) | `sqs` | `valkey` puts every queue on Valkey Streams; see [Queue backend](#queue-backend-sqs-or-valkey-streams) |
+| `queue_redis_url` (`LLMQ_QUEUE_REDIS_URL`) | `None` | With `valkey`: a separate Valkey for the queues (else the state Valkey) |
 | `redis_url` or `redis_host`/`port`/`username`/`password`/`ssl` | localhost | `redis_password` is a `SecretStr` |
 | `redis_socket_timeout_secs` / `connect_timeout` / `health_check_interval` | 5 / 2 / 30 | Connection errors retried 3× with backoff |
 | `id_hash_salt` (`LLMQ_ID_HASH_SALT`) | library constant | **Set your own in production**; keys the BLAKE2b hash of session/user ids |
@@ -240,6 +242,22 @@ A custom provider implements `async call(op, params, target) -> dict` and `class
 | `bulk` | `llm-<model>-bulk` if configured (e.g. embeddings), else base | Ingestion/batch; lowest priority |
 
 A queued `bg`/`bulk` call waits at most 15 s for a slot, then goes back to the queue with a delay instead of holding a worker.
+
+### Queue backend: SQS or Valkey Streams
+
+Queues live on Amazon SQS by default. `LLMQ_QUEUE_BACKEND=valkey` puts them on Valkey Streams instead, with the same queue names and the same delivery rules: visibility timeout with heartbeat, release with a delay, redelivery after a pod dies, a DLQ after `maxReceiveCount`, delays, expiry, strict lane priority and batched send / ack. The broker is unchanged: `ValkeyQueueClient` answers the SQS calls it makes ([docs/VALKEY_QUEUE_PLAN.md](docs/VALKEY_QUEUE_PLAN.md)).
+
+| | SQS | Valkey Streams |
+|---|---|---|
+| Create queues | your infrastructure code | `llm-queue queues create [--visibility-secs 60 --max-receives 10 --retention-secs 345600]` |
+| Where | AWS, multi-AZ, managed | `LLMQ_QUEUE_REDIS_URL`, or the state Valkey when unset |
+| Valkey down | calls run direct; queued work stays in SQS | queue, limiter and results are down together; calls run direct |
+| Backlog | cheap, days | Valkey memory: size it (bodies ≤ 200 KB; larger params by reference) |
+| Metrics | CloudWatch | `llmq_queue_depth{queue,kind}`, `llmq_queue_oldest_seconds{queue}` from the pods |
+| DLQ redrive | console / `StartMessageMoveTask` | `llm-queue queues redrive --queue <name>` |
+| FIFO queues | yes | no (refused at boot) |
+
+Use a dedicated Valkey with AOF (`everysec`) and Multi-AZ for queues in production: a failover can lose or repeat the last messages (handlers are idempotent, a loss shows as a caller timeout).
 
 ### Concurrency: queue depth vs bucket size
 
@@ -388,7 +406,7 @@ make down
 # Windows without make:  uv run python tools/llmq_dev.py up | test | down
 ```
 
-Runnable examples are in [`samples/`](https://github.com/techiewonk/taskiq-llm-queue/tree/main/samples): quickstart, chat, embeddings, lanes, fallback on throttle, send-only and worker pods, LangChain, LangGraph, jobs, cancel and timeouts, sync calls, CLI, and `13_research_assistant_flow.py`, which replays a real app's flows locally or against real Bedrock (`--target aws`, settings from `.env` or AWS Secrets Manager). The stack, capability checks and test layers are described in [docs/TESTING.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/TESTING.md); delivery-safety rules in [docs/DESIGN.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/DESIGN.md).
+Runnable examples are in [`samples/`](https://github.com/techiewonk/taskiq-llm-queue/tree/main/samples): quickstart, chat, embeddings, lanes, fallback on throttle, send-only and worker pods, LangChain, LangGraph, jobs, cancel and timeouts, sync calls, CLI, `13_research_assistant_flow.py` (a real app's flows locally or against real Bedrock: `--target aws`, settings from `.env` or AWS Secrets Manager), settings and buckets (14), retries and errors (15), rate limits and lane caps (16) and an app-style LangChain + LangGraph graph (17). Every sample reads `LLMQ_*` overrides, so `LLMQ_QUEUE_BACKEND=valkey` runs all of them on Valkey Streams ([samples/README.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/samples/README.md) "Settings"). The stack, capability checks and test layers are described in [docs/TESTING.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/TESTING.md); delivery-safety rules in [docs/DESIGN.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/DESIGN.md).
 
 ## Credits
 

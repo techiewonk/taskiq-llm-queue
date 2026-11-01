@@ -25,6 +25,9 @@ SQS_RELEASED_TOTAL = "llmq_sqs_released_total"  # kind = reason (shutdown, drain
 SQS_EXPIRED_TOTAL = "llmq_sqs_expired_total"
 SQS_ERRORS_TOTAL = "llmq_sqs_errors_total"  # step = SQS operation, kind = error family
 SQS_WAIT_SECONDS = "llmq_sqs_wait_seconds"  # time a message sat in SQS before receipt
+# Valkey queue backend: what CloudWatch reports for SQS (state = visible, in_flight, delayed, dead).
+QUEUE_DEPTH = "llmq_queue_depth"
+QUEUE_OLDEST_SECONDS = "llmq_queue_oldest_seconds"
 
 # Allowed labels; raw user/session ids are never metric labels (cardinality, privacy).
 LABELS = ("model", "target", "lane", "queue", "path", "kind", "step")

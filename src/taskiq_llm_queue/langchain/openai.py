@@ -67,6 +67,7 @@ class QueuedChatOpenAI(ChatOpenAI):
         if isinstance(values, dict):
             values["streaming"] = False
             values["disable_streaming"] = True
+            values.setdefault("name", ChatOpenAI.__name__)  # trace run name as the parent's
         return values
 
     def _create_chat_result(

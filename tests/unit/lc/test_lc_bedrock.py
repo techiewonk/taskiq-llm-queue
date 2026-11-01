@@ -246,3 +246,41 @@ def test_placeholder_client_only_fills_fields_the_installed_class_has() -> None:
     for slot in ("client", "bedrock_client"):
         if slot in type(model).model_fields:
             assert getattr(model, slot) is not None
+
+
+async def test_trace_run_name_is_the_parents() -> None:
+    """Langfuse / LangSmith name the generation like plain ChatBedrockConverse (dashboards)."""
+    seen: list[str] = []
+
+    class Names(AsyncCallbackHandler):
+        async def on_chat_model_start(self, serialized: Any, messages: Any, **kw: Any) -> None:
+            seen.append(kw.get("name") or serialized.get("name"))
+
+    await _queued(FakeQueueClient()).ainvoke("hi", config={"callbacks": [Names()]})
+    assert seen == ["ChatBedrockConverse"]
+    assert _queued(FakeQueueClient(), name="custom").get_name() == "custom"
+
+
+async def test_fallback_reports_the_served_model_to_tracers() -> None:
+    """On fallback `llm_output["model_name"]` is the served Bedrock id (Langfuse model/cost)."""
+    served_id = "openai.gpt-oss-20b-1:0"
+    config = QueueConfig(
+        models={
+            "gpt120b": ModelConfig(provider="bedrock", model_id=MODEL_ID),
+            "gpt20b": ModelConfig(provider="bedrock", model_id=served_id),
+        }
+    )
+    outputs: list[Any] = []
+
+    class Outputs(AsyncCallbackHandler):
+        async def on_llm_end(self, response: LLMResult, **kw: Any) -> None:
+            outputs.append(response.llm_output)
+
+    fallback = FakeQueueClient(meta=META.model_copy(update={"served_model": "gpt20b"}))
+    fallback.config = config
+    await _queued(fallback).ainvoke("hi", config={"callbacks": [Outputs()]})
+    same = FakeQueueClient()  # served by the requested alias: nothing added
+    same.config = config
+    await _queued(same).ainvoke("hi", config={"callbacks": [Outputs()]})
+    assert outputs[0]["model_name"] == served_id
+    assert "model_name" not in (outputs[1] or {})

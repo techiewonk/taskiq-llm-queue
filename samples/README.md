@@ -50,6 +50,7 @@ something else, set the matching `LLMQ_*` variable (e.g. `LLMQ_REDIS_HOST`, `LLM
 | `14_settings_and_buckets.py` | settings per provider and model (`settings_default` = `LLMQ_SETTINGS`), value + source, bucket size, a live change without restart, a provider-wide bucket shared by two models |
 | `15_retries_errors_and_rt_wait.py` | the retry curve, `exc.meta` on a failed call (attempts, queue wait, last target), `rt_capacity_wait_secs` live per model |
 | `16_rate_limits_and_lane_caps.py` | RPM budget per minute (`fixed`), the rt reserve inside it, a bucket for the bulk lane (`lane_max_concurrency`), `llm-queue status` |
+| `17_langgraph_rag_agent.py` | LangChain + LangGraph app-style graph: queued embeddings for retrieval, `with_structured_output` router, `bind_tools` agent loop with `fallback_policy="chain"`, a bg-lane summary node, `astream(stream_mode="updates")`, sync `.invoke()` from a thread |
 
 ## Running
 
@@ -75,6 +76,36 @@ its path):
 uv run ruff check samples && uv run ruff format --check samples
 MYPYPATH=samples uv run mypy samples --strict
 ```
+
+## Settings: change any sample without editing it
+
+Every sample builds its config with `local_config()` (`_local.py`): the local defaults below,
+overlaid with any `LLMQ_*` variable set in the environment, so the same variables as
+production (README "Setting names") work for every script. `python samples/_local.py env`
+prints the effective values.
+
+| Variable | Local default | Change it to |
+|---|---|---|
+| `LLMQ_QUEUE_BACKEND` | `sqs` (ElasticMQ :9324) | `valkey`: every queue on Valkey Streams; `ensure_queues()` creates them |
+| `LLMQ_QUEUE_REDIS_URL` | unset (queues on the state Valkey) | `redis://:localdev@localhost:6379/0` or a second Valkey |
+| `LLMQ_REDIS_HOST` / `_PORT` / `_PASSWORD` / `_SSL` | `localhost` / `6379` / `localdev` / `false` | another Valkey |
+| `LLMQ_SQS_ENDPOINT_URL` | `http://localhost:9324` | another SQS endpoint (unset with real AWS credentials: AWS SQS) |
+| `LLMQ_BEDROCK_ENDPOINT_URL` | fakellm `http://localhost:8080` | unset for real Bedrock (see 13) |
+| `LLMQ_KEY_PREFIX` | `llmq:local` | a private prefix per run |
+| `LLMQ_MODELS`, `LLMQ_FALLBACK_CHAINS` | the five sample aliases, `gpt120b -> gpt20b` | your own JSON |
+| `LLMQ_SETTINGS` | none (14-16 set theirs in code) | per provider / model JSON (README "Settings per provider and model") |
+| `LLMQ_SQS_WAIT_TIME_SECS`, `LLMQ_RETRY_BASE_SECS`, `LLMQ_CONSUMER_DRAIN_SECS`, `LLMQ_RESULT_DISPATCH_MS` | `2`, `0.2`, `5`, `rt:50,bg:100,bulk:200` (fast exits) | production defaults: unset |
+
+### Run every sample on Valkey Streams instead of SQS
+
+```bash
+export LLMQ_QUEUE_BACKEND=valkey                       # PowerShell: $env:LLMQ_QUEUE_BACKEND = 'valkey'
+for f in samples/[01][0-9]_*.py; do .venv/Scripts/python "$f" > /dev/null && echo "ok   $f" || echo "FAIL $f"; done
+python samples/_local.py queues                        # counts from the Valkey queues
+python samples/_local.py reset                         # also wipes the Valkey queue keys
+```
+
+Without the variable the same loop runs on ElasticMQ. Both are part of the release checks.
 
 ## Expected output
 

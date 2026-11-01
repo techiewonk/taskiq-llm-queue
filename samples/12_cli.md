@@ -74,13 +74,24 @@ that registered `ingest` runs it: `09_jobs.py` does, so a job sent here runs on 
 
 ## Queues and dead-letter queues
 
-The CLI has no queue or DLQ commands. For the local stack:
+`llm-queue queues` lists visible / in-flight / delayed counts per configured queue and its DLQ,
+on either backend (`LLMQ_QUEUE_BACKEND`):
 
 ```bash
-.venv/Scripts/python samples/_local.py queues        # visible / in-flight per sample queue and its -dlq
+llm-queue queues                                      # same as: llm-queue queues list
+.venv/Scripts/python samples/_local.py queues        # the sample queues, without the CLI env
 ```
 
-With the AWS CLI (any credentials work against ElasticMQ):
+With `LLMQ_QUEUE_BACKEND=valkey` the CLI also manages the queues (on SQS that is infrastructure
+code, so these refuse):
+
+```bash
+llm-queue queues create --visibility-secs 60 --max-receives 10 --retention-secs 345600
+llm-queue queues redrive --queue llm-gpt20b          # DLQ messages back onto llm-gpt20b
+llm-queue queues purge --queue llm-gpt20b --yes      # purge works on SQS too
+```
+
+With the AWS CLI (SQS backend; any credentials work against ElasticMQ):
 
 ```bash
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=ap-south-1

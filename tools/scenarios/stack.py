@@ -110,6 +110,11 @@ async def leak_report(settings: Settings) -> dict[str, Any]:
 
 
 def _sqs(settings: Settings) -> Any:
+    """Queue admin client: ElasticMQ, or `ValkeyQueueClient` when `SCN_QUEUE_BACKEND=valkey`."""
+    if settings.queue_backend == "valkey":
+        from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+
+        return ValkeyQueueClient(redis_client(settings), prefix=settings.prefix, owns_redis=True)
     return get_session().create_client("sqs", region_name=REGION, endpoint_url=settings.sqs_url)
 
 
@@ -228,6 +233,9 @@ async def peek(settings: Settings, queue: str, max_messages: int = 10) -> list[d
 async def redrive(settings: Settings, queue: str) -> int:
     """Move every DLQ message of `queue` back (receive + send + delete); returns how many."""
     moved = 0
+    if settings.queue_backend == "valkey":
+        async with _sqs(settings) as client:
+            return int(await client.redrive(queue))
     async with _sqs(settings) as sqs:
         dlq = (await sqs.get_queue_url(QueueName=f"{queue}-dlq"))["QueueUrl"]
         src = (await sqs.get_queue_url(QueueName=queue))["QueueUrl"]

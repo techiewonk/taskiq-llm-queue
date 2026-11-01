@@ -7,10 +7,11 @@ Resolution order per provider name: `QueueConfig.providers` (`"pkg.mod:Class"`),
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 from collections.abc import Callable, Mapping
-from importlib.metadata import entry_points
+from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any
 
 from taskiq_llm_queue.errors import ConfigError
@@ -27,6 +28,17 @@ BUILTIN_PROVIDERS: Mapping[str, str] = {
     "bedrock": "taskiq_llm_queue.providers.bedrock:BedrockProvider",
     "openai": "taskiq_llm_queue.providers.openai_compat:OpenAICompatProvider",
 }
+
+
+@functools.cache
+def plugin_entry_points() -> dict[str, EntryPoint]:
+    """Provider plugins by name, scanned once per process.
+
+    The scan reads every installed distribution's metadata and holds the GIL for 0.2-0.6 s on
+    Windows; uncached, the first sync call (a new registry) stalled the event loop (S22).
+    """
+    return {ep.name: ep for ep in entry_points(group=ENTRY_POINT_GROUP)}
+
 
 ProviderFactory = Callable[["QueueConfig"], Provider]
 
@@ -80,11 +92,7 @@ class ProviderRegistry:
         self._providers: dict[str, Provider] = {}
         self._factories: dict[str, ProviderFactory] = {}
         injected = dict(factories or {})
-        plugins = (
-            {ep.name: ep for ep in entry_points(group=ENTRY_POINT_GROUP)}
-            if use_entry_points
-            else {}
-        )
+        plugins = plugin_entry_points() if use_entry_points else {}
         errors: list[str] = []
         names = {m.provider for m in config.models.values()} | set(config.providers)
         for name in sorted(names):

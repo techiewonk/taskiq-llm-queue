@@ -32,6 +32,7 @@ from taskiq_llm_queue.config import Lane, ModelSettings, create_redis, create_sy
 from taskiq_llm_queue.context import current_context
 from taskiq_llm_queue.core import CoreDeps, InflightAttempts, InfraError, JobResult, execute_job
 from taskiq_llm_queue.envelope import (
+    JOB_NAME_LABEL,
     TASK_CALL,
     TASK_EMBED,
     TASK_JOB,
@@ -236,6 +237,9 @@ class LLMQueue:
                 sqs_timeouts_to_failover=config.sqs_timeouts_to_failover,
                 local_cap_fallback=config.local_limit_cap,
                 model_caps=model_caps(config),
+                queues_on_state_valkey=(
+                    config.queue_backend == "valkey" and config.queue_redis_url is None
+                ),
             ),
             probe=self._probe_redis,
             metrics=self.metrics,
@@ -354,6 +358,39 @@ class LLMQueue:
             )
         if stored < SCHEMA_VERSION:
             logger.error("schema_migration_needed", key=key, stored=stored, expected=SCHEMA_VERSION)
+
+    async def _watch_queues(self) -> None:
+        """Valkey backend: `llmq_queue_depth{queue,state}` and `llmq_queue_oldest_seconds`.
+
+        Every `cfg_reload_secs`; every pod reports the same values (alarm on the maximum).
+        """
+        from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+        from taskiq_llm_queue.config import create_queue_redis
+
+        names = sorted(
+            {queue_name(v) for m in self.config.models.values() for v in m.queues.values()}
+            | {queue_name(v) for v in self.config.job_queues.values()}
+        )
+        redis = create_queue_redis(self.config, client_name=self._redis_name())
+        async with ValkeyQueueClient(redis, prefix=self.config.key_prefix, owns_redis=True) as q:
+            while True:
+                await asyncio.sleep(self.config.cfg_reload_secs)
+                for name in names:
+                    try:
+                        depth = await q.depth(name)
+                    except Exception:  # Valkey blip or missing queue: next round reports
+                        continue
+                    labels = {"queue": name}
+                    for kind in ("visible", "in_flight", "delayed", "dead"):
+                        safe_hook(
+                            self.metrics.gauge,
+                            mn.QUEUE_DEPTH,
+                            depth[kind],
+                            {**labels, "kind": kind},
+                        )
+                    safe_hook(
+                        self.metrics.gauge, mn.QUEUE_OLDEST_SECONDS, depth["oldest_secs"], labels
+                    )
 
     async def _watch_limits(
         self,
@@ -544,6 +581,8 @@ class LLMQueue:
             asyncio.create_task(self._watch_limits(limiter, breaker, rate), name="llmq-limits")
         )
         state.tasks.append(asyncio.create_task(self._watch_settings(state), name="llmq-settings"))
+        if config.queue_backend == "valkey" and not isinstance(self.metrics, NullMetrics):
+            state.tasks.append(asyncio.create_task(self._watch_queues(), name="llmq-queue-depth"))
         if self.router is None and config.routing_enabled:
             default = RoutingConfig.model_validate(config.routing_default)
             self._own_router = CanaryRouter(
@@ -810,7 +849,8 @@ class LLMQueue:
         }
         task = state.brokers.jobs.find_task(TASK_JOB)
         assert task is not None
-        await task.kicker().with_task_id(job_id).with_labels(queue_name=queue_name(queue)).kiq(body)
+        labels = {"queue_name": queue_name(queue), JOB_NAME_LABEL: name}
+        await task.kicker().with_task_id(job_id).with_labels(**labels).kiq(body)
         return job_id
 
     # ------------------------------------------------------------------ sync
@@ -1416,6 +1456,7 @@ class _SyncRunner:
         )
         self._thread.start()
         self._registry = ProviderRegistry(owner.config, factories=owner._factories)
+        self._registry.aws_session = _sync_session(owner.aws_session)
         self._redis: redis.Redis | None = None
         self._async_redis: Redis | None = None  # rate budgets; bound to this loop
         self._local_rate = LocalRateBudget(share=owner._pod_share)
@@ -1504,6 +1545,18 @@ def _new_aws_session() -> AioSession:
     from aiobotocore.session import get_session
 
     return get_session()
+
+
+def _sync_session(main: AioSession | None) -> AioSession:
+    """Session for the sync runner's loop, reusing the main session's parsed botocore data.
+
+    A fresh session re-parses botocore's endpoint and service JSON; `json.loads` holds the GIL
+    for 0.1-0.5 s, which stalled the caller's event loop on the first sync call (S22).
+    """
+    session = _new_aws_session()
+    if main is not None:
+        session.register_component("data_loader", main.get_component("data_loader"))
+    return session
 
 
 def _batch_ids(request_id: str, count: int) -> list[str]:

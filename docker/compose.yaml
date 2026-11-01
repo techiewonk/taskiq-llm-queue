@@ -51,6 +51,19 @@ services:
   # ---------------------------------------------------------------- scenario harness (profile scn)
   # An isolated stack for `python -m tools.scenarios`: chaos scenarios stop/kill these services,
   # never the shared ones above. Start: docker compose -f docker/compose.yaml --profile scn up -d --wait
+  # Persistent twin of valkey-scn, configured like a production queue server (AOF, fsync on
+  # every write, no eviction): `SCN_QUEUE_BACKEND=valkey` runs state and queues on it.
+  valkey-scn-persist:
+    image: valkey/valkey:8.1-alpine
+    profiles: ["scn"]
+    command: ["valkey-server", "--port", "16380", "--requirepass", "localdev", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    ports: ["16380:16380"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "16380", "-a", "localdev", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
   valkey-scn:
     image: valkey/valkey:8.1-alpine
     profiles: ["scn"]

@@ -102,6 +102,7 @@ class HybridSQSBroker(AsyncBroker):
         aws_session_token: str | None = None,
         client_config: AioConfig | None = None,
         session: AioSession | None = None,
+        client_factory: Callable[[], contextlib.AbstractAsyncContextManager[Any]] | None = None,
         max_inflight: int = 10,
         reserve_for_priority0: int = 0,
         min_slots_for_lower: int = 0,
@@ -120,7 +121,12 @@ class HybridSQSBroker(AsyncBroker):
         backoff_base_secs: float = 0.5,
         backoff_cap_secs: float = 20.0,
     ) -> None:
-        """Validate everything up front; no client or task is created until `startup()`."""
+        """Validate everything up front; no client or task is created until `startup()`.
+
+        `client_factory` returns an async context manager yielding an object with the SQS
+        client calls the broker makes (e.g. `ValkeyQueueClient`); unset, an aiobotocore SQS
+        client is created from `session`.
+        """
         super().__init__()
         errors = []
         if not queues:
@@ -149,6 +155,7 @@ class HybridSQSBroker(AsyncBroker):
         }
         self._client_config = client_config
         self._session = session
+        self._client_factory = client_factory
         self._scheduler = SlotScheduler(
             max_inflight,
             reserve_for_priority0=reserve_for_priority0,
@@ -229,7 +236,9 @@ class HybridSQSBroker(AsyncBroker):
         session = self._session or get_session()
         try:
             client: SQSClient = await stack.enter_async_context(
-                session.create_client("sqs", config=config, **self._client_kwargs)
+                self._client_factory()
+                if self._client_factory is not None
+                else session.create_client("sqs", config=config, **self._client_kwargs)
             )
             for queue in self._queues.values():
                 url = await self._resolve_url(client, queue)

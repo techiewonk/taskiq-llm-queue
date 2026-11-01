@@ -6,6 +6,26 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-02
+
+### Changed
+- Development status Alpha. `llm-queue queues` takes subcommands (`list` default, `create`, `redrive`, `purge`); `queues`, `status` and `job send` use the configured queue backend. Job messages carry their name in the `llmq_job` label (`send_job` and `llm-queue job send`); older messages still match by args.
+- Scenario harness: `SCN_QUEUE_BACKEND=valkey` runs every scenario on Valkey Streams against `valkey-scn-persist` (AOF `always`, `noeviction`); S20 and S33 are SQS-only, S33v Valkey-only.
+
+### Verified
+- 869 tests (unit, integration and every scenario on SQS): 866 pass, 2 skip by design; S27 at its full 450K-call default exceeds what one laptop load generator offers (196K in 30 min) and passes at the gate load (6K/min × 3 min, rt queue wait p95 1.1 s). All scenarios pass on Valkey; samples 01-17 exit 0 on both backends; real Bedrock: S01, S03, S04, S05, S16, S17, S19, S22, S26, S28, S29, S40, S41 pass.
+
+### Fixed
+- Jobs whose payload was offloaded to S3 were never run: the job filter read the job name from the args, which offload empties, so the message was released every 30 s until the DLQ. Jobs now carry the name in the `llmq_job` label (older messages still match by args). Scenario S24.
+- The first sync call stalled the caller's event loop 0.2-0.6 s: every new `ProviderRegistry` re-scanned all installed packages' entry points, holding the GIL. The scan now runs once per process. The sync runner's session also reuses the main session's parsed botocore data. A first burst of sync calls on real AWS still stalls the loop 0.1-1.8 s once per pod while clients and HTTPS connections are built (S22 reports it as `cold_burst_lag_ms`); warm bursts stay under 60 ms.
+- Tracing: `QueuedChatBedrockConverse` and `QueuedChatOpenAI` now default `name` to the parent class, so Langfuse / LangSmith generations keep the name `ChatBedrockConverse` / `ChatOpenAI`. After a fallback, `llm_output["model_name"]` is the Bedrock id that served the call, so tracers show and price the right model.
+
+### Added
+- Valkey Streams queue backend: `queue_backend="valkey"` (`LLMQ_QUEUE_BACKEND`), optional `queue_redis_url` (`LLMQ_QUEUE_REDIS_URL`). `ValkeyQueueClient` (`broker/valkey_queue.py`) serves the SQS calls `HybridSQSBroker` makes (visibility, receipt-handle generations, delay, DLQ after `maxReceiveCount`, long polls woken by pub/sub), so the broker and everything above it are unchanged; `HybridSQSBroker(client_factory=...)` is the hook. CLI `queues create | list | redrive | purge`; gauges `llmq_queue_depth{queue,kind}` and `llmq_queue_oldest_seconds{queue}`. FIFO queues are refused. A client re-creates a queue it knew when its keys vanish (restart without persistence); release deadlines and idle re-checks are jittered so the releasing pod does not always win the message back; with the queues on the state Valkey, Valkey recovering also ends the queue failover windows (`FailoverSettings.queues_on_state_valkey`). All scenarios pass on Valkey except the SQS-only S20 / S33 (skipped; S33v measures Valkey). Plan and results: docs/VALKEY_QUEUE_PLAN.md.
+- Scenarios S04 (LangChain / LangGraph drop-in: `ainvoke`, `abatch`, lanes from `request_context`, `bind_tools`, structured output, a LangGraph tool loop, sync `invoke`, queued embeddings), S24 (S3 offload through an in-process moto S3) and S33 (SQS call counts through a counting proxy: bg sends and acks batched, rt single, idle long polls bounded). They replace the three skipped placeholders.
+- `SCN_AWS_LOW_VOLUME=1` lets `SCN_PROVIDER=aws` run scenarios marked `low-volume`. S10, S11, S18, S23, S37, S47 and S49 are now marked not AWS-safe, because they inject faults or read the fakellm call log.
+- Sample `17_langgraph_rag_agent.py`: an app-style graph with queued embeddings for retrieval, a structured-output router, a tool loop with `fallback_policy="chain"`, a bg-lane summary node, `stream_mode="updates"` and a sync `.invoke()`.
+
 ## [0.1.0a2] - 2026-10-30
 
 ### Added

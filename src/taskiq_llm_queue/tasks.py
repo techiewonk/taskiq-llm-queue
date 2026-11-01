@@ -27,6 +27,7 @@ from taskiq_llm_queue.broker.broker import (
 )
 from taskiq_llm_queue.core import InfraError, execute_job
 from taskiq_llm_queue.envelope import (
+    JOB_NAME_LABEL,
     TASK_CALL,
     TASK_EMBED,
     TASK_JOB,
@@ -430,6 +431,9 @@ def job_filter(runtime: WorkerRuntime) -> Callable[[Any], bool]:
     def accept(message: Any) -> bool:
         if message.task_name != TASK_JOB:
             return True
+        labelled = (message.labels or {}).get(JOB_NAME_LABEL)
+        if labelled is not None:  # also set when the args were offloaded to S3
+            return labelled in runtime.jobs
         args = [*message.args, *message.kwargs.values()]
         return any(isinstance(a, dict) and a.get("job") in runtime.jobs for a in args)
 

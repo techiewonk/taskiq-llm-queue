@@ -43,6 +43,8 @@ class FailoverSettings:
     `model_caps` (alias -> `max_concurrency`) bounds every local cap of that alias too.
     `sqs_timeouts_to_failover`: send timeouts (ambiguous, unlike a refused send) within a
     minute before the model fails over; the timed-out call itself still runs direct.
+    `queues_on_state_valkey`: the queues live on the state Valkey (`queue_backend=valkey`
+    without `queue_redis_url`), so Valkey coming back also ends every queue failover window.
     """
 
     sqs_failover_secs: float = 300.0
@@ -52,6 +54,7 @@ class FailoverSettings:
     local_cap_fallback: int = 20
     live_pods: int = 0
     model_caps: Mapping[str, int] = field(default_factory=dict)
+    queues_on_state_valkey: bool = False
 
     def __post_init__(self) -> None:
         """Reject impossible values at construction (boot time)."""
@@ -215,8 +218,16 @@ class FailoverState:
             self._redis_backoff = self.settings.redis_retry_min_secs
             self._busy = {k: lim for k, lim in self._local.items() if lim.inflight(*k) > 0}
             self._local.clear()
+            # Valkey queues on this Valkey: their sends failed for the same outage (S21).
+            reopened = list(self._sqs_until) if self.settings.queues_on_state_valkey else []
+            for alias in reopened:
+                del self._sqs_until[alias]
+                self._sqs_timeouts.pop(alias, None)
         logger.warning("valkey_local_mode_ended")
         self._gauge(0.0, {"kind": "redis"})
+        for alias in reopened:
+            logger.warning("sqs_failover_ended", model=alias, reason="valkey_back")
+            self._gauge(0.0, {"model": alias, "kind": "sqs"})
 
     def redis_down(self) -> bool:
         """True while Valkey is considered down (probe running, or inside the backoff window)."""

@@ -177,3 +177,19 @@ def test_settings_from_env_and_validation() -> None:
         FailoverSettings.from_env({"LLMQ_SQS_FAILOVER_SECS": "x", "LLMQ_LOCAL_LIMIT_CAP": "y"})
     with pytest.raises(ConfigError):
         FailoverSettings(sqs_failover_secs=0)
+
+
+@pytest.mark.parametrize("on_state_valkey", [True, False])
+def test_valkey_back_ends_queue_windows_only_when_queues_live_on_it(on_state_valkey: bool) -> None:
+    """S21 on the Valkey backend: sends failed for the same outage, so Valkey coming back ends
+    the queue failover windows; with SQS (or a separate queue Valkey) the window runs on."""
+    clock, gauges = Clock(), Gauges()
+    settings = FailoverSettings(queues_on_state_valkey=on_state_valkey)
+    state = FailoverState(settings, metrics=gauges, clock=clock)
+    state.report_redis_failure(ConnectionError("down"))
+    state.report_sqs_failure("gpt20b", ConnectionError("queue down too"))
+    assert state.path_override("gpt20b") == "direct"
+    state.report_redis_ok()
+    clock.now += 31  # past the Valkey retry backoff
+    expected = None if on_state_valkey else "direct"
+    assert state.path_override("gpt20b") == expected

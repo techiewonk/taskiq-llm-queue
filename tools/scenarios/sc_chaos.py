@@ -14,7 +14,7 @@ from collections import Counter
 from tools.scenarios import api, stack
 from tools.scenarios.common import Stream, calls, one, redis_call, wait_until
 from tools.scenarios.env import GPT20B_PRIMARY
-from tools.scenarios.harness import Ctx, scenario
+from tools.scenarios.harness import Ctx, ScenarioSkipped, scenario
 
 
 def _ok_once(ctx: Ctx, replies: list[api.Reply], ok200: dict[str, int], rids: list[str]) -> None:
@@ -109,6 +109,10 @@ async def s20(ctx: Ctx) -> None:
     Back to sqs once SQS returns and the failover window closes. The send is bounded by
     `sqs_send_timeout_secs` (it hung ~50-70 s on a dead pooled connection before).
     """
+    if ctx.settings.queue_backend == "valkey":
+        raise ScenarioSkipped(
+            "SQS-only: on the Valkey backend the queue goes down with Valkey (S21)"
+        )
     cfg = ctx.config(sqs_failover_secs=15.0)
     await ctx.workers(1, cfg)
     q = await ctx.queue(cfg)
@@ -164,12 +168,16 @@ async def s21(ctx: Ctx) -> None:
     )
     await stack.start_service(ctx.settings.valkey_service)
 
+    probes: list[str] = []  # how each post-recovery call was served (or why it failed)
+
     async def healthy() -> bool:
         r = await one(ctx, q, f"h{time.monotonic_ns()}", timeout_secs=20)
+        probes.append(r.meta.worker.split(":")[0] if r.ok else f"{r.error_kind}:{r.error!r}"[:90])
         return r.ok and not r.meta.worker.startswith("direct")
 
     back = await wait_until(healthy, timeout_secs=90, every=1)
     ctx.metric("back_to_sqs_after_s", back)
+    ctx.metric("recovery_probes", dict(Counter(probes)))
     ctx.expect(
         all(r.ok for r in during),
         f"calls failed while Valkey was down: "
@@ -178,7 +186,7 @@ async def s21(ctx: Ctx) -> None:
     ctx.expect(back is not None, "not back to normal 90 s after Valkey returned")
 
 
-@scenario("S47", "Manual pause/resume of a worker", aws_safe="low-volume")
+@scenario("S47", "Manual pause/resume of a worker", aws_safe="no")
 async def s47(ctx: Ctx) -> None:
     """`pause_receiving` stops a pod taking work (backlog waits); resume drains it."""
     (w1,) = await ctx.workers(1)
@@ -225,7 +233,7 @@ async def s48(ctx: Ctx) -> None:
     ctx.expect(reply.ok, f"call lost after the config was restored: {reply.error!r}")
 
 
-@scenario("S49", "Long call > visibility timeout", tags=("slow",), aws_safe="low-volume")
+@scenario("S49", "Long call > visibility timeout", tags=("slow",), aws_safe="no")
 async def s49(ctx: Ctx) -> None:
     """A 90 s provider call on a 60 s-visibility queue runs exactly once (heartbeat extends)."""
     await ctx.workers(2)

@@ -117,6 +117,7 @@ async def main() -> None:
                 config.redis_password.get_secret_value() if config.redis_password else ""
             ),
             "LLMQ_SQS_ENDPOINT_URL": str(config.sqs_endpoint_url),
+            "LLMQ_QUEUE_BACKEND": config.queue_backend,
             "LLMQ_AWS_REGION": str(config.aws_region),
             "LLMQ_MODELS": json.dumps(
                 {k: v.model_dump(mode="json") for k, v in config.models.items()}

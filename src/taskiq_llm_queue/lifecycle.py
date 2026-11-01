@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from redis.asyncio import Redis
     from taskiq import AsyncResultBackend
 
+    from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
     from taskiq_llm_queue.config import ModelConfig, QueueConfig
     from taskiq_llm_queue.metrics import MetricsSink
     from taskiq_llm_queue.protocols import Lease, ReceiveGate
@@ -374,6 +375,9 @@ def build_brokers(
         "release_running_on_shutdown": True,
         "session": session,
     }
+    valkey = config.queue_backend == "valkey"
+    if valkey:
+        common["client_factory"] = valkey_client_factory(config)
     wait = config.sqs_batch_wait_secs
     batching = Batching(timeout_secs=wait) if wait > 0 else None
     for alias, model in config.models.items():
@@ -388,7 +392,7 @@ def build_brokers(
         queues = [
             SQSQueue(
                 name=queue_name(value),
-                url=value if "://" in value else None,
+                url=value if "://" in value and not valkey else None,
                 priority=QUEUE_PRIORITY[kind],
                 wait_time_secs=config.sqs_wait_time_secs,
                 gate=gate,
@@ -417,7 +421,7 @@ def build_brokers(
             [
                 SQSQueue(
                     name=queue_name(v),
-                    url=v if "://" in v else None,
+                    url=v if "://" in v and not valkey else None,
                     wait_time_secs=config.sqs_wait_time_secs,
                 )
                 for v in job_queues
@@ -431,6 +435,27 @@ def build_brokers(
         register_tasks(jobs, runtime)
         brokers.jobs = jobs
     return brokers
+
+
+def valkey_client_factory(config: QueueConfig) -> Callable[[], ValkeyQueueClient]:
+    """Per-broker `ValkeyQueueClient` factory (own pool; closed with the broker).
+
+    FIFO queue names are refused here, at boot: Valkey queues have no group ordering.
+    """
+    from taskiq_llm_queue.broker.valkey_queue import ValkeyQueueClient
+    from taskiq_llm_queue.config import create_queue_redis
+    from taskiq_llm_queue.errors import ConfigError
+
+    names = {v for m in config.models.values() for v in m.queues.values()}
+    fifo = sorted(n for n in names | set(config.job_queues.values()) if n.endswith(".fifo"))
+    if fifo:
+        raise ConfigError(f"queue_backend=valkey does not support FIFO queues: {fifo}")
+
+    def factory() -> ValkeyQueueClient:
+        redis = create_queue_redis(config, client_name="llmq-queues")
+        return ValkeyQueueClient(redis, prefix=config.key_prefix, owns_redis=True)
+
+    return factory
 
 
 def _add_offload(broker: HybridSQSBroker, config: QueueConfig, session: AioSession | None) -> None:

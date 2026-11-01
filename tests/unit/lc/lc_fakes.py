@@ -116,6 +116,7 @@ class FakeQueueClient:
     converse_response: dict[str, Any] = field(default_factory=lambda: CONVERSE_TOOL_RESPONSE)
     chat_response: dict[str, Any] = field(default_factory=lambda: CHAT_TEXT_RESPONSE)
     error: Exception | None = None
+    meta: CallMeta = META
     calls: list[tuple[str, str, Any, dict[str, Any]]] = field(default_factory=list)
 
     def _record(self, op: str, model: str, payload: Any, kwargs: dict[str, Any]) -> None:
@@ -125,7 +126,7 @@ class FakeQueueClient:
 
     def _converse(self, op: str, model: str, request: dict[str, Any], **kw: Any) -> Any:
         self._record(op, model, request, kw)
-        return FakeResult(copy.deepcopy(self.converse_response), META)
+        return FakeResult(copy.deepcopy(self.converse_response), self.meta)
 
     async def converse(self, model: str, request: dict[str, Any], **kw: Any) -> Any:
         return self._converse("converse", model, request, **kw)

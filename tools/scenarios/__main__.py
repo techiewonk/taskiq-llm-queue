@@ -26,10 +26,10 @@ def _run(args: argparse.Namespace) -> int:
     specs = harness.select(args.ids, args.tag)
     settings = Settings()
     if settings.aws:
-        unsafe = [s.id for s in specs if s.aws_safe != "yes"]
+        unsafe = [s.id for s in specs if not harness.aws_allowed(s)]
         if unsafe and args.ids:
             raise SystemExit(f"SCN_PROVIDER=aws refuses scenarios that are not aws-safe: {unsafe}")
-        specs = [s for s in specs if s.aws_safe == "yes"]
+        specs = [s for s in specs if harness.aws_allowed(s)]
     run_dir = Path(args.run_dir) if args.run_dir else harness.default_run_dir()
     print(f"run dir: {run_dir}  ({len(specs)} scenarios)", flush=True)
     results = asyncio.run(harness.run_many(specs, settings, run_dir))

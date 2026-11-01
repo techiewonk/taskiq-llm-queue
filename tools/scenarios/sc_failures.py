@@ -433,7 +433,7 @@ async def s36(ctx: Ctx) -> None:
     await ctx.final_checks()
 
 
-@scenario("S37", "Live target change (skip_targets) mid-run", aws_safe="low-volume")
+@scenario("S37", "Live target change (skip_targets) mid-run", aws_safe="no")
 async def s37(ctx: Ctx) -> None:
     """Region throttled, apac serving; then `skip_targets: apac` is set live.
 

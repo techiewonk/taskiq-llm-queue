@@ -111,17 +111,20 @@ async def r03(ctx: Ctx) -> None:
     backlog = asyncio.create_task(calls(ctx, q, 150, lane="bg", tag="bg", timeout_secs=400))
     await asyncio.sleep(5)
     waits = []
+    split: list[tuple[int, int]] = []  # (queue wait, provider) ms per rt call
     for i in range(15):
         t0 = time.monotonic()
         reply = await one(ctx, q, i, tag="rt", lane="rt", timeout_secs=30)
         if reply.ok:
             waits.append(time.monotonic() - t0)
+            split.append((reply.meta.queue_wait_ms, reply.meta.provider_ms))
         await asyncio.sleep(4)
     backlog.cancel()
     bg_minutes = _per_minute(await _starts(ctx, "bg"))
     full = list(bg_minutes.values())[1:-1] or list(bg_minutes.values())
     ctx.metric("rt_ok", len(waits))
     ctx.metric("rt_p95_s", round(percentile(waits, 95), 2) if waits else None)
+    ctx.metric("rt_wait_provider_ms", split)
     ctx.metric("bg_starts_per_minute", list(bg_minutes.values()))
     ctx.expect(len(waits) == 15, f"rt calls ok: {len(waits)}/15")
     ctx.expect(bool(waits) and percentile(waits, 95) <= 2.0, "rt waited too long for a token")

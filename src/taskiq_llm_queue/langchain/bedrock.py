@@ -138,6 +138,8 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         )
         if isinstance(values, dict):
             values["disable_streaming"] = True
+            # Traces (Langfuse, LangSmith) keep the parent's run name, so dashboards still match.
+            values.setdefault("name", ChatBedrockConverse.__name__)
         return values
 
     def _queue(self) -> QueueClient:
@@ -195,6 +197,12 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         meta = result.meta.model_dump()
         for generation in chat.generations:
             generation.message.response_metadata.update(meta)
+        served = result.meta.served_model.partition("@")[0]
+        if served and served != self._alias.partition("@")[0]:
+            # Fallback: report the model that answered (tracers price by `llm_output`).
+            models = getattr(getattr(self._queue(), "config", None), "models", {})
+            served_id = models[served].model_id if served in models else served
+            chat.llm_output = {**(chat.llm_output or {}), "model_name": served_id}
         return chat
 
     def _generate(
