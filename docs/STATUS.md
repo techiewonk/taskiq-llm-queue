@@ -1,6 +1,6 @@
 # Status: features, issues, solutions and results
 
-Snapshot **2026-10-30**. PyPI has **`0.1.0a2`** (tag `v0.1.0a2`, `037b6c0`): every feature below marked "main only" is in it. Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
+Snapshot **2026-11-02**. PyPI has **`0.2.0`** (tag `v0.2.0`, `dd8b3fe`, CI green): Valkey Streams queue backend plus the fixes in the CHANGELOG; earlier rows are in it too. Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
 v0.30 in the app repo; rate-limit design: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
 
 Legend: ✅ built and verified · 🟡 built, partly verified or with a known limit · 🔵 proposed / agreed, not built · ❌ open problem
@@ -35,6 +35,7 @@ Legend: ✅ built and verified · 🟡 built, partly verified or with a known li
 | F22 | Metrics: `llmq_inflight`, `llmq_breaker_open`, SQS counters per queue | ✅ 0.1.0a2 | client, lifecycle | — | unit tests |
 | F23 | S3 offload for messages over 200 KB (`s3_offload_bucket`) | ✅ 0.1.0a2 | lifecycle, client | — | integration test (moto S3 + ElasticMQ) |
 | F24 | Send batching for bg / bulk (`sqs_batch_wait_secs` 0.02 s) | ✅ 0.1.0a2 | lifecycle | — | S35, S35b, S35c, S23, S27 PASS |
+| F25 | Valkey Streams queue backend (`LLMQ_QUEUE_BACKEND=valkey`): same broker over an SQS-shaped client; CLI `queues create/list/redrive/purge`; depth gauges | ✅ 0.2.0 | broker/valkey_queue.py | all (backend switch) | client 13/13, broker suite on both backends, every scenario on Valkey, samples 01-17 on both, V7 numbers in VALKEY_QUEUE_PLAN.md |
 
 ## 2. Issues found and their solutions
 
