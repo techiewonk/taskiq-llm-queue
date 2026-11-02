@@ -1,6 +1,6 @@
 # Scenario worker: the package plus tools/scenarios, slim. Build context is the package root;
 # worker.Dockerfile.dockerignore keeps .venv, caches and secrets out of the context.
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
