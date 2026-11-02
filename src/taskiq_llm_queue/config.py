@@ -30,6 +30,25 @@ BUILTIN_PROVIDERS = frozenset({"bedrock", "openai"})
 ProviderKind = str
 ENV_PREFIX = "LLMQ_"
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+# SQS queue name rule, applied on both backends so one config works on either: 1-80 of
+# letters, digits, `-`, `_` (`.fifo` counted in). Also keeps `{`/`}` out of Valkey key tags.
+_QUEUE_NAME_RE = re.compile(r"^(?:[A-Za-z0-9_-]{1,80}|[A-Za-z0-9_-]{1,75}\.fifo)$")
+
+
+def _bad_queue_names(names: Mapping[str, str]) -> dict[str, str]:
+    """Entries of `names` whose queue name (or a URL's last segment) breaks the SQS name rule."""
+    bad = {}
+    for key, name in names.items():
+        short = (
+            name.rstrip("/").rsplit("/", 1)[-1]
+            if name.startswith(("https://", "http://"))
+            else name
+        )
+        if not _QUEUE_NAME_RE.match(short):
+            bad[key] = name
+    return bad
+
+
 # Key of the BLAKE2b hash behind hashed ids and canary buckets. Public and fixed, so only good
 # for local use: set your own `LLMQ_ID_HASH_SALT` in production (all pods must share it).
 DEFAULT_ID_HASH_SALT = "taskiq-llm-queue/id-hash/v1"
@@ -79,6 +98,13 @@ class ModelConfig(BaseModel):
         "clustered throttles.",
     )
     api_key_env: str | None = None
+
+    @field_validator("queues")
+    @classmethod
+    def _queue_names_valid(cls, value: dict[str, str]) -> dict[str, str]:
+        if bad := _bad_queue_names(value):
+            raise ValueError(f"invalid queue names (1-80 of A-Z a-z 0-9 - _, or .fifo): {bad}")
+        return value
 
     @field_validator("targets")
     @classmethod
@@ -415,6 +441,13 @@ class QueueConfig(BaseModel):
         size = len(value.get_secret_value().encode("utf-8"))
         if not 1 <= size <= _MAX_SALT_BYTES:
             raise ValueError(f"id_hash_salt must be 1-{_MAX_SALT_BYTES} bytes, got {size}")
+        return value
+
+    @field_validator("job_queues")
+    @classmethod
+    def _job_queue_names_valid(cls, value: dict[str, str]) -> dict[str, str]:
+        if bad := _bad_queue_names(value):
+            raise ValueError(f"invalid job queue names (1-80 of A-Z a-z 0-9 - _): {bad}")
         return value
 
     @field_validator("models")

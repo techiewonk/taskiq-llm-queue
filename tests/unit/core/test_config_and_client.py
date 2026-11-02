@@ -334,3 +334,32 @@ async def test_schema_key_written_once_and_newer_state_refused(
     await q._check_schema(redis)
     assert "schema_migration_needed" in caplog.text
     assert await redis.get(key) == str(SCHEMA_VERSION - 1).encode()  # never overwritten
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "llm-gpt20b-rt",
+        "mofsl-dev-researcha-llm-gpt120b-rt",
+        "Team_B_Fast",
+        "q" * 80,
+        "jobs.fifo",
+        "https://sqs.ap-south-1.amazonaws.com/123456789012/llm-custom-rt",
+    ],
+)
+def test_custom_queue_names_accepted(name: str) -> None:
+    """Any SQS-valid name (or queue URL) works for model lanes and job queues on both backends."""
+    model = ModelConfig(provider="bedrock", model_id="m", queues={"rt": name, "default": "base"})
+    config = QueueConfig(models={"m": model}, job_queues={"ingest": name})
+    assert config.models["m"].queues["rt"] == name
+    assert config.job_queues["ingest"] == name
+
+
+@pytest.mark.parametrize("name", ["", "bad name", "llm{x}", "q" * 81, "llm.v2", "jobs.fifo.x"])
+def test_invalid_queue_names_refused_at_build(name: str) -> None:
+    """Bug: invalid names passed config and failed at start as "does not exist"; and on Valkey
+    `queues create` made them, braces breaking the key's hash tag. Now refused when built."""
+    with pytest.raises(ValueError, match="invalid queue names"):
+        ModelConfig(provider="bedrock", model_id="m", queues={"rt": name, "default": "base"})
+    with pytest.raises(ValueError, match="invalid job queue names"):
+        QueueConfig(job_queues={"ingest": name})

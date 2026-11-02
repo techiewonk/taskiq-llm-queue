@@ -6,6 +6,15 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+### Changed
+
+- Queue names (model `queues` and `job_queues`) are checked when the config is built: 1-80 of
+  `A-Z a-z 0-9 - _`, `<name>.fifo`, or an SQS queue URL, on both backends. Before, a bad name
+  passed and failed at start as "does not exist", and on Valkey `queues create` made it (a `{`
+  or `}` broke the key's hash tag).
+- The missing-queue error at start names the fix for each backend (`llm-queue queues create`
+  on Valkey) instead of only SQS's.
+
 ## [0.2.1] - 2026-11-02
 
 Re-release of 0.2.0 with no code changes, published by `publish.yml` (PyPI trusted publishing)

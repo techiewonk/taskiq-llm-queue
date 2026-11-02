@@ -314,6 +314,17 @@ Every duration ends in `_SECS` (milliseconds in `_MS`). Old spellings from pre-r
 
 A queued `bg`/`bulk` call waits at most 15 s for a slot, then goes back to the queue with a delay instead of holding a worker.
 
+**Queue names are yours.** Every model maps its lanes to any queue names you choose, and models may share a set (the embedding models above do) or each have their own; jobs map a job name to a queue in `job_queues`. Names follow the SQS rule on both backends, so one config works on either: 1–80 of `A-Z a-z 0-9 - _` (or `<name>.fifo` on SQS), or an SQS queue URL. Anything else is refused when the config is built.
+
+```python
+models={
+    "gpt120b": ModelConfig(..., queues={"rt": "mofsl-uat-researcha-llm-gpt120b-rt",
+                                        "default": "mofsl-uat-researcha-llm-gpt120b"}),
+    "titan":   ModelConfig(..., queues={"rt": "emb-live", "default": "emb-bg", "bulk": "emb-ingest"}),
+},
+job_queues={"ingest": "jobs-ingest", "report": "nightly-report"},
+```
+
 ### Queue backend: SQS or Valkey Streams
 
 Queues live on Amazon SQS by default. `LLMQ_QUEUE_BACKEND=valkey` puts them on Valkey Streams instead, with the same queue names and the same delivery rules: visibility timeout with heartbeat, release with a delay, redelivery after a pod dies, a DLQ after `maxReceiveCount`, delays, expiry, strict lane priority and batched send / ack. The broker is unchanged: `ValkeyQueueClient` answers the SQS calls it makes ([docs/VALKEY_QUEUE_PLAN.md](https://github.com/techiewonk/taskiq-llm-queue/blob/main/docs/VALKEY_QUEUE_PLAN.md)).

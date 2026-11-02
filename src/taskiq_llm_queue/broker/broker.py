@@ -860,7 +860,8 @@ class HybridSQSBroker(AsyncBroker):
         except Exception as exc:
             if classify_error(exc) is ErrorFamily.NOT_FOUND:
                 raise BrokerConfigError(
-                    f"SQS queue {queue.name!r} does not exist (create it or set is_declare=True)"
+                    f"queue {queue.name!r} does not exist (SQS: create it in your infrastructure "
+                    "or set is_declare=True; Valkey backend: run `llm-queue queues create`)"
                 ) from exc
             raise
 
