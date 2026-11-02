@@ -6,6 +6,12 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-02
+
+Re-release of 0.2.0 with no code changes, published by `publish.yml` (PyPI trusted publishing)
+so the files carry provenance attestations. 0.2.0 was uploaded by hand without them and is yanked;
+use 0.2.1.
+
 ## [0.2.0] - 2026-11-02
 
 ### Changed

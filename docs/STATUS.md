@@ -1,6 +1,6 @@
 # Status: features, issues, solutions and results
 
-Snapshot **2026-11-02**. PyPI has **`0.2.0`** (tag `v0.2.0`, `dd8b3fe`, CI green): Valkey Streams queue backend plus the fixes in the CHANGELOG; earlier rows are in it too. Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
+Snapshot **2026-11-02**. PyPI has **`0.2.1`** (tag `v0.2.1`, published by `publish.yml` with provenance; 0.2.0 was a hand upload without it and is yanked): Valkey Streams queue backend plus the fixes in the CHANGELOG; earlier rows are in it too. Plan: `docs/BEDROCK_SQS_QUEUE_PLAN.md`
 v0.30 in the app repo; rate-limit design: [RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md).
 
 Legend: ✅ built and verified · 🟡 built, partly verified or with a known limit · 🔵 proposed / agreed, not built · ❌ open problem
