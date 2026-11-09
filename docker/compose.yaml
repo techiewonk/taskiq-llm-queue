@@ -19,7 +19,7 @@ x-llmq-env: &llmq-env
 services:
   valkey:
     # Prod runs Valkey 8.x on ElastiCache; password required, TLS off locally (the app's VALKEY_SSL=false).
-    image: valkey/valkey:8.1-alpine
+    image: valkey/valkey:9.2-alpine
     command: ["valkey-server", "--requirepass", "localdev", "--save", "", "--appendonly", "no"]
     ports: ["6379:6379"]
     healthcheck:
@@ -54,7 +54,7 @@ services:
   # Persistent twin of valkey-scn, configured like a production queue server (AOF, fsync on
   # every write, no eviction): `SCN_QUEUE_BACKEND=valkey` runs state and queues on it.
   valkey-scn-persist:
-    image: valkey/valkey:8.1-alpine
+    image: valkey/valkey:9.2-alpine
     profiles: ["scn"]
     command: ["valkey-server", "--port", "16380", "--requirepass", "localdev", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
     ports: ["16380:16380"]
@@ -65,7 +65,7 @@ services:
       retries: 15
 
   valkey-scn:
-    image: valkey/valkey:8.1-alpine
+    image: valkey/valkey:9.2-alpine
     profiles: ["scn"]
     command: ["valkey-server", "--port", "16379", "--requirepass", "localdev", "--save", "", "--appendonly", "no"]
     ports: ["16379:16379"]
