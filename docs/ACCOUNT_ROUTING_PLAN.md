@@ -162,7 +162,13 @@ processes and cannot herd.
   deployment, the costs (1 request, the token estimate), the priority flag, and a random number for
   `spread` (scripts do not draw their own).
 - **Usable** = enabled by the operator, not disabled by health, breaker not open, not paused, not
-  slow.
+  slow, and inside the call's `allowed_regions` / `allowed_accounts` when it has them.
+- **Retries go to the next deployment.** After a retryable failure (5xx, timeout) the retry runs
+  `PICK_TAKE` again without the deployment that just failed, so it lands on another region or
+  account when one is usable, and on the same one only when it is the only one.
+- **A deployment added live takes its full share at once**: its adaptive limiter starts at its
+  cap (`max_concurrency`, else the limiter maximum) instead of `limiter_initial`, and still cuts
+  on throttles.
 - **Refusal** returns the shortest wait among the candidates; a deferred call comes back after
   that long.
 - **Provider budget** (`shared_rpm` / `shared_tpm`, when set) keeps its own `RATE` call after
@@ -540,8 +546,8 @@ Everything is live-editable except the rows marked *deploy*.
 | `rate_limits` | `both` (chat), `rpm` (embedding) | D, A, M, R | Which budgets are enforced: `both`, `rpm`, `tpm`, `off`; switches enforcement without deleting the numbers |
 | `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
-| `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | Token bucket or calendar minute; burst allowance |
-| `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Cap and start value of calls in flight per deployment |
+| `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | `smooth` (default: starts spread evenly, small burst allowance) or `fixed` (calendar minute) |
+| `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Hard cap and start value of calls in flight per deployment. The adaptive limiter stays on next to RPM / TPM as the safety net when the real quota is lower |
 | `priority_reserve` | 0.2 | D, M | Share of quota and slots only priority calls may use |
 | `normal_min_share` | 0.1 | D, M | Share priority calls cannot take |
 | `timeout_secs` | 90 | D, A, M + per call | Deadline of a call, queue wait included |
@@ -570,7 +576,10 @@ Everything is live-editable except the rows marked *deploy*.
 
 **Per call** (all optional): `priority`, `timeout_secs`, `max_wait_secs`, `session_id`,
 `user_id`, `tenant_id`, `request_id`, `allow_fallback` (`all`, the default; `regions`: region
-fallback only; `none`: confirmed deployments of this model only), and the inference parameters.
+fallback only; `none`: confirmed deployments of this model only), `allowed_regions` /
+`allowed_accounts` (the balancer, the region fallback and the model fallback choose only among
+these; not a pin, the balancer still decides inside the set; a filter that leaves no deployment
+fails at once with `no_deployment`), and the inference parameters.
 
 #### Inference parameters (temperature and the rest)
 
@@ -669,7 +678,8 @@ sweep, alert) is taken with a short Valkey lock, so it is correct for any number
 |---|---|
 | `await llmq.status(model=, account=, region=, by=)` | Per model × deployment: waiting (priority and normal), in progress, started this minute, RPM / TPM used and left, concurrency limit, breaker, paused, enabled, healthy, p95 latency |
 | `await llmq.request_status(request_id)` | State, deployment, priority, attempts, timings, error kind |
-| HTTP (extra `[http]`) | Read-only FastAPI router the app mounts with its own auth dependency: `/status`, `/requests/{id}`, `/registry` (secret references and role ARNs redacted) |
+| HTTP (extra `[http]`) | Read-only FastAPI router the app mounts with its own auth dependency: `/status`, `/requests/{id}`, `/registry` (secret references and role ARNs redacted), and `/health` without auth |
+| Health | `await llmq.health()` and `GET /llmq/health`: 200 when the stores are reachable and the registry is loaded; 503 while draining or when no deployment of any model is usable; no details in the body |
 | CLI | `llm-queue status --by account\|region\|model --watch`, `llm-queue request ID`, `llm-queue registry get\|set\|enable\|disable\|import\|diff` |
 
 - **Metrics** carry model + account + region (+ `priority` on wait-time metrics), to CloudWatch EMF or
@@ -964,6 +974,10 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B49 | TPM is the tighter limit: RPM 1,000, TPM 100K, calls of ~2K tokens | starts per minute ≈ 50, tokens per minute ≤ 100K in every window on every deployment; RPM never the reason for a refusal |
 | B50 | Token refunds: 30 % of attempts throttled by the provider; calls that use far fewer tokens than `max_tokens` | throttled attempts return their tokens (throughput within 5 % of the no-throttle run); the budget follows real usage, not the reservations |
 | B51 | Usage missing in a chat response, a stream cut mid-way, `tpm_output_weight=5`, a request larger than `tpm`; `rate_limits` switched live from `both` to `rpm` and to `off` and back | estimate kept and counted as missing; partial stream charged for what was received; weighted tokens held under the quota; `request_too_large` at once; each switch applies within `cfg_reload_secs` and only the enabled budgets refuse calls |
+| B52 | A call with `allowed_regions` of two of four regions; one of the two exhausted; a filter matching nothing | only the allowed regions are used, also for fallback and model fallback; `no_deployment` at once for the empty set |
+| B53 | One region returns 5xx on every call | each retry lands on another deployment; 0 failed calls while another region is usable; the breaker opens for the bad one |
+| B54 | A deployment added live to a busy model | it takes its quota share within one reload, no ramp; throttles still cut it |
+| B55 | Health: stores reachable; state store down; draining; every deployment disabled | 200; 503; 503; 503 from the Python call and the route |
 
 ## 6. Work plan by release
 
@@ -1054,7 +1068,7 @@ off (uat / prod today) there is nothing to drain.
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
 | E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
-| E41 | Tests | fakellm scenarios B01-B51; a small `live` suite off by default; balancing bench gated |
+| E41 | Tests | fakellm scenarios B01-B55; a small `live` suite off by default; balancing bench gated |
 | E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
@@ -1078,6 +1092,14 @@ off (uat / prod today) there is nothing to drain.
 | E65 | Edit rights and audit | Whoever can reach the CLI / the store may edit; every edit records the actor, time, before and after; the audit stream is kept 90 days (`audit_retention_days`) |
 | E66 | Token accounting | A chat call is admitted on RPM and TPM together; tokens are estimated, then corrected from real usage; refunds on throttles, partial charge on failures and cut streams; output weight, estimate-quality metric, `request_too_large` (§3.7a) |
 | E67 | Budgets on and off | `rate_limits` = `both` / `rpm` / `tpm` / `off` per model (live, every level). Default `both` for chat and `rpm` for embeddings; an embedding model may turn token limiting on |
+| E68 | Retry target | The next usable deployment, not the one that just failed |
+| E69 | Adaptive limiter | Kept, on by default, next to RPM / TPM; `max_concurrency` is an optional hard cap |
+| E70 | Budget window | `smooth` by default; `fixed` per model |
+| E71 | Per-call region filter | Optional `allowed_regions` / `allowed_accounts`; the balancer decides inside the set |
+| E72 | Workers | In the app pods now (`mode=both`); dedicated worker pods possible later with the same setting; a sample manifest and a queue-depth metric in the docs |
+| E73 | Scheduled settings | Not in 0.3; operators or a cron job use `llm-queue registry set` |
+| E74 | New deployment | Takes its full share at once (limiter starts at its cap) |
+| E75 | Health | `llmq.health()` and `GET /llmq/health` |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
