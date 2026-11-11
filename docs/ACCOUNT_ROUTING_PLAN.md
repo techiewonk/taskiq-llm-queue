@@ -1487,6 +1487,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E111 | Per-user limits | Not in 0.3; `register_admission` can reject by user |
 | E112 | Owner confirmation (2026-11-12) | Residency lists per model; live edits limited to safe fields; no per-user cap in 0.3 |
 | E113 | Environments | No split of an account's quota between environments: `quota_share` is not built; each environment is configured with the RPM / TPM it may use |
+| E114 | First registry (2026-11-12) | Placeholder RPM / TPM until real numbers arrive. Chat models: India regions confirmed, US regions as fallback. Embedding models: India regions confirmed, other regions as fallback. Fallback outside India stays off through the residency list until compliance agrees |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
