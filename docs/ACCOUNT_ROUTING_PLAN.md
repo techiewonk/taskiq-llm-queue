@@ -128,10 +128,9 @@ flowchart LR
   APP[App call] --> ADM0["admission hook<br/>(admit / reject / tag)"]
   ADM0 --> W["waiting queue of the model<br/>(priority calls first)"]
   W --> RX[Worker receives]
-  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM (reserves applied)"}
-  PT --> SH{"provider budget<br/>(when set)"}
-  SH --> SL{"concurrency slot<br/>(adaptive limiter)"}
-  SL -->|granted| IP["in-progress set +<br/>request status"]
+  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM and a<br/>concurrency slot (reserves applied)"}
+  PT --> SH{"account budget<br/>(when set)"}
+  SH -->|granted| IP["in-progress set +<br/>request status"]
   IP --> CALL["client of the account + region<br/>(own credentials, deployment params)"]
   CALL --> RES[(result or stream chunks → caller)]
   PT -->|"no confirmed deployment"| FB{"model fallback rule"}
@@ -149,7 +148,9 @@ route name `sqs` becomes `queue`. No new cancel work; the existing `llmq.cancel`
 
 **Choose-and-take in Valkey.** The rate budgets of all deployments of a model and its rotation
 state share the hash tag `{m:ALIAS}`, so one Lua script (`PICK_TAKE`)
-reads the budgets, picks by the strategy and takes the tokens atomically. It replaces the token
+reads the budgets, picks by the strategy and takes the tokens **and the concurrency slot** of
+the chosen deployment atomically (the limiter and lease keys carry the same tag), so admission
+is one store call and a call never holds budget while it is refused a slot. It replaces the token
 take that already happens (no extra Valkey call), gives the same result for any number of
 processes and cannot herd.
 
@@ -176,6 +177,11 @@ processes and cannot herd.
   that long.
 - **Provider budget** (`shared_rpm` / `shared_tpm`, when set) keeps its own `RATE` call after
   the pick; if it refuses, the tokens go back. Everything else is inside the one script.
+- **"Left" for `headroom`** = the limit minus what was used in the current minute (the
+  `seen_calls` / `seen_tokens` counters of the budget hash, the numbers the status view shows);
+  a deployment's headroom is the smaller of its RPM share left and its TPM share left.
+- **Keys.** One budget hash per deployment, `P:{m:ALIAS}:rate:DEPLOYMENT`; rotation state in
+  `P:{m:ALIAS}:rot`; the account budget in `P:{a:ACCOUNT}:rate`.
 - **No quota.** A deployment without a quota always has budget. `headroom` needs a quota on
   every confirmed deployment (validation error otherwise).
 - **State reset.** Rotation and weight state is keyed by the deployment list; a registry change
@@ -262,7 +268,9 @@ publish never re-enables a broken deployment and health never shows up as a regi
   the share of RPM / TPM and of concurrency slots that only priority calls may use, so a bulk
   run cannot spend the whole minute before a chat call arrives. `normal_min_share` (default
   0.1) is the share priority calls cannot take, so normal work never starves. Both are applied
-  inside `PICK_TAKE` and the limiter.
+  inside `PICK_TAKE` as a cap per class next to the total: normal calls ≤ (1 − `priority_reserve`)
+  of the budget, priority calls ≤ (1 − `normal_min_share`). A model with no priority traffic
+  sets `priority_reserve: 0` to use its whole budget.
 - **`tenant_id`** is an optional label on a call (which team or app it belongs to). It is kept
   in the request status and the logs for filtering; it does not change order or quota.
 - **Embedding batches:** the library splits texts into model-sized batches (titan 1 text per
@@ -743,8 +751,8 @@ sequenceDiagram
   C->>WQ: send envelope (request id, priority, deadline)
   W->>WQ: receive (priority calls first)
   W->>V: claim; sticky lookup (session s)
-  W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token
-  W->>V: shared budgets, concurrency slot
+  W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token + concurrency slot
+  W->>V: account budget (when set)
   W->>V: in-progress add, request status = in_progress
   W->>B: converse via the client of (aws-main, ap-south-1), deployment params merged
   B-->>W: response + usage
@@ -959,7 +967,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B31 | A bulk run of 5,000 normal calls fills the quota; 50 priority calls arrive mid-minute; then constant priority load | priority calls start within 2 s (they use `priority_reserve`); under constant priority load normal calls still get `normal_min_share` |
 | B32 | Bulk embed 50K texts on titan and cohere, with the default (`rpm`) and with `rate_limits: "both"` | batch sizes as §3.7; RPM held per deployment (one request per batch); with `both`, TPM held too and corrected from usage; vectors in input order |
 | B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 failed priority calls, mixed versions safe, registry version never goes back |
-| B34 | Ramp from 10K / min until something saturates | the ceiling, the bottleneck and the state-store memory recorded here |
+| B34 | Ramp from 10K / min until something saturates | the ceiling, the bottleneck and the state-store memory recorded here; with no backlog the queue path adds ≤ 20 ms at p95 over a direct call (store calls per request counted and recorded) |
 | B35 | Live suite (`-m live`, dev account), off by default | each model × deployment answers once; a failure names the deployment and the AWS error |
 | B36 | `debug_capture` on for one model (live edit; config in non-prod only) | truncated text kept ≤ 60 min, then gone; off after a registry publish; refused from config in prod; other models and all logs hold none |
 | B37 | AccessDenied on one deployment, 20 processes | disabled after 3 errors in 5 min, one alert; one probe after 15 min; re-enabled on success; a registry publish does not re-enable it |
@@ -1103,6 +1111,13 @@ off (uat / prod today) there is nothing to drain.
 | E73 | Scheduled settings | Not in 0.3; operators or a cron job use `llm-queue registry set` |
 | E74 | New deployment | Takes its full share at once (limiter starts at its cap) |
 | E75 | Health | `llmq.health()` and `GET /llmq/health` |
+| E76 | Budget keys | One hash per deployment under the model tag (`P:{m:ALIAS}:rate:DEPLOYMENT`); `P:{m:ALIAS}:rot`, `P:{a:ACCOUNT}:rate` |
+| E77 | Priority on the stream backend | A priority stream and a normal stream under one queue name; one receive call reads priority first |
+| E78 | "Left" for `headroom` | Limit minus used in the current minute; the smaller of the RPM and TPM shares |
+| E79 | Reserves | A cap per class: normal ≤ 80 %, priority ≤ 90 % of each budget by default; `priority_reserve: 0` for models without priority traffic |
+| E80 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added; workers accept v1 and v2 during the upgrade rule of §6.1 |
+| E81 | Expired calls | Status `expired`; the caller gets `rate_limited` with `retry_after_secs` |
+| E82 | One admission call | The concurrency slot is taken inside `PICK_TAKE`; overhead target ≤ 20 ms p95 with no backlog (B34) |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |

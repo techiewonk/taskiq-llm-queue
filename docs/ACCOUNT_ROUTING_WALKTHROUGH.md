@@ -5,13 +5,13 @@ It is the companion of [ACCOUNT_ROUTING_PLAN.md](ACCOUNT_ROUTING_PLAN.md): the p
 rules and decisions, this page shows them working on one example.
 
 Status: **design, nothing built**. Key names and fields marked *(proposed)* are not fixed in the
-plan yet; they are settled in steps A1 and A4 and listed again in §14 for discussion. Every
+plan yet; they are settled in steps A1 and A4 and were decided on 2026-11-12 (§14). Every
 other name comes from the plan or from the 0.2.1 code.
 
 Contents: 1 the parts · 2 words · 3 example config · 4 every key in the stores · 5 start-up ·
 6 one request, step by step · 7 RPM and TPM in depth · 8 when something goes wrong ·
 9 deployment health · 10 changing a setting live · 11 status · 12 embeddings · 13 streaming ·
-14 points to discuss.
+14 decisions on the open details.
 
 ## 1. The parts
 
@@ -257,7 +257,7 @@ Any pod's worker reads the queue; priority messages are read before normal ones.
 | `{P:q:…}:rc` | `1731400000123-0 → 1` |
 | `P:{r:req-7f3a}:job` | `state=running, worker=pod-b-3, heartbeat=…` (the claim: a duplicate delivery is dropped) |
 
-### Step 6. Choose a deployment and take RPM + TPM (`PICK_TAKE`, one script)
+### Step 6. Choose a deployment, take RPM + TPM and a concurrency slot (`PICK_TAKE`, one script)
 
 The worker first works out which deployments are **usable**:
 
@@ -288,21 +288,22 @@ What the script sees and decides (all inside the store, atomically):
 | aws-main/us-east-1 | 120 of 300 (40 %) | 220,000 of 400,000 (55 %) | 40 % | yes |
 
 `headroom` picks the one with the most left: **aws-main/ap-south-1**. The script takes 1 from its
-RPM budget and 7,096 from its TPM budget in the same step (both or neither) and returns:
+RPM budget, 7,096 from its TPM budget and one concurrency slot in the same step (all or
+nothing) and returns:
 
 ```json
-{"granted": true, "deployment": "aws-main/ap-south-1"}
+{"granted": true, "deployment": "aws-main/ap-south-1", "slot": "req-7f3a"}
 ```
 
 Other strategies with the same data: `ordered` → ap-south-1 (first in config);
 `round_robin` → the next one in the shared rotation; `weighted` → by `weight`.
 
-### Step 7. Account budget and concurrency slot (worker → state store)
+### Step 7. The concurrency slot and the account budget
 
 | Check | Key | Here |
 |---|---|---|
-| Account-wide cap (`shared_rpm` / `shared_tpm`) | `P:{a:aws-main}:rate` | not set, skipped. When set and full, the tokens of step 6 go back and the call waits |
-| Concurrency slot (adaptive limiter) | `P:{m:gpt120b}:ac:aws-main/ap-south-1`, `…:lease:…` | limit 24, 11 in use → slot granted, `lease: req-7f3a → now + 90 s` |
+| Concurrency slot (adaptive limiter), taken inside `PICK_TAKE` | `P:{m:gpt120b}:ac:aws-main/ap-south-1`, `…:lease:…` | limit 24, 11 in use → slot granted, `lease: req-7f3a → now + 90 s`. A deployment with no free slot counts as full in step 6 |
+| Account-wide cap (`shared_rpm` / `shared_tpm`), a second call only when set | `P:{a:aws-main}:rate` | not set, skipped. When set and full, the tokens and the slot of step 6 go back and the call waits |
 
 The limiter is the safety net: it learns the real concurrency the provider accepts and shrinks
 on throttles, whatever the configured RPM says.
@@ -626,16 +627,23 @@ Setting `rate_limits: "both"` and a `tpm` on the model turns token limiting on f
 | End of stream carries the usage; TPM is corrected then | `{end: true, usage: {…}}` |
 | Failure after chunks were sent | an error event with the partial text; no silent switch to another deployment |
 
-## 14. Points to discuss
+## 14. Decisions on the open details
 
-These are the places where this page had to pick a detail the plan leaves open.
+Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E82).
 
-| # | Point | What this page assumes |
+| # | Point | Decision |
 |---|---|---|
-| 1 | Key names for budgets, rotation, account cap, in-progress detail, sticky (marked *proposed* in §4) | `P:{m:ALIAS}:rate:DEPLOYMENT` and the others as listed |
-| 2 | Priority inside one queue on the stream backend | A second stream `:sp` under the same queue name |
-| 3 | Envelope version 2: `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added | As in §6 step 4 |
-| 4 | What "left" means for `headroom` in `smooth` mode | Limit minus what was used in the current minute (`seen_calls`, `seen_tokens`), as the status view shows |
-| 5 | How the two reserves are enforced in `smooth` mode | A second clock per class at 80 % (normal) and 90 % (priority) of the limit |
+| 1 | Key names | One budget hash per deployment, `P:{m:ALIAS}:rate:DEPLOYMENT`, and the others as listed in §4 |
+| 2 | Priority inside one queue on the stream backend | A second stream `:sp` under the same queue name, read first |
+| 3 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added |
+| 4 | "Left" for `headroom` | Limit minus what was used in the current minute |
+| 5 | Reserves | A cap per class: normal ≤ 80 %, priority ≤ 90 %; `priority_reserve: 0` on models without priority traffic |
 | 6 | Expired calls | Status `expired`; the caller's error is `rate_limited` with `retry_after_secs` |
-| 7 | Real RPM / TPM per region for the first four models, and which regions are confirmed or fallback | Sample numbers only |
+| 7 | Admission | The concurrency slot is taken inside `PICK_TAKE`: one store call |
+
+Store calls of one queued request: caller 1 (status and send, in parallel); worker 6 (receive,
+claim, `PICK_TAKE`, mark in progress, finish, acknowledge). Target: the queue path adds at most
+20 ms at p95 with no backlog (measured in B34).
+
+Still needed from the owner: real RPM / TPM per region for the first four models, and which
+regions are confirmed or fallback. This page uses sample numbers only.
