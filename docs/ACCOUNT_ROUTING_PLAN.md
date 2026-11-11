@@ -40,14 +40,15 @@ loop ([ARCHITECTURE §4b, §5, §5a](ARCHITECTURE.md)).
 | **Account** | Where calls are billed and quota lives; has its own credentials and provider kind | `aws-main` (pod identity), `aws-dr` (assume role), `vllm-dc1` (API key) |
 | **Region group** | Per model and account: `confirmed` (normal serving) and `fallback` (used only under the model's fallback rule) | confirmed `ap-south-1`, `ap-south-2`; fallback `ap-southeast-2` |
 | **Deployment** | One model served from one account + region, or from an inference profile. Replaces `Target` | `gpt120b @ aws-main/ap-south-1` |
-| **Model policy** | Per model: balancing strategy, fallback rule, stickiness, Valkey-down mode, tenant share | `balance=headroom`, `fallback.after_secs=2` |
-| **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias), per provider, per tenant | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
+| **Model policy** | Per model: balancing strategy, region fallback, model fallback, stickiness, reserves, Valkey-down mode, inference defaults | `balance=headroom`, `fallback.after_secs=2` |
+| **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias) and per provider | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
 | **Registry** | The one config document for models: accounts, and per model its provider, model id, deployments, quota and policy; lives in Valkey, published from config | §3.8 |
 
 A deployment is named `account/region` (or `account/name` for a profile, e.g. `aws-main/apac`).
 It takes the place of today's target, so the limiter, breaker, lease and metric keys keep their
 shape. There is **no pinning**: a call names a model alias and the balancer decides. A call may
-still narrow the model's rule (`fallback="same_model"` keeps it off the model chain).
+still narrow the model's rule (`allow_fallback="regions"` keeps it on its own model, `"none"` on
+its confirmed deployments).
 
 **Alias and model id.** Each model has one alias that the owner defines (`gpt120b`, or
 `openai.gpt-oss-120b-1`). A call may pass the alias or the full provider model id
@@ -101,7 +102,7 @@ flowchart LR
 - **Request status** = `P:req:<id>`, for every call on the queue path and the direct path:
   `waiting → in_progress(deployment) → done | failed | expired | cancelled`, with timestamps.
   Kept 30 min; results 5 min (settings). While the state store is down no status is written.
-- **Deferring without a receive count.** A call sent back to wait for budget (rate, tenant share)
+- **Deferring without a receive count.** A call sent back to wait for budget
   must not move toward the DLQ. The Valkey queue gets a `defer` operation (visible again after a
   delay, receive count unchanged); on SQS the message is re-sent with a delay and the old one
   deleted. Only failures and crashes count toward `max_receives`.
@@ -116,17 +117,17 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  APP[App call] --> ADM0["admission hook<br/>(admit / reject / tag, tenant)"]
+  APP[App call] --> ADM0["admission hook<br/>(admit / reject / tag)"]
   ADM0 --> W["waiting queue of the model<br/>(priority calls first)"]
   W --> RX[Worker receives]
-  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM + tenant share"}
+  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM (reserves applied)"}
   PT --> SH{"provider budget<br/>(when set)"}
   SH --> SL{"concurrency slot<br/>(adaptive limiter)"}
   SL -->|granted| IP["in-progress set +<br/>request status"]
   IP --> CALL["client of the account + region<br/>(own credentials, deployment params)"]
   CALL --> RES[(result or stream chunks → caller)]
   PT -->|"no confirmed deployment"| FB{"model fallback rule"}
-  FB -->|allowed| PT2["fallback deployments, then model chain"] --> SH
+  FB -->|allowed| PT2["fallback regions, then model fallback"] --> SH
   FB -->|not allowed| BACK["deferred in the waiting queue until<br/>a token is free or its deadline passes"]
 ```
 
@@ -138,8 +139,8 @@ route name `sqs` becomes `queue`. No new cancel work; the existing `llmq.cancel`
 
 ### 3.4 Balancing (per model, live switchable)
 
-**Choose-and-take in Valkey.** The rate budgets of all deployments of a model, its rotation
-state and its tenant counters share the hash tag `{m:ALIAS}`, so one Lua script (`PICK_TAKE`)
+**Choose-and-take in Valkey.** The rate budgets of all deployments of a model and its rotation
+state share the hash tag `{m:ALIAS}`, so one Lua script (`PICK_TAKE`)
 reads the budgets, picks by the strategy and takes the tokens atomically. It replaces the token
 take that already happens (no extra Valkey call), gives the same result for any number of
 processes and cannot herd.
@@ -153,7 +154,7 @@ processes and cannot herd.
 | `custom:<name>` | A Python hook orders the deployments; the script takes from the first one with budget |
 
 - **Inputs** from the worker: the strategy, the usable candidates, the preferred (sticky)
-  deployment, the costs (1 request, the token estimate), the tenant, and a random number for
+  deployment, the costs (1 request, the token estimate), the priority flag, and a random number for
   `spread` (scripts do not draw their own).
 - **Usable** = enabled by the operator, not disabled by health, breaker not open, not paused, not
   slow.
@@ -202,8 +203,8 @@ model does not list itself; two models that list each other must both use `requi
 (so an overload cannot bounce between them); an embedding model cannot have `model_fallback`
 (vectors of another model are not compatible); a chat model can only list chat models. The
 request must be valid for the other model: its deployment `params` adapt it (guardrail, model
-fields); nothing else is converted. A call may still pass `fallback="same_model"` to stay on
-its model.
+fields) and the inference parameters follow §3.9; nothing else is converted. A call may pass
+`allow_fallback="regions"` to stay on its model.
 
 `register_fallback_policy(name, fn)` replaces the rule with code.
 
@@ -237,22 +238,23 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - A deployment may carry `params` merged into the request when it is picked: `guardrailConfig`
   (guardrails are per account and region), `additionalModelRequestFields`.
 
-### 3.7 Quotas, tenants, embeddings
+### 3.7 Quotas, reserves, embeddings
 
-- **Quota of a deployment:** its override → the model's `quota` default → none (then only the
+- **Quota of a deployment:** its override → the model's `rpm` / `tpm` → `defaults` → none (then only the
   adaptive limiter applies). Numbers are set by operators; the limiter still learns from 429s.
 - **Scopes:** the deployment budget is the account × region × model budget (one alias per model
   id); the provider budget (`shared_rpm` / `shared_tpm`) stays as an optional cap across models.
-- **Tenant share.** A call may carry `tenant`; `tenant_share` caps one tenant's part of a model's
-  budget per window, checked inside `PICK_TAKE` (counters under `{m:ALIAS}`, expiring with the
-  window). A refused call is **deferred** (§3.2), so another tenant's messages behind it are
-  served and it never moves toward the DLQ. Without a tenant: first in, first out (priority calls first).
+- **Reserves** (per model, both settable, 0 turns one off). `priority_reserve` (default 0.2) is
+  the share of RPM / TPM and of concurrency slots that only priority calls may use, so a bulk
+  run cannot spend the whole minute before a chat call arrives. `normal_min_share` (default
+  0.1) is the share priority calls cannot take, so normal work never starves. Both are applied
+  inside `PICK_TAKE` and the limiter.
+- **`tenant_id`** is an optional label on a call (which team or app it belongs to). It is kept
+  in the request status and the logs for filtering; it does not change order or quota.
 - **Embedding batches:** the library splits texts into model-sized batches (titan 1 text per
   call, cohere up to 96); each batch costs 1 RPM and its tokens and is balanced like any call.
 - **Tokens:** estimated before the call (`register_token_estimator` replaces characters / 4),
-  corrected by the real usage after it. Token metrics per model × account × region, and per
-  tenant only for tenants on `metrics_tenants` (others count as `other`), so the number of
-  metric series stays bounded. No prices.
+  corrected by the real usage after it. Token metrics per model × account × region. No prices.
 
 ### 3.8 Registry in Valkey
 
@@ -282,72 +284,124 @@ publish never re-enables a broken deployment and health never shows up as a regi
 
 ### 3.9 Config schema
 
-One document, `LLMQ_REGISTRY` (secret, env, file or its own secret). `QueueConfig` keeps only
-infrastructure: the two stores, key prefix, TTLs and global defaults. `LLMQ_MODELS` is gone.
+One document, `LLMQ_REGISTRY` (secret, env, file or its own secret), holds everything about
+models: accounts, deployments, quotas, rules, inference defaults, live settings, fallback and
+canary routing. `LLMQ_MODELS`, `LLMQ_SETTINGS`, `LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT`
+and `LLMQ_WORKER_SLOTS` are gone; `llm-queue settings` and `llm-queue routing` read and edit the
+registry. `QueueConfig` (`LLMQ_*` env) keeps only infrastructure: the two stores, key prefix,
+TTLs, security lists.
+
+**Shape.** Every setting is optional. The same setting names work at four levels, most specific
+first: a deployment's `overrides` → the model → the account's `settings` → `defaults`. An
+unknown name is refused at boot with the nearest valid name suggested.
 
 ```json
 {
   "registry_version": 1,
+
+  "defaults": {
+    "timeout_secs": 90,
+    "priority_reserve": 0.2,
+    "normal_min_share": 0.1,
+    "balance": "ordered",
+    "valkey_down": "pause",
+    "request_status": true,
+    "queue_pct": 100,
+    "worker_slots": 20,
+    "attempt_timeout_secs": 120,
+    "retry_attempts": 3,
+    "throttle_retry_attempts": 6,
+    "inference": {"temperature": 0.2, "max_tokens": 2048},
+    "queue": {"visibility_secs": 60, "max_receives": 10, "retention_secs": 345600},
+    "health": {"disable_errors": 3, "disable_window_secs": 300, "probe_after_secs": 900,
+               "probe_max_secs": 7200, "slow_ratio": 3.0, "slow_min_secs": 5, "slow_min_samples": 20},
+    "alerts": {"quota_used_pct": 90, "quota_used_mins": 5, "spill_pct": 20, "waiting_age_secs": 60}
+  },
+
+  "routing": {"kill_switch": false, "allow_users": []},
+
   "accounts": {
-    "aws-main": {"kind": "aws"},
-    "aws-dr": {"kind": "aws", "role_arn": "arn:aws:iam::222222222222:role/llmq-bedrock",
-               "external_id_ref": "LLMQ_DR_EXTERNAL_ID"},
+    "aws-main": {"kind": "aws", "settings": {"shared_rpm": 5000}},
+    "aws-dr": {"kind": "aws", "enabled": true,
+               "role_arn": "arn:aws:iam::222222222222:role/llmq-bedrock",
+               "external_id_ref": "LLMQ_DR_EXTERNAL_ID",
+               "settings": {"attempt_timeout_secs": 150}},
     "vllm-dc1": {"kind": "openai", "base_url": "https://vllm.internal/v1",
                  "api_key_ref": "LLMQ_VLLM_API_KEY"}
   },
+
   "models": {
     "gpt120b": {
+      "type": "chat",
       "provider": "bedrock",
       "model_id": "openai.gpt-oss-120b-1:0",
-      "quota": {"rpm": 500, "tpm": 400000},
+      "rpm": 500,
+      "tpm": 400000,
       "timeout_secs": 90,
+      "max_wait_secs": 30,
+      "priority_reserve": 0.3,
       "balance": "headroom",
       "balance_opts": {"pick": "percent"},
       "sticky": {"key": "session", "idle_ttl_secs": 1800},
       "valkey_down": "static_cap",
-      "tenant_share": 0.5,
+      "inference": {"temperature": 0.2, "top_p": 0.9, "max_tokens": 4096,
+                    "stop": ["</answer>"], "extra": {"reasoning_effort": "low"}},
+      "inference_limits": {"max_tokens": 8192, "locked": ["top_p"]},
       "fallback": {"on": ["exhausted", "broken"], "after_secs": 2},
       "model_fallback": {"on": ["exhausted", "broken"], "after_secs": 5,
-                         "models": ["gpt120b-vllm", "gpt20b"]},
+                         "models": ["gpt120b-vllm", {"model": "gpt20b", "require_headroom": true}]},
       "deployments": {
         "aws-main": {
           "confirmed": ["ap-south-1", "us-east-1"],
           "fallback": ["us-west-2",
                        {"name": "apac", "region": "ap-south-1",
                         "profile_id": "apac.openai.gpt-oss-120b-1:0", "rpm": 300}],
-          "overrides": {"ap-south-1": {"params": {"guardrailConfig": {
-            "guardrailIdentifier": "gr-abc", "guardrailVersion": "1"}}}}
+          "overrides": {
+            "ap-south-1": {"params": {"guardrailConfig": {
+              "guardrailIdentifier": "gr-abc", "guardrailVersion": "1"}}},
+            "us-east-1": {"rpm": 300, "max_concurrency": 40, "enabled": true}
+          }
         },
         "aws-dr": {"confirmed": ["ap-southeast-1"], "overrides": {"ap-southeast-1": {"rpm": 200}}}
       }
     },
+
     "gpt20b": {
+      "type": "chat",
       "provider": "bedrock",
       "model_id": "openai.gpt-oss-20b-1:0",
-      "quota": {"rpm": 1000, "tpm": 800000},
-      "timeout_secs": 90,
+      "rpm": 1000,
+      "tpm": 800000,
       "balance": "round_robin",
+      "inference": {"temperature": 0.0, "max_tokens": 1024},
       "fallback": {"on": ["exhausted", "broken"], "after_secs": 2},
+      "model_fallback": {"on": ["exhausted"], "after_secs": 5,
+                         "models": [{"model": "gpt120b", "require_headroom": true}]},
       "deployments": {
-        "aws-main": {
-          "confirmed": ["ap-south-1", "us-east-1"],
-          "fallback": ["us-west-2"],
-          "overrides": {"us-east-1": {"rpm": 600}}
-        }
+        "aws-main": {"confirmed": ["ap-south-1", "us-east-1"], "fallback": ["us-west-2"]}
       }
     },
+
     "gpt120b-vllm": {
+      "type": "chat",
       "provider": "openai",
       "model_id": "gpt-oss-120b",
-      "quota": {"rpm": 120},
+      "rpm": 120,
+      "inference": {"temperature": 0.2, "max_tokens": 4096, "seed": 7},
       "deployments": {"vllm-dc1": {"confirmed": ["dc1"]}}
     },
+
     "embed-titan": {
+      "type": "embedding",
       "provider": "bedrock",
       "model_id": "amazon.titan-embed-text-v2:0",
-      "quota": {"rpm": 2000, "tpm": 300000},
+      "rpm": 2000,
+      "tpm": 300000,
       "timeout_secs": 60,
+      "embed_batch_size": 1,
       "balance": "weighted",
+      "inference": {"dimensions": 1024, "normalize": true},
+      "queue": {"name": "llm-embed-titan", "visibility_secs": 30},
       "fallback": {"on": ["exhausted", "broken"], "after_secs": 1},
       "deployments": {
         "aws-main": {
@@ -356,18 +410,125 @@ infrastructure: the two stores, key prefix, TTLs and global defaults. `LLMQ_MODE
           "overrides": {"ap-south-1": {"weight": 3}, "ap-south-2": {"rpm": 1000, "tpm": 150000}}
         }
       }
+    },
+
+    "embed-cohere": {
+      "type": "embedding",
+      "provider": "bedrock",
+      "model_id": "cohere.embed-english-v3",
+      "rpm": 2000,
+      "embed_batch_size": 96,
+      "inference": {"input_type": "search_document", "truncate": "END"},
+      "deployments": {
+        "aws-main": {"confirmed": ["ap-south-1", "ap-southeast-1"], "fallback": ["us-east-1"]}
+      }
     }
   }
 }
 ```
 
+**The smallest valid registry** (everything else takes its default):
+
+```json
+{
+  "registry_version": 1,
+  "accounts": {"aws-main": {"kind": "aws"}},
+  "models": {
+    "gpt20b": {"type": "chat", "provider": "bedrock", "model_id": "openai.gpt-oss-20b-1:0",
+               "deployments": {"aws-main": {"confirmed": ["ap-south-1"]}}}
+  }
+}
+```
+
+#### Settings reference
+
+"Levels": D = `defaults`, A = account `settings`, M = model, R = a deployment's `overrides`.
+Everything is live-editable except the rows marked *deploy*.
+
+| Setting | Default | Levels | Meaning |
+|---|---|---|---|
+| `type` | required | M (*deploy*) | `chat` or `embedding` |
+| `provider`, `model_id` | required | M (*deploy*) | Provider kind and its model id; one alias per model id |
+| `enabled` | true | A, M, R | false stops new calls there (in-flight calls finish) |
+| `rpm`, `tpm` | none | D, M, R | Requests and tokens per minute of a deployment; none = no budget, only the adaptive limiter |
+| `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
+| `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | Token bucket or calendar minute; burst allowance |
+| `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Cap and start value of calls in flight per deployment |
+| `priority_reserve` | 0.2 | D, M | Share of quota and slots only priority calls may use |
+| `normal_min_share` | 0.1 | D, M | Share priority calls cannot take |
+| `timeout_secs` | 90 | D, A, M + per call | Deadline of a call, queue wait included |
+| `max_wait_secs` | none | D, M + per call | Longest wait for quota; then `rate_limited` with `retry_after_secs`. None = until the deadline |
+| `attempt_timeout_secs` | 180 | D, A, M, R | Limit of one provider attempt |
+| `retry_attempts`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | as in 0.2 | D, A, M, R | Retry budget and backoff per deployment |
+| `breaker_threshold`, `breaker_cooldown_secs` | 5, 15 | D, A, M, R | Circuit breaker per deployment |
+| `balance`, `balance_opts` | `ordered` | D, M | Strategy (§3.4); `balance_opts.pick` for `headroom` |
+| `weight` | 1 | R | Share for `weighted` |
+| `sticky` | off | D, M | `{"key": "session" \| "custom:<name>", "idle_ttl_secs": 1800}` |
+| `fallback` | none | D, M | Region fallback rule (§3.5) |
+| `model_fallback` | none | M | Model fallback rule (§3.5) |
+| `valkey_down` | `pause` | D, M | `pause`, `static_cap`, `fail_fast` (§3.11); `local_limit_cap` (10) is the cap |
+| `queue_pct` | 100 | D, M | Share of calls sent through the queue; the rest run direct under the same budgets (canary) |
+| `worker_slots` | 20 | D, M | Messages of this model one process works on at once |
+| `queue` | derived | D, M (*deploy* for `name`) | `{"name", "visibility_secs", "max_receives", "retention_secs"}` |
+| `request_status` | true | D, M | Per-request status on or off |
+| `embed_batch_size` | 1 | M | Texts per embedding call |
+| `inference`, `inference_limits` | none | D, A, M, R | Default model parameters and their limits (below) |
+| `params` | none | R | Raw request fields merged for one deployment (guardrail, model fields) |
+| `health.*` | see example | D, A, M, R | Auto-disable, probe and slow-region numbers |
+| `alerts.*` | see example | D, M | Alert thresholds |
+| `admission`, `fallback_policy`, `token_estimator`, `probe` | none | D, M | Names of registered hooks (§3.10) |
+| `debug_capture` | off | M | Truncated text for ≤ 60 min (§3.12) |
+| `routing.kill_switch`, `routing.allow_users` | false, [] | top level | Kill switch sends every call direct; listed users always use the queue |
+
+**Per call** (all optional): `priority`, `timeout_secs`, `max_wait_secs`, `session_id`,
+`user_id`, `tenant_id`, `request_id`, `allow_fallback` (`all`, the default; `regions`: region
+fallback only; `none`: confirmed deployments of this model only), and the inference parameters.
+
+#### Inference parameters (temperature and the rest)
+
+A model may carry default model parameters; every one is optional. The library fills in what
+the call did not set, so callers no longer repeat them and an operator can change them live.
+
+| Name in the registry | Bedrock Converse | OpenAI-compatible | Applies to |
+|---|---|---|---|
+| `max_tokens` | `inferenceConfig.maxTokens` | `max_tokens` | chat |
+| `temperature` | `inferenceConfig.temperature` | `temperature` | chat |
+| `top_p` | `inferenceConfig.topP` | `top_p` | chat |
+| `stop` | `inferenceConfig.stopSequences` | `stop` | chat |
+| `top_k` | `additionalModelRequestFields.top_k` | `extra_body.top_k` | chat (model-dependent) |
+| `seed` | not supported: refused at boot for a Bedrock model | `seed` | chat |
+| `frequency_penalty`, `presence_penalty` | `additionalModelRequestFields` (model-dependent) | same names | chat |
+| `extra` | merged into `additionalModelRequestFields` | merged into the request body | chat: anything model-specific, e.g. `reasoning_effort` (**unverified** per model) |
+| `dimensions`, `normalize` | Titan body `dimensions`, `normalize` | `dimensions` | embedding |
+| `input_type`, `truncate`, `embedding_types` | Cohere body fields | — | embedding |
+
+Rules:
+
+1. **Order.** library default < `defaults` < account < model < deployment < **the call**. A value
+   the caller sets wins, except a **locked** name: `inference_limits.locked` lists parameters the
+   caller cannot change (the registry value is used and the difference is logged once).
+2. **Limits.** `inference_limits.max_tokens` is a ceiling: a larger request is lowered to it
+   (`inference_limits.on_exceed`: `clamp`, the default, or `reject`). Ranges are checked at boot
+   and on every edit: `temperature` 0-2, `top_p` 0-1, `max_tokens` ≥ 1, `top_k` ≥ 1.
+3. **Token budget.** The TPM reservation uses the effective `max_tokens` (the call's, else the
+   model's default), so a sensible default also makes the budget estimate accurate.
+4. **Model fallback.** On another model, values the caller set explicitly are kept (within that
+   model's limits); values that came from defaults are replaced by the other model's defaults;
+   a parameter the other model's provider does not support is dropped and logged once.
+5. **Wrong type.** A chat-only parameter on an embedding model, or the reverse, is refused at
+   boot. `extra` is passed through unchecked, so a bad field there shows as a provider error.
+6. **Visibility.** `llm-queue settings get --model gpt120b` shows each effective parameter and
+   its level; the request status records the effective `temperature` and `max_tokens` (no text).
+7. **LangChain adapters.** A value set on the model object (`temperature=0`) is a call value;
+   an unset one takes the registry default.
+
 | Rule | Detail |
 |---|---|
-| Region entry | A string (in-region model id) or an object for an inference profile (`name`, `region` to call, `profile_id`, optional quota); a profile is its own deployment with its own quota |
+| Region entry | A string (in-region model id) or an object for an inference profile (`name`, `region` to call, `profile_id`, optional settings); a profile is its own deployment with its own quota |
 | Regions | `confirmed` and `fallback` are the only place a region is named (no catalog). A region where the model is not available is found on the first calls: auto-disable and alert (§3.5) |
-| Validation (all errors at once) | Alias format; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `weight` only with `weighted`; `headroom` needs a quota on every confirmed deployment; `kind=openai` needs `base_url`; hook names are registered; `model_fallback` checks (§3.5); queue names (existing rule) |
-| Defaults | `balance=ordered`, no `sticky`, no `fallback` (stay on confirmed), no `model_fallback` (never change model), `valkey_down=pause`, `timeout_secs` from the global default, queue `<prefix>llm-<alias>` |
-| Compatibility | Clean break in 0.3.0: `LLMQ_MODELS`, `Target`, `targets`, `skip_targets`, `alias@target`, `Lane` and every per-lane setting are removed; `gpt120b@primary` becomes `gpt120b@aws-main/ap-south-1` in keys and metrics, so learned limiter state starts fresh. Upgrade steps: §6.1 |
+| Validation (all errors at once) | Unknown setting names; alias format; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `headroom` needs `rpm` or `tpm` on every confirmed deployment; `priority_reserve + normal_min_share` < 1; `after_secs` and `max_wait_secs` below `timeout_secs` (a warning when `model_fallback.after_secs` is below `fallback.after_secs`); `kind=openai` needs `base_url`; hook names are registered; `model_fallback` checks (§3.5); inference names, ranges and model type; queue names (existing rule) |
+| Secrets | `api_key_ref` and `external_id_ref` name an environment variable or secret key; the value is read by the process and never stored in Valkey |
+| Compatibility | Clean break in 0.3.0: `LLMQ_MODELS`, `LLMQ_SETTINGS`, `LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT`, `LLMQ_WORKER_SLOTS`, `Target`, `targets`, `skip_targets`, `alias@target`, `Lane` and every per-lane setting are removed; `gpt120b@primary` becomes `gpt120b@aws-main/ap-south-1` in keys and metrics, so learned limiter state starts fresh. Upgrade steps: §6.1 |
 
 ### 3.10 Configurable and customisable everywhere
 
@@ -376,18 +537,10 @@ settings get` shows the level of every value.
 
 ```mermaid
 flowchart LR
-  D["deployment<br/>account × region of a model"] --> M["model alias"] --> A["account / provider"] --> G["global (QueueConfig)"] --> L["library default"]
+  D["deployment<br/>(overrides)"] --> M["model"] --> A["account<br/>(settings)"] --> G["defaults"] --> L["library default"]
 ```
 
-| Setting family | Global | Account / provider | Model | Deployment |
-|---|---|---|---|---|
-| rpm, tpm, rate_window, rate_burst | ✅ | ✅ (shared budget) | ✅ (`quota`) | ✅ (`overrides`) |
-| max_concurrency, limiter_initial | ✅ | ✅ | ✅ | ✅ |
-| timeout_secs (also per call), attempt timeout, retries, backoff, breaker | ✅ | ✅ | ✅ | ✅ |
-| auto-disable (N, window), probe (cool-down, cap), slow_ratio / slow_min_secs / slow_min_samples, alert thresholds | ✅ | ✅ | ✅ | ✅ |
-| balance, balance_opts, fallback, sticky, valkey_down, tenant_share, debug_capture | ✅ (default) | — | ✅ | — |
-| weight, params | — | — | — | ✅ |
-| enabled | — | ✅ (whole account) | — | ✅ |
+Which setting works at which level is in the settings reference (§3.9).
 
 **Hooks.** Registered by name in code, chosen by name in config, so one config works on every
 process. A hook is a pure function over a snapshot (no I/O). If it raises or returns nonsense the
@@ -483,7 +636,7 @@ sequenceDiagram
   participant W as Worker
   participant V as State store
   participant B as Bedrock (aws-main / ap-south-1)
-  App->>C: converse("gpt120b", params, priority=True, session_id=s, tenant=t)
+  App->>C: converse("gpt120b", params, priority=True, session_id=s)
   C->>C: admission hook
   C->>V: request status = waiting
   C->>WQ: send envelope (request id, priority, deadline)
@@ -586,7 +739,8 @@ llmq = LLMQueue.from_env()          # infrastructure settings + LLMQ_REGISTRY
 # a model is named by its alias or its full model id: "gpt120b" == "openai.gpt-oss-120b-1:0"
 await llmq.start()                  # publish / load the registry, ensure queues, start workers
 
-reply = await llmq.converse("gpt120b", params, priority=True, session_id=sid, tenant="desk-a")
+reply = await llmq.converse("gpt120b", params, priority=True, session_id=sid,
+                            max_wait_secs=30, tenant_id="research-desk")
 reply.meta.deployment               # "aws-main/ap-south-1"
 reply.meta.fallback                 # None | "region" | "model"
 vectors = await llmq.embed("embed-titan", texts, timeout_secs=900)   # batched by the library
@@ -620,7 +774,7 @@ instead of `resolve_fallback`.
 | `registry/store.py` | `RegistryStore` | `publish(registry, actor)` (version + hash rule), `load()`, `set()`, `enable()`, `disable()`, `diff()`, `run()` reload loop |
 | `reliability/_lua.py` | — | new scripts `PICK_TAKE`, `DEPLOY_HEALTH`, `LATENCY`, `ONCE` (lock / marker) |
 | `broker/valkey_queue.py` | — | new `defer` operation (visible after a delay, receive count unchanged); priority and normal streams under one queue name |
-| `routing/balance.py` | `Balancer` (Protocol), `register_balancer` | `pick_take(alias, strategy, candidates, preferred, costs, tenant) -> Grant \| Wait` |
+| `routing/balance.py` | `Balancer` (Protocol), `register_balancer` | `pick_take(alias, strategy, candidates, preferred, costs, priority) -> Grant \| Wait` |
 | `routing/plan.py` | `CallPlan`, `plan_call` | `plan_call(alias, ctx, resolved, sticky) -> CallPlan`; `CallPlan.next(cause)` |
 | `routing/fallback_rule.py` | `register_fallback_policy` | `allowed(rule, cause, waited_secs) -> bool` |
 | `routing/sticky.py` | `StickyStore`, `register_sticky_key` | `get(alias, key)`, `put(alias, key, deployment, ttl)` |
@@ -657,7 +811,7 @@ Removed: `Target`, `ModelConfig.targets`, `FallbackConfig.skip_targets`, `resolv
 | U9 | security | credentials only in Secrets Manager / IAM roles, no prompt text in logs | a Valkey or log leak exposes no keys or user text |
 | U10 | developer | to plug in vLLM / OpenAI-compatible endpoints as accounts | on-prem capacity joins the same balancing |
 | U11 | chat user | to see the answer as it is written | the chat feels fast |
-| U12 | tenant | my calls not to be starved by another tenant's bulk run | my work finishes in its normal time |
+| U12 | chat user | my call not to wait behind a bulk run | chat stays fast while ingestion is running |
 | U13 | platform owner | the same behaviour with 2 or 20 worker processes | scaling needs no retuning |
 | U14 | developer | my own balancer, fallback rule or token estimator | the library fits our rules without a fork |
 | U15 | operator | a safe upgrade from 0.2 to 0.3 | no call is lost or run by a worker that does not understand it |
@@ -701,7 +855,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B28 | One of four regions 5× slower; then only two regions | share of new calls drops to ~0 within 30 s and returns after recovery; with two regions nothing is excluded |
 | B29 | Real quota 200, configured 500 | 429 rate < 5 % within 60 s; traffic moves; one alert with the observed rate |
 | B30 | Worker killed with 50 calls in progress | all 50 finish elsewhere within 60 s; 0 lost |
-| B31 | Tenant X sends 5,000 bulk calls, then tenant Y 100 | X ≤ `tenant_share`; Y finishes in its normal time; no message of X reaches the DLQ |
+| B31 | A bulk run of 5,000 normal calls fills the quota; 50 priority calls arrive mid-minute; then constant priority load | priority calls start within 2 s (they use `priority_reserve`); under constant priority load normal calls still get `normal_min_share` |
 | B32 | Bulk embed 50K texts on titan and cohere | batch sizes as §3.7; RPM and TPM held; vectors in input order |
 | B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 failed priority calls, mixed versions safe, registry version never goes back |
 | B34 | Ramp from 10K / min until something saturates | the ceiling, the bottleneck and the state-store memory recorded here |
@@ -715,17 +869,19 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B42 | A rate-deferred message 50 times | receive count unchanged; never in the DLQ; a failing handler still reaches the DLQ at `max_receives` |
 | B43 | 5,000 normal calls queued, then 100 priority calls | priority wait p95 ≤ 2 s; every normal call still finishes; first in, first out inside each class |
 | B44 | A region where the model does not exist is listed as confirmed | disabled after 3 errors with an alert naming the deployment and the AWS error; calls served by the other regions; 0 failed calls |
+| B45 | Inference defaults: a call without parameters; a call with its own `temperature`; a locked `top_p`; `max_tokens` over the limit; a model change | defaults applied; the call's value wins; the locked value is kept; the limit is enforced (`clamp` and `reject`); explicit values carried to the other model, defaults replaced by its own, unsupported ones dropped |
+| B46 | A call with `max_wait_secs=5` while the quota is used up | `rate_limited` with `retry_after_secs` after 5 s, not at the deadline |
 
 ## 6. Work plan by release
 
 | Release | Step | Content | Gate |
 |---|---|---|---|
 | **0.3.0** | A0 | Test prerequisites: fakellm quotas per key × region × model, latency / error injection, fake STS, Redis + second Valkey in compose | harness self-test |
-| | A1 | Registry schema (one document: accounts, models with provider and model id), validation, resolve, override levels; alias or model id in calls, queue name from the alias; `LLMQ_MODELS`, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
+| | A1 | Registry schema (one document: defaults, routing, accounts, models), all setting names and levels, inference parameters and limits, validation, resolve; alias or model id in calls, queue name from the alias; the five old `LLMQ_*` model configs, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
 | | A2 | Registry store: version + hash rule, live edits, audit, CLI `registry`, registry file / own secret | B11, B40 |
 | | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22 |
-| | A4 | Quota scopes, tenant share, `defer` on both backends | R01-R12 still pass; B05, B31, B42 |
-| | A5 | Fallback rule and hook, model chain, per-deployment params | B06, B07, B38 |
+| | A4 | Deployment and provider budgets, `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42 |
+| | A5 | Region fallback and model fallback rules and hook, per-deployment params, inference defaults merged per provider (locked names, limits, model change) | B06, B07, B38, B45 |
 | | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43 |
 | | A7 | Pod-count logic removed; `valkey_down` modes; once-locks | B16, B22 |
 | | A8 | Upgrade guide and the app's config moved to the registry | B41 |
@@ -778,7 +934,7 @@ off (uat / prod today) there is nothing to drain.
 | E11 | Failover loss | Accepted (idempotent claims, caller deadlines); optional `queue_wait_replicas`, measured |
 | E12 | Registry | In Valkey; `registry_version` rule: higher replaces, equal keeps live edits, lower ignored |
 | E13 | Live edits | Every field, audited, CLI warns they last until the next config version; `registry diff` |
-| E14 | Config documents | One document, `LLMQ_REGISTRY`: accounts and models (provider, model id, deployments, quota, policy). `LLMQ_MODELS` removed |
+| E14 | Config documents | One document, `LLMQ_REGISTRY`: defaults, routing, accounts, models. It replaces `LLMQ_MODELS`, `LLMQ_SETTINGS`, `LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT` and `LLMQ_WORKER_SLOTS` |
 | E15 | Regions | No catalog: `confirmed` and `fallback` per model and account are the only region lists; a wrong region is caught by auto-disable and alert |
 | E16 | Quotas | One default per model, overrides per region; set by operators, limiter learns from 429s |
 | E17 | Inference profiles | Their own deployment with their own quota |
@@ -801,23 +957,25 @@ off (uat / prod today) there is nothing to drain.
 | E34 | Streaming | Queued and direct; a mid-stream failure is an error event with the partial text |
 | E35 | Waiting for quota | Every call waits in the queue until a token is free or its deadline passes, then `rate_limited` |
 | E36 | Worker crash | In-progress calls resume within 60 s |
-| E37 | Fairness and priority | Optional `tenant` with `tenant_share`; no lanes; one optional `priority=True` flag per call inside the same queue |
+| E37 | Priority | No lanes and no tenant shares; one optional `priority=True` flag per call inside the same queue, with `priority_reserve` (0.2) and `normal_min_share` (0.1) per model; `tenant_id` is only a label |
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
 | E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
-| E41 | Tests | fakellm scenarios B01-B44; a small `live` suite off by default; balancing bench gated |
+| E41 | Tests | fakellm scenarios B01-B46; a small `live` suite off by default; balancing bench gated |
 | E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
 | E46 | Queues per model | Named from the alias by default, overridable; one queue set per model, no sharing |
 | E47 | Provider per alias | One provider and model id per alias; vLLM capacity is a separate alias reached through the chain; no shared account-region-model scope is needed |
-| E48 | Tenant metrics | Only tenants on `metrics_tenants` get their own series; others count as `other` |
+| E48 | Max wait | Optional `max_wait_secs` per model and per call; unset = wait until the deadline |
 | E49 | Debug capture | ≤ 60 min; prod: audited live edit only; non-prod may enable it from config |
 | E50 | Upgrade 0.2 → 0.3 | Both paths documented: new prefix and drain (uat / prod), stop the world (dev) |
 | E51 | Repo flow | Library branch `feat/accounts-routing`, one local commit per finished step (pushed by the owner) |
 | E52 | Lanes | Removed: no rt / bg / bulk, no per-lane settings |
 | E53 | Timeouts | One default per model (settable at every level), and per call |
 | E54 | Models in the registry | Adding or removing a whole model needs a new `registry_version` (a deploy); everything else is live |
+| E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
+| E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
 
 ## 8. Needed from the owner
@@ -836,7 +994,7 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 
 | # | Gap | Fix | Where |
 |---|---|---|---|
-| G1 | **Tenant share did not give fairness.** The lane queue is FIFO, so tenant X's 5,000 messages sit in front of tenant Y's; refusing X's calls would also bump their receive count toward the DLQ | A refused call is *deferred*: visible again after a delay with the receive count unchanged, so Y's messages are served and X's never reach the DLQ | §3.2, §3.7, B31, B42 |
+| G1 | **Tenant share did not give fairness** (FIFO queue, DLQ risk) | Tenant shares were dropped by the owner; chat is protected by the priority flag and the two reserves instead. The `defer` operation stays for G2 | §3.7, B31 |
 | G2 | The same DLQ risk for every rate-limited call that waits several windows | `defer` on both backends; only failures and crashes count toward `max_receives` | §3.2, B42 |
 | G3 | **0.2 → 0.3 upgrade was unsafe.** "Mixed versions safe" cannot hold across the clean break: a 0.2 worker cannot run a 0.3 message | Upgrade on a new key and queue prefix, drain the old queues; mixed-version safety promised between 0.3.x only | §6.1, B41, U15 |
 | G4 | **One model could not mix Bedrock and vLLM** (B09): provider and model id are single per alias in `QueueConfig` | Kept single: vLLM capacity is its own alias reached through the chain; one alias per model id, so the extra shared budget scope is dropped and the pick is fully atomic | §3.1, §3.6, B09 |
@@ -844,7 +1002,7 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 | G6 | With many processes, every one would probe, sweep and alert | Short Valkey locks / markers: one probe, one sweep, one alert per event | §3.5, §3.11, §3.12, B22 |
 | G7 | A config change without a version bump would be silently ignored | Content hash stored with the version; a mismatch is logged and alerted | §3.8, B40 |
 | G8 | Latency-aware exclusion was undefined with 1-2 deployments and could exclude the last one | Needs ≥ 3 usable deployments, minimum samples, an absolute floor; never the last usable one | §3.4, B28 |
-| G9 | Tenant as a metric label gives unbounded series (CloudWatch cost) | Tenant label only for tenants on `metrics_tenants`, others as `other` | §3.7 |
+| G9 | Tenant as a metric label gives unbounded series | No tenant label in metrics; `tenant_id` is only in the request status and logs | §3.7 |
 | G10 | `headroom` is undefined for a deployment without a quota | Validation error; a deployment without a quota otherwise always has budget | §3.4, §3.9 |
 | G11 | `spread` needs randomness inside a Lua script | The worker passes the random number in | §3.4 |
 | G12 | Sticky and atomic pick were two steps | The sticky deployment is a "preferred" input of `PICK_TAKE` | §3.4 |
@@ -866,3 +1024,25 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 | G28 | Scenarios needed test features that do not exist (per-key quotas, STS, streaming, Redis image) | Step A0 | §5, §6 |
 | G29 | The app's own config migration to the registry was not in the plan | Step A8 | §6 |
 | G30 | Data residency: fallback regions outside India were decided but not signed off | Owner item Q4 | §8 |
+
+### 9.1 Settings review (2026-11-11)
+
+| # | Gap | Fix |
+|---|---|---|
+| S1 | No model type, so the model-fallback checks had nothing to read | `type`: `chat` or `embedding` |
+| S2 | Embedding batch size was fixed in the text | `embed_batch_size` per model |
+| S3 | Account-level and global settings had no place in the document | `defaults` block and `settings` per account |
+| S4 | Quota written two ways (`quota` and flat `rpm`) | Flat `rpm` / `tpm` at every level |
+| S5 | Health, probe, slow-region, alert and streaming numbers were promised but never named | Settings reference with names, defaults and levels |
+| S6 | `enabled` was not in the schema | `enabled` on account, model and deployment |
+| S7 | Hooks other than the balancer had no config key | `admission`, `fallback_policy`, `token_estimator`, `probe`, `sticky.key` |
+| S8 | Queue attributes were not settable per model | `queue` block with global defaults |
+| S9 | Per-call options were undefined | The per-call list, with `allow_fallback` = `all` / `regions` / `none` |
+| S10 | Timings were not checked against each other | Errors and one warning at boot |
+| S11 | A typo in a setting name would be ignored | Unknown names refused, nearest name suggested |
+| S12 | Request status had no switch | `request_status` per model |
+| S13 | Priority calls had no reserved capacity; normal calls could starve | `priority_reserve` and `normal_min_share` |
+| S14 | Two systems configured the same values | Everything in the registry; five old `LLMQ_*` configs removed |
+| S15 | Tenant share was one number | Tenant shares removed by the owner; `tenant_id` is a label only |
+| S16 | A call could wait its whole timeout for quota | Optional `max_wait_secs` per model and per call |
+| S17 | Model parameters (temperature, max tokens, ...) had to be repeated by every caller and could not be changed live | `inference` defaults and `inference_limits` at every level |
