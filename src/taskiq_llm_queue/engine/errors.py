@@ -26,6 +26,7 @@ KINDS = frozenset(
         "worker_lost",
         "cancelled",
         "provider_error",
+        "rejected",
     }
 )
 

@@ -88,6 +88,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_runtime.py",),
         needs_stack=True,
     ),
+    "a9": Step(
+        "Hooks (balancer, fallback policy, admission, sticky key), fallback by cause, params",
+        sources=("src/taskiq_llm_queue/engine",),
+        tests=("tests/unit/engine", "tests/integration/engine/test_runtime.py"),
+        needs_stack=True,
+    ),
 }
 
 

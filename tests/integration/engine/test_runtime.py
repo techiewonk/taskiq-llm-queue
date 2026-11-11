@@ -144,15 +144,19 @@ async def test_embeddings_with_inference_defaults(make: Make) -> None:
 
 async def test_rpm_budget_and_expiry(make: Make) -> None:
     engine, fake = await make({"big": {"rpm": 3, "max_wait_secs": 1, "priority_reserve": 0}})
+    minute = engine.clock.now() // 60
     results = await asyncio.gather(
         *[engine.call("big", CHAT, timeout_secs=5) for _ in range(8)], return_exceptions=True
     )
     ok = [r for r in results if not isinstance(r, BaseException)]
     failed = [r for r in results if isinstance(r, CallFailed)]
-    assert len(ok) == 6  # 3 per minute on each of r1 and r2
-    assert {f.kind for f in failed} == {"rate_limited"}
+    if engine.clock.now() // 60 == minute:  # a fixed window resets at the minute boundary
+        assert len(ok) == 6  # 3 per minute on each of r1 and r2
+    else:
+        assert 6 <= len(ok) <= 8
+    assert {f.kind for f in failed} <= {"rate_limited"}
     calls = _stats(fake, f"{GPT}@r1").get("calls", 0) + _stats(fake, f"{GPT}@r2").get("calls", 0)
-    assert calls == 6  # nothing above the budget reached the provider
+    assert calls == len(ok)  # nothing above the budget reached the provider
 
 
 async def test_throttles_move_to_fallback_region(make: Make) -> None:
@@ -242,3 +246,83 @@ async def test_call_filter_leaves_nothing(make: Make) -> None:
     with pytest.raises(CallFailed) as info:
         await engine.call("big", CHAT, allowed_regions=["nowhere"])
     assert info.value.kind == "no_deployment"
+
+
+# ---------------------------------------------------------------- A9: hooks and fallback causes
+
+
+async def test_custom_balancer_orders_candidates(make: Make) -> None:
+    from taskiq_llm_queue.engine import hooks
+
+    hooks.register_balancer("prefer_r2", lambda cands, ctx: ["aws-a/r2"])
+    engine, _ = await make({"big": {"balance": "custom:prefer_r2"}})
+    assert (await engine.call("big", CHAT)).meta.deployment == "aws-a/r2"
+
+
+async def test_admission_hook_rejects(make: Make) -> None:
+    from taskiq_llm_queue.engine import hooks
+
+    hooks.register_admission(
+        "no_bob", lambda ctx: hooks.Reject("blocked user") if ctx.user_id == "bob" else None
+    )
+    engine, _ = await make({"big": {"admission": "no_bob"}})
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT, user_id="bob")
+    assert info.value.kind == "rejected"
+    assert (await engine.call("big", CHAT, user_id="ann")).ok
+
+
+async def test_fallback_only_for_listed_causes(make: Make) -> None:
+    engine, _ = await make(
+        {
+            "big": {
+                "rpm": 1,
+                "priority_reserve": 0,
+                "max_wait_secs": 1,
+                "fallback": {"on": ["error"], "after_secs": 0},
+            }
+        }
+    )
+    await engine.call("big", CHAT)
+    await engine.call("big", CHAT)
+    with pytest.raises(CallFailed) as info:  # exhausted is not a listed cause: no spill to r3
+        await engine.call("big", CHAT, timeout_secs=3)
+    assert info.value.kind == "rate_limited"
+
+
+async def test_broken_confirmed_uses_fallback_tier(make: Make) -> None:
+    disabled = {"r1": {"enabled": False}, "r2": {"enabled": False}}
+    engine, _ = await make(
+        {
+            "big": {
+                "fallback": {"on": ["broken"], "after_secs": 0},
+                "deployments": {
+                    "aws-a": {"confirmed": ["r1", "r2"], "fallback": ["r3"], "overrides": disabled}
+                },
+            }
+        }
+    )
+    reply = await engine.call("big", CHAT)
+    assert reply.meta.deployment == "aws-a/r3"
+    assert reply.meta.fallback == "region"
+
+
+async def test_fallback_policy_hook(make: Make) -> None:
+    from taskiq_llm_queue.engine import hooks
+
+    hooks.register_fallback_policy("never", lambda cause, waited, rule, ctx: False)
+    disabled = {"r1": {"enabled": False}, "r2": {"enabled": False}}
+    engine, _ = await make(
+        {
+            "big": {
+                "fallback": {"on": ["broken"], "after_secs": 0},
+                "fallback_policy": "never",
+                "deployments": {
+                    "aws-a": {"confirmed": ["r1", "r2"], "fallback": ["r3"], "overrides": disabled}
+                },
+            }
+        }
+    )
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT)
+    assert info.value.kind == "model_unavailable"

@@ -128,3 +128,29 @@ def test_openai_and_embedding_defaults() -> None:
         ]
         == 64
     )
+
+
+def test_deployment_params_merge() -> None:
+    request = {"messages": [], "additionalModelRequestFields": {"a": 1}}
+    merged = inference.merge_params(
+        request,
+        {
+            "guardrailConfig": {"guardrailIdentifier": "gr", "guardrailVersion": "1"},
+            "additionalModelRequestFields": {"b": 2},
+        },
+    )
+    assert merged["guardrailConfig"]["guardrailIdentifier"] == "gr"
+    assert merged["additionalModelRequestFields"] == {"a": 1, "b": 2}
+    assert request["additionalModelRequestFields"] == {"a": 1}
+
+
+def test_hook_failure_falls_back_once() -> None:
+    from taskiq_llm_queue.engine import hooks
+
+    def broken(*_: object) -> None:
+        raise RuntimeError("bug")
+
+    assert hooks.call_safely("balancer", "b", broken, default="built-in") == "built-in"
+    assert hooks.get("balancer", "missing") is None
+    with pytest.raises(ValueError, match="name"):
+        hooks.register_balancer("", lambda c, x: [])

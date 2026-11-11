@@ -23,7 +23,7 @@ from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.clients.pool import route_for
 from taskiq_llm_queue.clients.providers import Providers
 from taskiq_llm_queue.clients.timing import AttemptTimeout, Timing
-from taskiq_llm_queue.engine import inference, tokens
+from taskiq_llm_queue.engine import hooks, inference, tokens
 from taskiq_llm_queue.engine.admission import (
     Admission,
     Ask,
@@ -75,6 +75,7 @@ class _Held:
     envelope: Envelope
     first_seen: float
     grants: set[tuple[str, str]] = field(default_factory=set)
+    broken: bool = False
 
 
 class StoreClock:
@@ -224,6 +225,13 @@ class Engine:
             tenant_id=tenant_id,
             app_request_id=request_id is not None,
         )
+        hook_name = view.value(alias, "admission")
+        hook = hooks.get("admission", hook_name)
+        if hook is not None:
+            ctx = hooks.CallContext(alias, rid, priority, session_id, user_id, tenant_id)
+            verdict = hooks.call_safely("admission", hook_name, hook, ctx, default=None)
+            if isinstance(verdict, hooks.Reject):
+                raise CallFailed("rejected", verdict.reason, request_id=rid)
         user_hash = hashlib.sha256((user_id or session_id or "").encode()).hexdigest()[:16]
         found = await self.requests.register(
             rid,
@@ -436,24 +444,54 @@ class Engine:
         env: Envelope,
         age: float,
         failed: frozenset[str],
+        cause: str,
     ) -> list[Candidate]:
         deps: list[Deployment] = list(view.deployments(alias))
         if env.allowed_regions:
             deps = [d for d in deps if d.region in env.allowed_regions]
         if env.allowed_accounts:
             deps = [d for d in deps if d.account in env.allowed_accounts]
-        rule = view.value(alias, "fallback")
-        fallback_ok = (
-            env.allow_fallback in ("all", "regions")
-            and rule is not None
-            and age >= float(rule["after_secs"])
-        )
+        fallback_ok = self._may_spill(view, alias, env, age, cause, "fallback")
         out = []
         for dep in deps:
             if dep.group == "fallback" and not fallback_ok:
                 continue
             out.append(Candidate(dep.key, dep.group, last=dep.key in failed))  # type: ignore[arg-type]
         return out
+
+    def _ctx(self, alias: str, held: _Held, waited: float) -> hooks.CallContext:
+        env = held.envelope
+        return hooks.CallContext(
+            alias, env.request_id, env.priority, env.session_id, env.user_id, env.tenant_id, waited
+        )
+
+    def _may_spill(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        env: Envelope,
+        age: float,
+        cause: str,
+        rule_name: str,
+    ) -> bool:
+        """Whether a call may use fallback regions / models now: rule or `fallback_policy`."""
+        allowed = ("all", "regions") if rule_name == "fallback" else ("all",)
+        rule = view.value(alias, rule_name)
+        if env.allow_fallback not in allowed or not rule:
+            return False
+        policy_name = view.value(alias, "fallback_policy")
+        policy = hooks.get("fallback_policy", policy_name)
+        if policy is not None:
+            ctx = hooks.CallContext(
+                alias, env.request_id, env.priority, env.session_id, env.user_id, env.tenant_id, age
+            )
+            default = cause in rule["on"] and age >= float(rule["after_secs"])
+            return bool(
+                hooks.call_safely(
+                    "fallback_policy", policy_name, policy, cause, age, rule, ctx, default=default
+                )
+            )
+        return cause in rule["on"] and age >= float(rule["after_secs"])
 
     def _ask(
         self,
@@ -468,7 +506,8 @@ class Engine:
     ) -> Ask | None:
         env = held.envelope
         age = self.clock.now() - held.message.position_ms / 1000.0
-        candidates = self._candidates(view, alias, env, age, failed)
+        cause = "error" if failed else ("broken" if held.broken else "exhausted")
+        candidates = self._candidates(view, alias, env, age, failed, cause)
         if not candidates:
             return None
         entry = view.registry.models[alias]
@@ -478,11 +517,19 @@ class Engine:
         if env.priority and view.value(alias, "balance_priority"):
             strategy = view.value(alias, "balance_priority")
         if str(strategy).startswith("custom:"):
-            strategy = "ordered"  # custom balancers order the candidates (step A9)
+            candidates = self._custom_order(view, alias, held, candidates, str(strategy)[7:], age)
+            strategy = "ordered"
         sticky = view.value(alias, "sticky")
         sticky_hash = None
-        if sticky and env.session_id and entry.type == "chat":
-            sticky_hash = hashlib.sha256(env.session_id.encode()).hexdigest()[:16]
+        if sticky and entry.type == "chat":
+            key: str | None = env.session_id
+            if str(sticky["key"]).startswith("custom:"):
+                name = str(sticky["key"])[7:]
+                fn = hooks.get("sticky_key", name)
+                ctx = self._ctx(alias, held, age)
+                key = hooks.call_safely("sticky_key", name, fn, ctx, default=None) if fn else None
+            if key:
+                sticky_hash = hashlib.sha256(str(key).encode()).hexdigest()[:16]
         return Ask(
             alias=alias,
             request_id=env.request_id,
@@ -504,6 +551,41 @@ class Engine:
             tag=held.message.id,
         )
 
+    def _custom_order(
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        held: _Held,
+        candidates: list[Candidate],
+        name: str,
+        age: float,
+    ) -> list[Candidate]:
+        """Candidates in the order a custom balancer prefers (unknown keys ignored)."""
+        fn = hooks.get("balancer", name)
+        if fn is None:
+            return candidates
+        deps = {d.key: d for d in view.deployments(alias)}
+        views = [
+            hooks.DeploymentView(
+                key=c.key,
+                account=deps[c.key].account,
+                region=deps[c.key].region,
+                group=c.tier,
+                rpm=view.value(alias, "rpm", c.key),
+                tpm=view.value(alias, "tpm", c.key),
+                weight=float(view.value(alias, "weight", c.key)),
+                tags=view.value(alias, "tags", c.key) or {},
+            )
+            for c in candidates
+        ]
+        ctx = self._ctx(alias, held, age)
+        order = hooks.call_safely("balancer", name, fn, views, ctx, default=None)
+        if not order:
+            return candidates
+        by_key = {c.key: c for c in candidates}
+        ranked = [by_key[k] for k in order if k in by_key]
+        return ranked + [c for c in candidates if c.key not in set(order)]
+
     def _owner(self, held: _Held, attempt: int) -> str:
         """Owner token of an attempt; the message id tells two deliveries of one id apart."""
         worker = f"{self.worker_id}@{held.message.id}"
@@ -513,13 +595,15 @@ class Engine:
         self, view: ResolvedRegistry, alias: str, env: Envelope, dep: str | None
     ) -> dict[str, Any]:
         entry = view.registry.models[alias]
-        return inference.apply(
+        request = inference.apply(
             entry.provider,
             env.op,
             env.params or {},
             view.value(alias, "inference", dep) or {},
             view.value(alias, "inference_limits", dep) or {},
         )
+        extra = view.value(alias, "params", dep) if dep else None
+        return inference.merge_params(request, extra or {})
 
     def _estimate(
         self, view: ResolvedRegistry, alias: str, env: Envelope, params: Mapping[str, Any]
@@ -613,6 +697,16 @@ class Engine:
             await self.queues.return_(held.message, delay_secs=self.settings.lease_secs / 2)
             return None
         if decision.kind == "none":
+            has_fallback = any(d.group == "fallback" for d in view.deployments(alias))
+            rule = view.value(alias, "fallback")
+            if not held.broken and has_fallback and rule and "broken" in rule["on"]:
+                held.broken = True
+                age = self.clock.now() - held.message.position_ms / 1000.0
+                if age < float(rule["after_secs"]):
+                    return Decision(
+                        "wait", wait_secs=float(rule["after_secs"]) - age, reason="broken"
+                    )
+                return await self._decide(view, alias, held, attempt, failed)
             fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
             if not fell:
                 await self._finish_call(
@@ -676,10 +770,8 @@ class Engine:
         """Try the model's fallback models when its rule allows; True when one granted."""
         rule = view.value(alias, "model_fallback")
         env = held.envelope
-        if not rule or env.allow_fallback != "all":
-            return False
         cause = "broken" if broken else "exhausted"
-        if cause not in rule["on"] or waited < float(rule["after_secs"]):
+        if not self._may_spill(view, alias, env, waited, cause, "model_fallback"):
             return False
         for item in rule["models"]:
             other = item["model"]

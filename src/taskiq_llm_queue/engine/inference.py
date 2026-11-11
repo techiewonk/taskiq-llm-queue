@@ -102,3 +102,14 @@ def apply(
             body = {k: v for k, v in body.items() if k not in ("dimensions", "normalize")}
         out["body"] = body
     return out
+
+
+def merge_params(request: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge a deployment's `params` (guardrail, model fields) into a request, one level deep."""
+    out = dict(request)
+    for key, value in extra.items():
+        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
+            out[key] = {**out[key], **value}
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
