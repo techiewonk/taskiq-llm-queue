@@ -257,21 +257,33 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - **`tenant_id`** is an optional label on a call (which team or app it belongs to). It is kept
   in the request status and the logs for filtering; it does not change order or quota.
 - **Embedding batches:** the library splits texts into model-sized batches (titan 1 text per
-  call, cohere up to 96); each batch costs 1 request (embedding models have no token budget)
-  and is balanced like any call.
+  call, cohere up to 96); each batch costs 1 request (plus its input tokens when token limiting is
+  on for the model) and is balanced like any call.
 - **Tokens:** estimated before the call (`register_token_estimator` replaces characters / 4),
   corrected by the real usage after it. Token metrics per model × account × region. No prices.
 
 ### 3.7a Token accounting (TPM next to RPM)
 
-A **chat** call is admitted on **both** budgets of its deployment: one request against RPM and
-its tokens against TPM, taken together in `PICK_TAKE` (both or neither). A chat model with only
+A call is admitted on **both** budgets of its deployment: one request against RPM and
+its tokens against TPM, taken together in `PICK_TAKE` (both or neither). A model with only
 `rpm` or only `tpm` is limited on that one.
 
-**Embedding models are RPM only.** They have no token budget: `tpm` (and every token setting) on
-a model of `type: embedding` is refused at boot, no tokens are estimated or counted for them,
-and each embedding call (one batch) costs exactly one request. Everything below is for chat
-models.
+**Each budget is optional and can be switched on and off per model.** `rpm` and `tpm` are
+enforced when they are set. `rate_limits` turns enforcement off without deleting the numbers:
+
+| `rate_limits` | Effect |
+|---|---|
+| `"both"` | RPM and TPM enforced (whichever is set) |
+| `"rpm"` | Only RPM enforced; no token estimate, reservation or correction |
+| `"tpm"` | Only TPM enforced |
+| `"off"` | No budget; only the adaptive limiter protects the provider |
+
+Defaults: `"both"` for a chat model, `"rpm"` for an embedding model (embedding quotas are
+normally per request). An embedding model may set `rate_limits: "both"` with a `tpm`; its
+tokens are then its input only (no output), each batch costs one request plus its input
+tokens, and usage comes from the response (Titan body; Cohere from the
+`x-amzn-bedrock-input-token-count` header). The setting is live-editable at every level, so
+an operator can switch token limiting off during an incident and back on after.
 
 ```mermaid
 flowchart LR
@@ -322,7 +334,7 @@ flowchart LR
 | # | Today | 0.3 |
 |---|---|---|
 | T1 | Tokens are corrected only after a successful call; a throttled or failed attempt keeps its whole reservation, so a throttle storm also eats the token budget | Refund rules above |
-| T2 | Embedding calls reserve and count tokens (their input), although embedding quotas are per request only | Embedding models are RPM only: no token estimate, no `tpm` |
+| T2 | Embedding calls always reserve and count tokens; Cohere embeddings return no token count in the body, so theirs is never corrected | Token limiting is off for embedding models by default (`rate_limits: "rpm"`) and optional; when on, Cohere usage is read from the response header |
 | T3 | Tool definitions are counted only as far as they are plain strings in the request | Counted explicitly; scenario B47 |
 | T4 | The default output reservation is a fixed 1,000 when a call has no `max_tokens` | The model's inference default is used first |
 | T5 | No measure of how good the estimate is | `llmq_token_estimate_ratio` |
@@ -524,8 +536,9 @@ Everything is live-editable except the rows marked *deploy*.
 | `provider`, `model_id` | required | M (*deploy*) | Provider kind and its model id; one alias per model id |
 | `enabled` | true | A, M, R | false stops new calls there (in-flight calls finish) |
 | `rpm` | none | D, M, R | Requests per minute of a deployment; none = no budget, only the adaptive limiter |
-| `tpm` | none | D, M, R | Tokens per minute of a deployment, **chat models only** (§3.7a); refused on an embedding model |
-| `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details, chat models only (§3.7a) |
+| `tpm` | none | D, M, R | Tokens per minute of a deployment (§3.7a) |
+| `rate_limits` | `both` (chat), `rpm` (embedding) | D, A, M, R | Which budgets are enforced: `both`, `rpm`, `tpm`, `off`; switches enforcement without deleting the numbers |
+| `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
 | `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | Token bucket or calendar minute; burst allowance |
 | `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Cap and start value of calls in flight per deployment |
@@ -601,7 +614,7 @@ Rules:
 |---|---|
 | Region entry | A string (in-region model id) or an object for an inference profile (`name`, `region` to call, `profile_id`, optional settings); a profile is its own deployment with its own quota |
 | Regions | `confirmed` and `fallback` are the only place a region is named (no catalog). A region where the model is not available is found on the first calls: auto-disable and alert (§3.5) |
-| Validation (all errors at once) | Unknown setting names; `tpm` or a token setting on an embedding model; alias format; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `headroom` needs `rpm` or `tpm` on every confirmed deployment; `priority_reserve + normal_min_share` < 1; `after_secs` and `max_wait_secs` below `timeout_secs` (a warning when `model_fallback.after_secs` is below `fallback.after_secs`); `kind=openai` needs `base_url`; hook names are registered; `model_fallback` checks (§3.5); inference names, ranges and model type; queue names (existing rule) |
+| Validation (all errors at once) | Unknown setting names; `rate_limits` naming a budget that has no number (`"tpm"` without `tpm`); alias format; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `headroom` needs `rpm` or `tpm` on every confirmed deployment; `priority_reserve + normal_min_share` < 1; `after_secs` and `max_wait_secs` below `timeout_secs` (a warning when `model_fallback.after_secs` is below `fallback.after_secs`); `kind=openai` needs `base_url`; hook names are registered; `model_fallback` checks (§3.5); inference names, ranges and model type; queue names (existing rule) |
 | Secrets | `api_key_ref` and `external_id_ref` name an environment variable or secret key; the value is read by the process and never stored in Valkey |
 | Compatibility | Clean break in 0.3.0: `LLMQ_MODELS`, `LLMQ_SETTINGS`, `LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_DEFAULT`, `LLMQ_WORKER_SLOTS`, `Target`, `targets`, `skip_targets`, `alias@target`, `Lane` and every per-lane setting are removed; `gpt120b@primary` becomes `gpt120b@aws-main/ap-south-1` in keys and metrics, so learned limiter state starts fresh. Upgrade steps: §6.1 |
 
@@ -931,7 +944,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B29 | Real quota 200, configured 500 | 429 rate < 5 % within 60 s; traffic moves; one alert with the observed rate |
 | B30 | Worker killed with 50 calls in progress | all 50 finish elsewhere within 60 s; 0 lost |
 | B31 | A bulk run of 5,000 normal calls fills the quota; 50 priority calls arrive mid-minute; then constant priority load | priority calls start within 2 s (they use `priority_reserve`); under constant priority load normal calls still get `normal_min_share` |
-| B32 | Bulk embed 50K texts on titan and cohere | batch sizes as §3.7; RPM held per deployment (one request per batch, no token budget); vectors in input order |
+| B32 | Bulk embed 50K texts on titan and cohere, with the default (`rpm`) and with `rate_limits: "both"` | batch sizes as §3.7; RPM held per deployment (one request per batch); with `both`, TPM held too and corrected from usage; vectors in input order |
 | B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 failed priority calls, mixed versions safe, registry version never goes back |
 | B34 | Ramp from 10K / min until something saturates | the ceiling, the bottleneck and the state-store memory recorded here |
 | B35 | Live suite (`-m live`, dev account), off by default | each model × deployment answers once; a failure names the deployment and the AWS error |
@@ -950,7 +963,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B48 | The same request id sent twice, 100 ms apart and after the first finished | one provider call; both callers get the same result within the result TTL |
 | B49 | TPM is the tighter limit: RPM 1,000, TPM 100K, calls of ~2K tokens | starts per minute ≈ 50, tokens per minute ≤ 100K in every window on every deployment; RPM never the reason for a refusal |
 | B50 | Token refunds: 30 % of attempts throttled by the provider; calls that use far fewer tokens than `max_tokens` | throttled attempts return their tokens (throughput within 5 % of the no-throttle run); the budget follows real usage, not the reservations |
-| B51 | Usage missing in a chat response, a stream cut mid-way, `tpm_output_weight=5`, a request larger than `tpm`, `tpm` set on an embedding model | estimate kept and counted as missing; partial stream charged for what was received; weighted tokens held under the quota; `request_too_large` at once; the embedding config refused at boot |
+| B51 | Usage missing in a chat response, a stream cut mid-way, `tpm_output_weight=5`, a request larger than `tpm`; `rate_limits` switched live from `both` to `rpm` and to `off` and back | estimate kept and counted as missing; partial stream charged for what was received; weighted tokens held under the quota; `request_too_large` at once; each switch applies within `cfg_reload_secs` and only the enabled budgets refuse calls |
 
 ## 6. Work plan by release
 
@@ -969,7 +982,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | | A10 | Sticky sessions; latency-aware exclusion; health, auto-disable and probe; quota-drop alert | B10, B28, B29, B37 |
 | **0.3.2** | A11 | In-progress set, per-request status, sweeper | B13, B30; extra Valkey cost per call measured |
 | | A12 | Status reader, Python API, CLI views, HTTP router, alerts, both metric sinks, `debug_capture` | B14, B36 |
-| | A13 | Embedding batching (RPM only), token estimator hook and token metrics for chat | B15, B32 |
+| | A13 | Embedding batching, optional token limiting for embeddings, token estimator hook and token metrics | B15, B32 |
 | **0.3.3** | A14 | Streaming, queued and direct | B25-B27 |
 | every release | A15 | Load and deploy scenarios, live suite, docs, samples, CHANGELOG | B17, B33-B35; all green on both engines |
 
@@ -1064,7 +1077,7 @@ off (uat / prod today) there is nothing to drain.
 | E64 | Propagation of live edits | Polling only: every process reloads within `cfg_reload_secs` (30 s) |
 | E65 | Edit rights and audit | Whoever can reach the CLI / the store may edit; every edit records the actor, time, before and after; the audit stream is kept 90 days (`audit_retention_days`) |
 | E66 | Token accounting | A chat call is admitted on RPM and TPM together; tokens are estimated, then corrected from real usage; refunds on throttles, partial charge on failures and cut streams; output weight, estimate-quality metric, `request_too_large` (§3.7a) |
-| E67 | Embedding models | RPM only: no `tpm`, no token estimate or token metrics; one request per batch |
+| E67 | Budgets on and off | `rate_limits` = `both` / `rpm` / `tpm` / `off` per model (live, every level). Default `both` for chat and `rpm` for embeddings; an embedding model may turn token limiting on |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
