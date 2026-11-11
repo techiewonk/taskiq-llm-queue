@@ -464,3 +464,69 @@ async def test_store_reset_reregisters_running_calls(
     assert await store.exists(engine.keys.epoch)
     with contextlib.suppress(CallFailed):  # the call's own records were lost with the store
         await task
+
+
+# ---------------------------------------------------------------- A11: health
+
+
+async def test_target_errors_disable_a_deployment(make: Make) -> None:
+    engine, fake = await make(
+        {"big": {"health": {"disable_errors": 3, "probe_after_secs": 600}}},
+        {"models": {f"{GPT}@r1": {"force_error": "AccessDeniedException"}}},
+    )
+    for _ in range(3):
+        reply = await engine.call("big", CHAT)
+        assert reply.meta.deployment == "aws-a/r2"
+        assert reply.meta.attempts == 2
+    assert "aws-a/r1" in await engine.health.disabled("big")
+    after = await engine.call("big", CHAT)
+    assert after.meta.attempts == 1  # r1 is skipped now
+    assert _stats(fake, f"{GPT}@r1")["calls"] == 3
+
+
+async def test_request_caused_errors_are_forgiven(make: Make) -> None:
+    denied = {"force_error": "AccessDeniedException"}
+    engine, _ = await make(
+        {"big": {"health": {"disable_errors": 1}}},
+        {"models": {f"{GPT}@r1": denied, f"{GPT}@r2": denied, f"{GPT}@r3": denied}},
+    )
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT)
+    assert info.value.kind == "provider_error"
+    assert await engine.health.disabled("big") == {}  # nothing disabled by a bad request
+
+
+async def test_last_usable_deployment_is_never_disabled(make: Make) -> None:
+    engine, _ = await make(
+        {"small": {"health": {"disable_errors": 1}, "max_attempts": 1}},
+        {"models": {f"{SMALL}@r1": {"force_error": "AccessDeniedException"}}},
+    )
+    with pytest.raises(CallFailed):
+        await engine.call("small", CHAT)
+    assert await engine.health.disabled("small") == {}
+
+
+async def test_probe_recovers_or_backs_off(make: Make) -> None:
+    engine, fake = await make()
+    await engine.health.disable("big", "aws-a/r1", probe_after_secs=0)
+    with pytest.raises(CallFailed) as info:
+        await engine.call("big", CHAT, allowed_regions=["r1"])
+    assert info.value.kind == "model_unavailable"
+    assert await engine.probe_due("big") == {"aws-a/r1": "recovered"}
+    assert (await engine.call("big", CHAT, allowed_regions=["r1"])).ok
+    fake.scenario.patch_model(f"{GPT}@r2", {"force_error": "ResourceNotFoundException"})
+    await engine.health.disable("big", "aws-a/r2", probe_after_secs=0)
+    assert await engine.probe_due("big") == {"aws-a/r2": "waiting"}
+    health = await engine.health.snapshot("big")
+    assert int(health["aws-a/r2|wait"]) == 60000  # doubles, never below 60 s
+
+
+async def test_credential_failure_is_per_process(make: Make) -> None:
+    engine, _ = await make(
+        {"small": {"max_attempts": 3}},
+        {"models": {f"{SMALL}@r1": {"force_error": "UnrecognizedClientException"}}},
+    )
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT)
+    assert info.value.kind == "credentials_unavailable"
+    assert "aws-a" in engine._bad_accounts

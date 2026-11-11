@@ -100,6 +100,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine",),
         needs_stack=True,
     ),
+    "a11": Step(
+        "Health: auto-disable with safeguards, probes, credentials per process",
+        sources=("src/taskiq_llm_queue/engine", "tools/fakellm/fakellm"),
+        tests=("tests/integration/engine/test_runtime.py",),
+        needs_stack=True,
+    ),
 }
 
 

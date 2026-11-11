@@ -1073,7 +1073,9 @@ provider error. `max_wait_secs` counts the waiting before the first grant only; 
 **Health (R16, R26, R27).**
 
 - A request that gets a target error on two deployments is the cause: it fails as fatal and its
-  errors are not counted. A success on a deployment resets its error count. Only model, region
+  errors are not counted. Target errors are recorded only once the call's outcome is known (a
+  success elsewhere, or a failure on that one deployment), so a single bad request can never
+  disable a deployment, whatever `disable_errors` is. A success on a deployment resets its error count. Only model, region
   and access errors count.
 - The last usable deployment of a model is never auto-disabled; an alert is raised instead.
 - A credential error makes the account unusable in that process only: its deployments are

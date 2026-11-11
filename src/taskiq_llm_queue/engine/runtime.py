@@ -38,6 +38,7 @@ from taskiq_llm_queue.engine.admission import (
 )
 from taskiq_llm_queue.engine.envelope import Envelope, Meta, Reply, params_hash, parse
 from taskiq_llm_queue.engine.errors import CallFailed
+from taskiq_llm_queue.engine.health import Health
 from taskiq_llm_queue.engine.keys import Keys
 from taskiq_llm_queue.engine.queue import Message, QueueFull, QueueSettings, StreamQueues
 from taskiq_llm_queue.engine.requests import RequestStore
@@ -52,6 +53,22 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 OPS = {("bedrock", "chat"): "converse", ("bedrock", "embedding"): "invoke_model"}
+
+
+def _probe_params(provider: str, kind: str, model_id: str) -> dict[str, Any]:
+    """The default probe request: one short word, one output token."""
+    if kind == "embedding":
+        if provider == "openai":
+            return {"input": "ping"}
+        if "cohere" in model_id:
+            return {"body": {"texts": ["ping"], "input_type": "search_query"}}
+        return {"body": {"inputText": "ping"}}
+    if provider == "openai":
+        return {"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+    return {
+        "messages": [{"role": "user", "content": [{"text": "ping"}]}],
+        "inferenceConfig": {"maxTokens": 1},
+    }
 
 
 def _auth_error(code: str) -> bool:
@@ -102,6 +119,7 @@ class _Held:
     meta: dict[str, dict[str, Any]] = field(default_factory=dict)
     broken: bool = False
     cancelled: bool = False
+    target_failed: list[tuple[str, str]] = field(default_factory=list)
     run: asyncio.Task[None] | None = None
 
     @property
@@ -182,6 +200,9 @@ class Engine:
         self._stopping = False
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self.health = Health(state, self.keys)
+        # Accounts whose credentials failed in this process: account -> (until, backoff).
+        self._bad_accounts: dict[str, tuple[float, float]] = {}
         self._idle = asyncio.Event()
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
@@ -203,6 +224,7 @@ class Engine:
                 self._slots[alias] = asyncio.Semaphore(slots)
                 self._tasks.append(asyncio.create_task(self._model_loop(alias)))
             self._tasks.append(asyncio.create_task(self._sweeper()))
+            self._tasks.append(asyncio.create_task(self._prober()))
             self._cancels = self.state.pubsub()
             await self._cancels.subscribe(self.keys.cancel_channel)
             self._tasks.append(asyncio.create_task(self._cancel_reader()))
@@ -738,6 +760,8 @@ class Engine:
         if env.allowed_accounts:
             deps = [d for d in deps if d.account in env.allowed_accounts]
         fallback_ok = self._may_spill(view, alias, env, age, cause, "fallback")
+        now = time.monotonic()
+        deps = [d for d in deps if self._bad_accounts.get(d.account, (0.0, 0.0))[0] <= now]
         out = []
         for dep in deps:
             if dep.group == "fallback" and not fallback_ok:
@@ -960,7 +984,19 @@ class Engine:
         env = held.envelope
         ask = self._ask(view, alias, held, attempt, failed)
         if ask is None:
-            await self._finish_call(held, "no_deployment", "the call's filter leaves no deployment")
+            if self._bad_accounts and any(
+                d.account in self._bad_accounts for d in view.deployments(alias)
+            ):
+                await self._finish_call(
+                    held,
+                    "credentials_unavailable",
+                    "no account with working credentials",
+                    retry_after=60,
+                )
+            else:
+                await self._finish_call(
+                    held, "no_deployment", "the call's filter leaves no deployment"
+                )
             return None
         params = self._params(view, alias, env, None)
         estimate = self._estimate(view, alias, env, params)
@@ -996,8 +1032,11 @@ class Engine:
                 return await self._decide(view, alias, held, attempt, failed)
             fell = await self._model_fallback(view, alias, held, attempt, 1e9, broken=True)
             if not fell:
+                due = await self.health.disabled(alias)
+                wait = max(1.0, min(due.values()) - self.clock.now()) if due else 60.0
+                logger.error("model_unavailable", model=alias)
                 await self._finish_call(
-                    held, "model_unavailable", "no usable deployment", retry_after=60
+                    held, "model_unavailable", "no usable deployment", retry_after=wait
                 )
             return None
         return decision
@@ -1274,9 +1313,13 @@ class Engine:
                 latency_ms=-1,
             )
             if is_target_error(exc, info):
-                return "retry", ("target", None, exc)
+                return await self._target_error(view, alias, held, dep_key, exc)
             if _auth_error(info.code):
                 self.providers.pool.forget(route)
+                _, backoff = self._bad_accounts.get(deployment.account, (0.0, 2.5))
+                backoff = min(backoff * 2, 60.0)
+                self._bad_accounts[deployment.account] = (time.monotonic() + backoff, backoff)
+                logger.error("account_credentials_failed", account=deployment.account)
                 return "retry", ("auth", None, exc)
             return "fatal", ("fatal", None, exc)
         latency = (time.monotonic() - started) * 1000
@@ -1310,6 +1353,7 @@ class Engine:
         )
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
         await self.requests.put_result(reply, final_state="done")
+        await self._count_target_errors(held, succeeded=True)
         await self.requests.set_status(
             env.request_id,
             "done",
@@ -1321,6 +1365,94 @@ class Engine:
         )
         await self._ack(held)
         return "ok", None
+
+    async def _target_error(
+        self, view: ResolvedRegistry, alias: str, held: _Held, dep_key: str, exc: BaseException
+    ) -> tuple[str, Any]:
+        """Note a target error; a request failing this way on two deployments is the cause.
+
+        Nothing is counted yet: `_count_target_errors` records them once the call's outcome
+        shows whether the deployment or the request was at fault (plan §3.18 R16).
+        """
+        held.target_failed.append((alias, dep_key))
+        if len({d for _, d in held.target_failed}) >= 2:
+            return "fatal", ("request", None, exc)
+        return "retry", ("target", None, exc)
+
+    async def _count_target_errors(self, held: _Held, *, succeeded: bool) -> None:
+        """Count noted target errors: after a success elsewhere, or a failure on one deployment."""
+        noted = held.target_failed
+        held.target_failed = []
+        if not noted or (not succeeded and len({d for _, d in noted}) >= 2):
+            return
+        view = self.registry.current
+        for alias, dep_key in noted:
+            settings = view.value(alias, "health", dep_key)
+            others = [d.key for d in view.deployments(alias) if d.key != dep_key]
+            outcome = await self.health.record_target_error(
+                alias,
+                dep_key,
+                held.envelope.request_id,
+                others=others,
+                window_secs=float(settings["disable_window_secs"]),
+                needed=int(settings["disable_errors"]),
+                probe_after_secs=float(settings["probe_after_secs"]),
+            )
+            if outcome == "disabled":
+                logger.error("deployment_disabled", model=alias, deployment=dep_key)
+            elif outcome == "last":
+                logger.error("deployment_failing_last_usable", model=alias, deployment=dep_key)
+
+    async def _prober(self) -> None:
+        """One process per model probes disabled deployments when they are due."""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                view = self.registry.current
+                for alias in view.registry.models:
+                    lock = await self.state.set(
+                        f"{self.keys.prefix}:lock:probe:{alias}", self.worker_id, nx=True, ex=5
+                    )
+                    if lock:
+                        await self.probe_due(alias)
+            except Exception as exc:
+                logger.warning("prober_failed", error=str(exc))
+
+    async def probe_due(self, alias: str) -> dict[str, str]:
+        """Probe every disabled deployment of a model that is due; their outcomes."""
+        view = self.registry.current
+        now = self.clock.now()
+        out: dict[str, str] = {}
+        for dep_key, due in (await self.health.disabled(alias)).items():
+            if due > now + 0.5:  # the local view of the store clock may lag slightly
+                continue
+            ok = await self._probe(view, alias, dep_key)
+            settings = view.value(alias, "health", dep_key)
+            out[dep_key] = await self.health.probed(
+                alias, dep_key, ok=ok, probe_max_secs=float(settings["probe_max_secs"])
+            )
+            if out[dep_key] == "recovered":
+                logger.info("deployment_recovered", model=alias, deployment=dep_key)
+        return out
+
+    async def _probe(self, view: ResolvedRegistry, alias: str, dep_key: str) -> bool:
+        """One small real call on a deployment: reachable and allowed (a throttle counts)."""
+        entry = view.registry.models[alias]
+        deployment = next((d for d in view.deployments(alias) if d.key == dep_key), None)
+        if deployment is None:
+            return True
+        op = OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
+        name = view.value(alias, "probe")
+        hook = hooks.get("probe", name)
+        params = (
+            hooks.call_safely("probe", name, hook, alias, op, default=None) if hook else None
+        ) or _probe_params(entry.provider, entry.type, entry.model_id)
+        provider = self.providers.get(entry.provider)
+        try:
+            await provider.call(op, params, route_for(view, deployment), Timing(30, 30))
+        except Exception as exc:
+            return provider.classify(exc).kind is ErrorKind.THROTTLE
+        return True
 
     # ================================================================ worker: settling
 
@@ -1354,6 +1486,7 @@ class Engine:
         retry_after: float | None = None,
     ) -> None:
         await self._reply(held.envelope, kind, message, final=final, retry_after=retry_after)
+        await self._count_target_errors(held, succeeded=False)
         await self._ack(held)
 
     async def _ack(self, held: _Held) -> None:

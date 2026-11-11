@@ -84,6 +84,13 @@ ERRORS: dict[str, ErrorSpec] = {
         "invalid_request_error",
         "model_not_found",
     ),
+    "UnrecognizedClientException": ErrorSpec(
+        403,
+        "The security token included in the request is invalid.",
+        401,
+        "invalid_request_error",
+        "invalid_api_key",
+    ),
 }
 
 # Errors counted as "throttled" in the stats rather than "errors".

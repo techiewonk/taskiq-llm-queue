@@ -239,7 +239,7 @@ local function evaluate(cand)
   if row == nil then return nil end
   local health = mk(alias, 'health')
   if row.enabled == false or row.account_enabled == false or row.outside_residency or row.blocked
-    or hnum(health, cand.key .. '|until', 0) > now then
+    or redis.call('HEXISTS', health, cand.key .. '|until') == 1 then
     return nil
   end
   local cb = mk(alias, 'cb:' .. cand.key)
@@ -481,6 +481,9 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
     local ac = mk(alias, 'ac:' .. dep)
     local limit, cap = limit_of(alias, row)
     if outcome == 'throttle' then
+      local thr = mk(alias, 'thr:' .. dep .. ':' .. minute)
+      redis.call('INCR', thr)
+      redis.call('EXPIRE', thr, 180)
       if hnum(ac, 'cut_at', 0) < now - 1000 then
         redis.call('HSET', ac, 'limit', tostring(math.max(1, math.floor(limit * 0.7))), 'cut_at', now)
       end
@@ -490,6 +493,7 @@ local function settle(alias, owner, rid, refund_r, refund_t, learn, outcome, lat
     local cb = mk(alias, 'cb:' .. dep)
     if outcome == 'ok' then
       redis.call('HSET', cb, 'state', 'closed', 'failures', 0, 'probe', '')
+      redis.call('DEL', mk(alias, 'terr:' .. dep))
     elseif outcome == 'fail' then
       local fails = redis.call('HINCRBY', cb, 'failures', 1)
       local probing = redis.call('HGET', cb, 'probe') == owner
