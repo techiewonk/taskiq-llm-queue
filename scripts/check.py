@@ -35,6 +35,11 @@ class Step:
 
 
 STEPS: dict[str, Step] = {
+    "a0": Step(
+        "Test prerequisites: fakellm accounts, TPM, speed, usage-missing, hang, streaming",
+        sources=("tools/fakellm/fakellm", "scripts"),
+        tests=("tests/unit/fakellm",),
+    ),
     "a1": Step(
         "Registry schema, settings, validation, resolve",
         sources=("src/taskiq_llm_queue/registry",),
@@ -106,7 +111,8 @@ def main() -> int:
     if unknown:
         print(f"unknown step(s): {', '.join(unknown)}; see --list")
         return 2
-    ok = all([run_step(n, STEPS[n]) for n in names])
+    results = [run_step(n, STEPS[n]) for n in names]  # run every step, then judge
+    ok = all(results)
     print("ALL PASS" if ok else "FAILED")
     return 0 if ok else 1
 

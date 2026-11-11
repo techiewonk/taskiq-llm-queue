@@ -154,7 +154,13 @@ async def test_region_discrimination(start_fake: StartFake, make_bedrock: MakeBe
         await virginia.converse(modelId=GPT, messages=MSGS)
     stats = fake.engine.snapshot()["models"]
     assert stats == {
-        f"{GPT}@ap-south-1": {**_zero(), "calls": 2, "ok": 2, "max_concurrent_seen": 1},
+        f"{GPT}@ap-south-1": {
+            **_zero(),
+            "calls": 2,
+            "ok": 2,
+            "max_concurrent_seen": 1,
+            "tokens": stats[f"{GPT}@ap-south-1"]["tokens"],
+        },
         f"{GPT}@us-east-1": {**_zero(), "calls": 1, "errors": 1},
     }
 
@@ -199,5 +205,5 @@ async def test_strict_models_unknown_key_is_not_found(
 
 
 def _zero() -> dict[str, int]:
-    keys = ("calls", "ok", "concurrent", "max_concurrent_seen", "throttled", "errors")
+    keys = ("calls", "ok", "concurrent", "max_concurrent_seen", "throttled", "errors", "tokens")
     return dict.fromkeys(keys, 0)

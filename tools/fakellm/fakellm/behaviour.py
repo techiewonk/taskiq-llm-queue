@@ -31,12 +31,15 @@ class KeyStats:
     max_concurrent_seen: int = 0
     throttled: int = 0
     errors: int = 0
+    tokens: int = 0
     window: deque[float] = field(default_factory=deque, repr=False)
+    token_window: deque[list[float]] = field(default_factory=deque, repr=False)
 
     def public(self) -> dict[str, int]:
-        """Counters without the private rpm window."""
+        """Counters without the private rpm / tpm windows."""
         data = asdict(self)
         del data["window"]
+        del data["token_window"]
         return data
 
 
@@ -47,6 +50,7 @@ class Outcome:
     behaviour: Behaviour
     error: str | None = None
     latency_ms: int = 0
+    reservation: list[float] | None = None
 
 
 class Engine:
@@ -94,17 +98,35 @@ class Engine:
         """Effective behaviour of `key` now, with due phases applied."""
         return self.scenario.merged(key, self.elapsed_s)
 
-    def resolve_bedrock_key(self, model_id: str, region: str) -> str:
-        """Pick the scenario key for a Bedrock call: `<model>@<region>`, else the profile id.
+    def resolve_bedrock_key(self, model_id: str, region: str, account: str | None = None) -> str:
+        """Pick the scenario key: `<model>@<account>/<region>`, `<model>@<region>`, the model id.
 
-        Profile ARNs also match on their last path segment (the profile id).
+        The account is the caller's access key id, so tests give each fake AWS account its own
+        key id and quota. Profile ARNs also match on their last path segment (the profile id).
         """
         models = self.scenario.models
-        candidates = [f"{model_id}@{region}", model_id]
+        ids = [model_id]
         if model_id.startswith("arn:") and "/" in model_id:
-            short = model_id.rsplit("/", 1)[1]
-            candidates += [f"{short}@{region}", short]
-        return next((c for c in candidates if c in models), candidates[0])
+            ids.append(model_id.rsplit("/", 1)[1])
+        candidates = []
+        for one in ids:
+            if account:
+                candidates.append(f"{one}@{account}/{region}")
+            candidates += [f"{one}@{region}", one]
+        return next((c for c in candidates if c in models), f"{model_id}@{region}")
+
+    def resolve_openai_key(self, model: str, account: str | None) -> str:
+        """Scenario key of an OpenAI-compatible call: `<model>@<api key>`, else the model."""
+        if account and f"{model}@{account}" in self.scenario.models:
+            return f"{model}@{account}"
+        return model
+
+    def settle(self, key: str, outcome: Outcome, used_tokens: int) -> None:
+        """Replace a call's TPM reservation by the tokens it really used (end of the call)."""
+        stats = self._key_stats(key)
+        stats.tokens += used_tokens
+        if outcome.reservation is not None:
+            outcome.reservation[1] = float(used_tokens)
 
     def _key_stats(self, key: str) -> KeyStats:
         return self.stats.setdefault(key, KeyStats())
@@ -122,8 +144,11 @@ class Engine:
         sigma = math.log(b.latency_p95_ms / b.latency_p50_ms) / _Z95
         return min(b.latency_p50_ms * math.exp(sigma * rng.gauss(0.0, 1.0)), 4 * b.latency_p95_ms)
 
-    async def call(self, key: str) -> Outcome:
-        """Admit or reject one call for `key`, sleep its latency and roll late failures."""
+    async def call(self, key: str, reserve_tokens: int = 0) -> Outcome:
+        """Admit or reject one call for `key`, sleep its latency and roll late failures.
+
+        `reserve_tokens` (input + max_tokens) is held against `tpm` until `settle`.
+        """
         b = self.behaviour(key)
         stats = self._key_stats(key)
         stats.calls += 1
@@ -144,6 +169,7 @@ class Engine:
                 (b.rpm is not None and len(stats.window) >= b.rpm)
                 or (b.max_concurrency is not None and stats.concurrent >= b.max_concurrency)
                 or throttle_roll < b.throttle_rate
+                or self._over_tpm(stats, b, now, reserve_tokens)
             ):
                 error = "ThrottlingException"
             else:
@@ -154,9 +180,15 @@ class Engine:
             else:
                 stats.errors += 1
             return Outcome(b, error=error)
+        reservation: list[float] | None = None
+        if b.tpm is not None:
+            reservation = [self._clock(), float(reserve_tokens)]
+            stats.token_window.append(reservation)
         stats.concurrent += 1
         stats.max_concurrent_seen = max(stats.max_concurrent_seen, stats.concurrent)
         try:
+            if b.hang:
+                await asyncio.Event().wait()  # never answers; the client gives up
             await self._sleep(latency_ms / 1000.0)
         finally:
             stats.concurrent -= 1
@@ -168,7 +200,16 @@ class Engine:
             stats.errors += 1
             return Outcome(b, error=error)
         stats.ok += 1
-        return Outcome(b, latency_ms=round(latency_ms))
+        return Outcome(b, latency_ms=round(latency_ms), reservation=reservation)
+
+    @staticmethod
+    def _over_tpm(stats: KeyStats, b: Behaviour, now: float, reserve: int) -> bool:
+        if b.tpm is None:
+            return False
+        while stats.token_window and now - stats.token_window[0][0] >= 60.0:
+            stats.token_window.popleft()
+        used = sum(entry[1] for entry in stats.token_window)
+        return used + reserve > b.tpm
 
     def snapshot(self) -> dict[str, object]:
         """Stats body for GET /admin/stats."""

@@ -96,6 +96,7 @@ async def test_max_concurrency_throttles_excess() -> None:
         "max_concurrent_seen": 3,
         "throttled": 7,
         "errors": 0,
+        "tokens": 0,
     }
 
 

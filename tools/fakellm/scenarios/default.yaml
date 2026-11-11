@@ -2,8 +2,16 @@
 # Bedrock keys are "<modelId>@<region>" (region from the SigV4 scope) or a cross-region
 # profile id; OpenAI-compatible keys are the request's "model". Unknown keys use defaults.
 #
-# Behaviour fields: latency_ms {p50, p95}, max_concurrency, rpm, throttle_rate,
-# error_rate_5xx, timeout_rate, tool_calls (echo|none), dims, force_error, retry_after_s.
+# Keys with an account: "<modelId>@<account>/<region>" where the account is the caller's AWS
+# access key id, or "<model>@<api key>" for OpenAI-compatible calls; without one, every account
+# shares the "<modelId>@<region>" / "<model>" key.
+#
+# Behaviour fields: latency_ms {p50, p95} (time to first response), max_concurrency, rpm,
+# tpm (reserves input + max_tokens at the start, settles to usage at the end, like Bedrock),
+# throttle_rate, error_rate_5xx, timeout_rate, tool_calls (echo|none), dims, force_error,
+# retry_after_s, tokens_per_s (output pace, 0 = instant), output_tokens (fixed reply length),
+# usage_missing (no usage in replies), hang (never answers).
+# Streaming: Bedrock ConverseStream (/converse-stream) and OpenAI chat with stream=true.
 seed: 42
 strict_models: false
 defaults: {latency_ms: {p50: 800, p95: 2500}, error_rate_5xx: 0.0}

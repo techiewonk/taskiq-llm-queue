@@ -96,7 +96,9 @@ async def test_stats_and_reset(start_fake: StartFake) -> None:
         "max_concurrent_seen": 1,
         "throttled": 0,
         "errors": 0,
+        "tokens": body["models"]["m"]["tokens"],
     }
+    assert body["models"]["m"]["tokens"] > 0  # settled usage of the two calls
     assert await call(fake, "POST", "/admin/reset") == (200, {"status": "reset"})
     _, body = await call(fake, "GET", "/admin/stats")
     assert body["models"] == {}

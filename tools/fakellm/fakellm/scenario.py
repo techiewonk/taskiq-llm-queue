@@ -26,6 +26,11 @@ _FIELDS = frozenset(
         "dims",
         "force_error",
         "retry_after_s",
+        "tpm",
+        "tokens_per_s",
+        "output_tokens",
+        "usage_missing",
+        "hang",
     }
 )
 
@@ -38,8 +43,10 @@ class ScenarioError(ValueError):
 class Behaviour:
     """Effective behaviour of one model x target key at one instant.
 
-    `max_concurrency` / `rpm` of None mean unlimited; `force_error` names an `ERRORS`
-    entry returned on every call (handy for SDK error-parse tests and outage drills).
+    `max_concurrency` / `rpm` / `tpm` of None mean unlimited; `force_error` names an `ERRORS`
+    entry returned on every call. `tpm` reserves input + max_tokens at the start and settles to
+    the real usage at the end, like Bedrock. `tokens_per_s` paces the output (0 = instant),
+    `output_tokens` fixes the reply length, `usage_missing` drops usage, `hang` never answers.
     """
 
     latency_p50_ms: float = 0.0
@@ -53,6 +60,11 @@ class Behaviour:
     dims: int = 1024
     force_error: str | None = None
     retry_after_s: float = 1.0
+    tpm: int | None = None
+    tokens_per_s: float = 0.0
+    output_tokens: int | None = None
+    usage_missing: bool = False
+    hang: bool = False
 
 
 def _positive_int(name: str, value: Any, *, nullable: bool) -> int | None:
@@ -69,6 +81,12 @@ def _number(name: str, value: Any, *, upper: float | None = None) -> float:
     if upper is not None and value > upper:
         raise ScenarioError(f"{name} must be <= {upper}, got {value!r}")
     return float(value)
+
+
+def _flag(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ScenarioError(f"{name} must be true or false, got {value!r}")
+    return value
 
 
 def build_behaviour(block: dict[str, Any]) -> Behaviour:
@@ -102,6 +120,11 @@ def build_behaviour(block: dict[str, Any]) -> Behaviour:
         dims=_positive_int("dims", block.get("dims", 1024), nullable=False) or 1024,
         force_error=force_error,
         retry_after_s=_number("retry_after_s", block.get("retry_after_s", 1.0)),
+        tpm=_positive_int("tpm", block.get("tpm"), nullable=True),
+        tokens_per_s=_number("tokens_per_s", block.get("tokens_per_s", 0.0)),
+        output_tokens=_positive_int("output_tokens", block.get("output_tokens"), nullable=True),
+        usage_missing=_flag("usage_missing", block.get("usage_missing", False)),
+        hang=_flag("hang", block.get("hang", False)),
         **rates,
     )
 
