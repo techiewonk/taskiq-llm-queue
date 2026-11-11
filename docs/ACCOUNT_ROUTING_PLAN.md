@@ -586,7 +586,6 @@ Everything is live-editable except the rows marked *deploy*.
 | `retry_budget_pct` | 20 | D, M | Retries a model may make per minute, as a share of its first attempts; beyond it calls fail fast |
 | `stream_idle_secs` | 30 | D, M | A stream with no chunk for this long ends with an error event |
 | `max_waiting` | 50000 | D, M | Calls allowed to wait per model; above it a send gets `queue_full`; 0 = no limit |
-| `quota_share` | 1.0 | D, A, M, R | Share (0 to 1) of `rpm` / `tpm` this environment may use, when several environments call one account |
 | `sticky_move_after_secs` | 1 | D, M | A sticky session moves only when its deployment is unusable or would wait longer than this |
 | `tags` | none | R | Free labels of a deployment, visible to custom hooks |
 | `residency.allowed_regions` | none | top level, M (*deploy*) | Regions calls may ever reach; a deployment or profile outside the list is refused at boot (§3.18) |
@@ -1124,9 +1123,6 @@ redrive keeps the class and skips calls past their deadline.
 alone: `exhausted` means no free slot, status shows `limit: null`, quota alerts are silent, and
 `headroom` or `require_headroom` on it is refused at boot.
 
-**Several environments on one account (R33).** `quota_share` multiplies `rpm` / `tpm`; dev, uat
-and prod on one AWS account set shares that add up to 1.
-
 **Residency (R36).** `residency.allowed_regions` (top level, or per model; deploy only) lists
 the regions calls may reach. A deployment outside it is refused at boot; an inference profile
 must declare `routes_to` and every region in it must be allowed.
@@ -1208,7 +1204,6 @@ per process, so their totals grow with the number of pods; everything else is in
 | U21 | Security reviewer | A list of what text is stored where and for how long, who can edit the registry, and proof that no call leaves the approved regions | The design can be signed off |
 | U22 | Bulk ingestion owner | To embed 1M texts without filling the queue store or slowing chat | Nightly indexing is safe |
 | U23 | Tester | Every scenario runnable locally on fakellm with one command and a numeric pass condition | A regression is caught before release |
-| U24 | Platform owner | A share of one account's quota per environment | dev and uat cannot spend prod's quota |
 | U25 | Operator | To rotate the store password and API keys without a restart | Rotation is routine |
 
 ## 5. Scenarios
@@ -1302,7 +1297,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B80 | A handler that crashes its worker 10 times on one call | the caller gets `dead_lettered` within one visibility period; one alert; other calls' failure counts ≤ 2 |
 | B81 | Pod clocks ± 5 s and one at + 90 s | budgets within 1 % of the no-skew run; 0 extra receives; no call expires more than 2 s early |
 | B82 | 4 models without rpm / tpm, 2,000 calls / min against a provider quota of 500 | 429 rate < 5 % after 60 s; status shows `limit: null`; no quota alert |
-| B83 | Two prefixes with `quota_share` 0.7 and 0.3 on one provider key | combined starts ≤ the quota in every window; 429 rate < 1 % |
+| B83 | (removed with `quota_share`, E113) | — |
 | B84 | A model restricted to two India regions, with a region outage, a model fallback and a cross-region profile | 0 calls outside the list; the profile is refused at boot |
 | B85 | A live edit of each protected field under `registry_live_edit=safe` | refused and audited as refused |
 | B86 | Both stores scanned 10 min after a run; forced store, STS and API-key auth failures | 0 keys holding message text outside the dead-letter queue; no secret in any log line, status body or audit entry |
@@ -1342,7 +1337,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | | A4 | Lanes replaced by the priority flag: envelope version 2, context, result reader, metric labels, LangChain adapters (alias or model id, `priority`, inference defaults); the existing scenario harness and samples ported | R01-R12 pass on the ported harness |
 | | A5 | Queues: stream backend default, queue pair per model, generation and failure counters, `return`, queues created at start, two stores, store clock in every script, `max_waiting`, dead-letter notice and `dlq` commands | B23, B24, B39, B42, B43, B76, B80, B81 |
 | | A6 | `PICK_TAKE` and `PICK_UNDO`: strategies and `balance_priority`, RPM / TPM and account budgets, slot per class, in-progress entry with owner token, waiter order, sweeper, custom balancer hook | B01-B04, B18-B21, B31, B58-B62, B64-B67, B71, B91 |
-| | A7 | Token accounting: refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`, `output_reserve`, `max_wait_secs`, expired calls answered as `rate_limited`, no-quota mode, `quota_share` | B46, B49-B51, B57, B82, B83 |
+| | A7 | Token accounting: refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`, `output_reserve`, `max_wait_secs`, expired calls answered as `rate_limited`, no-quota mode | B46, B49-B51, B57, B82 |
 | | A8 | Worker loop: held head call per model and class, batch admitted in order, retries (last choice, `max_attempts`, retry budget), timeout rule | B53, B56, B63, B72, B73 |
 | | A9 | Region and model fallback rules and hook, per-deployment params, inference defaults per provider, tool calls in the estimate, `allowed_regions` / `allowed_accounts`, residency guard, blocked regions | B06, B07, B38, B45, B47, B52, B84, B87 |
 | | A10 | Pod-count logic removed; `store_down` modes; once-locks; duplicate request ids; caller-gone cancel; shutdown order; kill switch and `queue_pct` | B16, B22 (shares), B33, B48, B74, B75, B88, B89 |
@@ -1483,14 +1478,15 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E102 | Duplicate request ids | Results read without delete; key includes user and params; `request_id_conflict`, `result_expired` |
 | E103 | Stream redelivery | A redelivered stream ends with `worker_lost` and the partial text; never restarted in the same stream |
 | E104 | Stores | Both `noeviction`; out of memory is its own error; `max_waiting` 50,000; the store's clock everywhere |
-| E105 | Shared quota | `quota_share` per environment |
+| E105 | Shared quota | Withdrawn by E113 |
 | E106 | Residency | `residency.allowed_regions`, deploy only; profiles declare `routes_to` |
 | E107 | Text at rest | TTL per key, TLS and encryption required, dead letters kept 1 day, keyed id hashing |
 | E108 | Operations | `block`, `drain`, `dlq`, `registry log`; `/health/live` and `/health/ready`; `wait_reason` and `tried` in the status |
 | E109 | No quota numbers | Limiter only; `exhausted` = no slot; `headroom` refused |
 | E110 | Work plan | Reordered into A0-A17 (§6) |
 | E111 | Per-user limits | Not in 0.3; `register_admission` can reject by user |
-| E112 | Owner confirmation (2026-11-12) | Environments share one AWS account and split it with `quota_share`; residency lists per model; live edits limited to safe fields; no per-user cap in 0.3 |
+| E112 | Owner confirmation (2026-11-12) | Residency lists per model; live edits limited to safe fields; no per-user cap in 0.3 |
+| E113 | Environments | No split of an account's quota between environments: `quota_share` is not built; each environment is configured with the RPM / TPM it may use |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1502,7 +1498,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | Q1 | RPM / TPM per region for the four first models |
 | Q2 | For each of the four first models: which regions are confirmed and which fallback |
 | Q3 | Account ids and role ARNs when a second AWS account is added (0.3.1) |
-| Q5 | `quota_share` per environment (for example prod 0.8, uat 0.15, dev 0.05) and the residency list of each model |
+| Q5 | The residency list of each model, once compliance answers |
 | Q4 | Compliance sign-off that request text may be processed in every region listed as confirmed or fallback (the cohere list includes EU, US, Canada and Brazil) |
 
 ## 9. Review: gaps found and fixed (2026-11-11)
@@ -1606,7 +1602,7 @@ configuration. Every row is fixed in the section named.
 | R30 | The caller of a dead-lettered call was not told | `dead_lettered` reply, metric, alert, `dlq` commands | §3.18, B80 |
 | R31 | A late status write could replace a final state | Final states are never replaced; TTL rule | §3.18 |
 | R32 | Alerts were sent at most once | State alerts are gauges | §3.18 |
-| R33 | Each environment believed it owned the whole account quota | `quota_share` | §3.18, B83 |
+| R33 | Each environment keeps its own budget for the same account | Not handled: the owner does not need a split between environments (E113) | — |
 | R34 | Prompts and responses at rest were not covered by the privacy rules | Table of text at rest with a TTL per key; TLS and encryption | §3.18, B86 |
 | R35 | Anyone reaching the store could change `base_url`, a role or guardrail params live | `registry_live_edit=safe` | §3.18, B85 |
 | R36 | No hard guard on the regions a model may reach | `residency.allowed_regions`; `routes_to` on profiles | §3.18, B84 |
