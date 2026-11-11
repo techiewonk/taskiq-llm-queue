@@ -1,0 +1,22 @@
+{
+  "registry_version": 1,
+  "accounts": {
+    "aws-main": {
+      "kind": "aws"
+    }
+  },
+  "models": {
+    "gpt20b": {
+      "type": "chat",
+      "provider": "bedrock",
+      "model_id": "openai.gpt-oss-20b-1:0",
+      "deployments": {
+        "aws-main": {
+          "confirmed": [
+            "ap-south-1"
+          ]
+        }
+      }
+    }
+  }
+}

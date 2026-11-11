@@ -1,0 +1,95 @@
+"""Run the checks of one work step (plan §6) or of everything: lint, format, types, tests.
+
+Every test run of the 0.3 work goes through this script, so a step is "done" only when
+`python scripts/check.py <step>` passes. No step calls a real LLM: stack tests use fakellm.
+
+    python scripts/check.py a1          # one step
+    python scripts/check.py a1 a2       # several
+    python scripts/check.py all         # every step built so far
+    python scripts/check.py --list      # what each step runs
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PY = str(ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python")
+
+
+@dataclass(frozen=True)
+class Step:
+    """What one step checks: source paths (lint and types) and test paths (pytest)."""
+
+    title: str
+    sources: tuple[str, ...]
+    tests: tuple[str, ...]
+    needs_stack: bool = False
+    extra: tuple[tuple[str, ...], ...] = field(default=())
+
+
+STEPS: dict[str, Step] = {
+    "a1": Step(
+        "Registry schema, settings, validation, resolve",
+        sources=("src/taskiq_llm_queue/registry",),
+        tests=("tests/unit/registry",),
+    ),
+}
+
+
+def _run(label: str, cmd: list[str]) -> bool:
+    started = time.monotonic()
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+    ok = proc.returncode == 0
+    secs = time.monotonic() - started
+    print(f"  {'PASS' if ok else 'FAIL'}  {label} ({secs:.1f}s)")
+    if not ok:
+        print((proc.stdout + proc.stderr).rstrip()[-4000:])
+    return ok
+
+
+def run_step(name: str, step: Step) -> bool:
+    """Run every check of one step; print one line per check."""
+    print(f"[{name}] {step.title}")
+    paths = [*step.sources, *step.tests]
+    results = [
+        _run("ruff check", [PY, "-m", "ruff", "check", *paths]),
+        _run("ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
+        _run("mypy", [PY, "-m", "mypy", "--no-incremental", *paths]),
+        _run(
+            "pytest",
+            [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", *step.tests],
+        ),
+    ]
+    results += [_run(" ".join(cmd), [PY, *cmd]) for cmd in step.extra]
+    return all(results)
+
+
+def main() -> int:
+    """Parse the step names and run them; exit 1 if any check fails."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("steps", nargs="*", help="step names (a1, a2, ...) or all")
+    parser.add_argument("--list", action="store_true", help="show the steps and exit")
+    args = parser.parse_args()
+    if args.list or not args.steps:
+        for name, step in STEPS.items():
+            print(f"{name:5} {step.title}  ({', '.join(step.tests)})")
+        return 0
+    names = list(STEPS) if args.steps == ["all"] else args.steps
+    unknown = [n for n in names if n not in STEPS]
+    if unknown:
+        print(f"unknown step(s): {', '.join(unknown)}; see --list")
+        return 2
+    ok = all([run_step(n, STEPS[n]) for n in names])
+    print("ALL PASS" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

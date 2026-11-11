@@ -1,0 +1,310 @@
+{
+  "registry_version": 1,
+  "defaults": {
+    "timeout_secs": 120,
+    "normal_min_share": 0.1,
+    "balance": "ordered",
+    "store_down": "pause",
+    "request_status": "full",
+    "queue_pct": 100,
+    "worker_slots": 20,
+    "attempt_timeout_secs": 60,
+    "retry_attempts": 3,
+    "throttle_retry_attempts": 6,
+    "inference": {
+      "temperature": 0.2,
+      "max_tokens": 2048
+    },
+    "queue": {
+      "visibility_secs": 60,
+      "max_receives": 10,
+      "retention_secs": 345600
+    },
+    "health": {
+      "disable_errors": 3,
+      "disable_window_secs": 300,
+      "probe_after_secs": 900,
+      "probe_max_secs": 7200,
+      "slow_ratio": 3.0,
+      "slow_min_secs": 5,
+      "slow_min_samples": 20
+    },
+    "alerts": {
+      "quota_used_pct": 90,
+      "quota_used_mins": 5,
+      "spill_pct": 20,
+      "waiting_age_secs": 60
+    }
+  },
+  "routing": {
+    "kill_switch": false,
+    "allow_users": []
+  },
+  "residency": {
+    "allowed_regions": [
+      "ap-south-1",
+      "ap-south-2"
+    ]
+  },
+  "accounts": {
+    "aws-main": {
+      "kind": "aws",
+      "settings": {
+        "shared_rpm": 5000
+      }
+    },
+    "aws-dr": {
+      "kind": "aws",
+      "enabled": true,
+      "role_arn": "arn:aws:iam::222222222222:role/llmq-bedrock",
+      "external_id_ref": "LLMQ_DR_EXTERNAL_ID",
+      "settings": {
+        "attempt_timeout_secs": 45
+      }
+    },
+    "vllm-dc1": {
+      "kind": "openai",
+      "base_url": "https://vllm.internal/v1",
+      "api_key_ref": "LLMQ_VLLM_API_KEY"
+    }
+  },
+  "models": {
+    "gpt120b": {
+      "type": "chat",
+      "provider": "bedrock",
+      "model_id": "openai.gpt-oss-120b-1:0",
+      "rpm": 500,
+      "tpm": 400000,
+      "timeout_secs": 120,
+      "max_wait_secs": 30,
+      "priority_reserve": 0.3,
+      "balance": "headroom",
+      "balance_opts": {
+        "pick": "percent"
+      },
+      "sticky": {
+        "key": "session",
+        "idle_ttl_secs": 1800
+      },
+      "store_down": "static_cap",
+      "inference": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "max_tokens": 4096,
+        "stop": [
+          "</answer>"
+        ],
+        "extra": {
+          "reasoning_effort": "low"
+        }
+      },
+      "inference_limits": {
+        "max_tokens": 8192,
+        "locked": [
+          "top_p"
+        ]
+      },
+      "fallback": {
+        "on": [
+          "exhausted",
+          "broken"
+        ],
+        "after_secs": 2
+      },
+      "model_fallback": {
+        "on": [
+          "exhausted",
+          "broken"
+        ],
+        "after_secs": 5,
+        "models": [
+          "gpt120b-vllm",
+          {
+            "model": "gpt20b",
+            "require_headroom": true
+          }
+        ]
+      },
+      "deployments": {
+        "aws-main": {
+          "confirmed": [
+            "ap-south-1",
+            "ap-south-2"
+          ],
+          "fallback": [
+            "us-east-1",
+            "us-west-2",
+            {
+              "name": "apac",
+              "region": "ap-south-1",
+              "profile_id": "apac.openai.gpt-oss-120b-1:0",
+              "routes_to": [
+                "ap-south-1",
+                "ap-south-2"
+              ],
+              "rpm": 300
+            }
+          ],
+          "overrides": {
+            "ap-south-1": {
+              "params": {
+                "guardrailConfig": {
+                  "guardrailIdentifier": "gr-abc",
+                  "guardrailVersion": "1"
+                }
+              }
+            },
+            "us-east-1": {
+              "rpm": 300,
+              "max_concurrency": 40,
+              "enabled": true
+            }
+          }
+        },
+        "aws-dr": {
+          "confirmed": [
+            "ap-south-2"
+          ],
+          "overrides": {
+            "ap-south-2": {
+              "rpm": 200
+            }
+          }
+        }
+      }
+    },
+    "gpt20b": {
+      "type": "chat",
+      "provider": "bedrock",
+      "model_id": "openai.gpt-oss-20b-1:0",
+      "rpm": 1000,
+      "tpm": 800000,
+      "balance": "round_robin",
+      "inference": {
+        "temperature": 0.0,
+        "max_tokens": 1024
+      },
+      "fallback": {
+        "on": [
+          "exhausted",
+          "broken"
+        ],
+        "after_secs": 2
+      },
+      "model_fallback": {
+        "on": [
+          "exhausted"
+        ],
+        "after_secs": 5,
+        "models": [
+          {
+            "model": "gpt120b",
+            "require_headroom": true
+          }
+        ]
+      },
+      "deployments": {
+        "aws-main": {
+          "confirmed": [
+            "ap-south-1",
+            "ap-south-2"
+          ],
+          "fallback": [
+            "us-east-1",
+            "us-west-2"
+          ]
+        }
+      }
+    },
+    "gpt120b-vllm": {
+      "type": "chat",
+      "provider": "openai",
+      "model_id": "gpt-oss-120b",
+      "rpm": 120,
+      "inference": {
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "seed": 7
+      },
+      "deployments": {
+        "vllm-dc1": {
+          "confirmed": [
+            "dc1"
+          ]
+        }
+      },
+      "residency": {
+        "allowed_regions": [
+          "dc1"
+        ]
+      }
+    },
+    "embed-titan": {
+      "type": "embedding",
+      "provider": "bedrock",
+      "model_id": "amazon.titan-embed-text-v2:0",
+      "rpm": 2000,
+      "timeout_secs": 120,
+      "embed_batch_size": 1,
+      "balance": "weighted",
+      "inference": {
+        "dimensions": 1024,
+        "normalize": true
+      },
+      "queue": {
+        "name": "llm-embed-titan",
+        "visibility_secs": 30
+      },
+      "fallback": {
+        "on": [
+          "exhausted",
+          "broken"
+        ],
+        "after_secs": 1
+      },
+      "deployments": {
+        "aws-main": {
+          "confirmed": [
+            "ap-south-1",
+            "ap-south-2"
+          ],
+          "fallback": [
+            "ap-southeast-2",
+            "ap-northeast-1"
+          ],
+          "overrides": {
+            "ap-south-1": {
+              "weight": 3
+            },
+            "ap-south-2": {
+              "rpm": 1000
+            }
+          }
+        }
+      }
+    },
+    "embed-cohere": {
+      "type": "embedding",
+      "provider": "bedrock",
+      "model_id": "cohere.embed-english-v3",
+      "rpm": 2000,
+      "embed_batch_size": 96,
+      "inference": {
+        "input_type": "search_document",
+        "truncate": "END"
+      },
+      "deployments": {
+        "aws-main": {
+          "confirmed": [
+            "ap-south-1",
+            "ap-south-2"
+          ],
+          "fallback": [
+            "ap-southeast-1",
+            "us-east-1"
+          ]
+        }
+      }
+    }
+  }
+}

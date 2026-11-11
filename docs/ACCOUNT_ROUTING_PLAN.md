@@ -500,6 +500,7 @@ suggested; in a stored document it gives a warning and the default (§3.18).
       "model_id": "gpt-oss-120b",
       "rpm": 120,
       "inference": {"temperature": 0.2, "max_tokens": 4096, "seed": 7},
+      "residency": {"allowed_regions": ["dc1"]},
       "deployments": {"vllm-dc1": {"confirmed": ["dc1"]}}
     },
 
@@ -651,7 +652,10 @@ Rules:
    boot. `extra` is passed through unchecked, so a bad field there shows as a provider error.
 6. **Visibility.** `llm-queue settings get --model gpt120b` shows each effective parameter and
    its level; the request status records the effective `temperature` and `max_tokens` (no text).
-7. **LangChain adapters.** A value set on the model object (`temperature=0`) is a call value;
+7. **Shared defaults by type.** Inference values in `defaults` or an account's `settings` apply
+   only to models of the matching type (chat values never reach an embedding model); a
+   wrong-type parameter set on a model or a deployment is an error.
+8. **LangChain adapters.** A value set on the model object (`temperature=0`) is a call value;
    an unset one takes the registry default.
 
 | Rule | Detail |
