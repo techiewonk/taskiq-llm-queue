@@ -591,7 +591,7 @@ fields (`params`, the `confirmed` / `fallback` lists, account `kind` / `base_url
 | `max_attempts` | 4 | D, M | Provider attempts of one call across all deployments and models (§3.18) |
 | `retry_budget_pct` | 20 | D, M | Retries a model may make per minute, as a share of its first attempts; beyond it calls fail fast |
 | `stream_idle_secs` | 30 | D, M | A stream with no chunk for this long ends with an error event |
-| `max_waiting` | 50000 | D, M | Calls allowed to wait per model; above it a send gets `queue_full`; 0 = no limit |
+| `max_waiting` | 50000 | D, M | Calls allowed to wait per model and class (the normal and the priority queue are counted apart); above it a send fails at once with `queue_full` and `retry_after_secs`; 0 = no limit |
 | `sticky_move_after_secs` | 1 | D, M | A sticky session moves only when its deployment is unusable or would wait longer than this |
 | `tags` | none | R | Free labels of a deployment, visible to custom hooks |
 | `residency.allowed_regions` | none | top level, M (*deploy*) | Regions calls may ever reach; a deployment or profile outside the list is refused at boot (§3.18) |
@@ -1718,6 +1718,14 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E124 | Readiness | Ready = registry loaded and not draining; store state in the body; no route depends on stores or providers |
 | E125 | Residency list | Deployments outside it are never used (not refused), so fallback regions can be listed before compliance answers |
 | E126 | Lifecycle details | Two-step model removal; a final status is never replaced; state alerts as gauges; secrets re-read on an auth error; `debug_capture` live-editable in prod |
+| E127 | Streaming permission | The pods' role has `bedrock:InvokeModelWithResponseStream`; chat always uses the streaming API. A deployment that denies it counts as an access error (auto-disable and alert), so the permission must exist in every account and region |
+| E128 | Request ids | Created by the library unless the app passes one; an app-supplied id keeps its result 5 min, a library id 30 s after the first read |
+| E129 | Default class | Normal. The app marks its live-chat model object as priority, so every live turn is priority without changing call sites |
+| E130 | Model fallback | A choice of each registry, not a library default; the examples show one possible setup |
+| E131 | Metrics | CloudWatch embedded metric format is the app's sink; Prometheus stays available |
+| E132 | Status over HTTP | The app mounts `/llmq/status`, `/llmq/requests/{id}` and `/llmq/registry` behind its admin check, and the two health routes without auth |
+| E133 | Queue full | A send above `max_waiting` fails at once with `queue_full`; priority and normal are counted apart |
+| E134 | Usage record | One `llmq_call_finished` log event per call (model, deployment, tokens, timings, hashed user, tenant; no text); no daily summary job |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1730,6 +1738,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | Q2 | For each of the four first models: which regions are confirmed and which fallback |
 | Q3 | Account ids and role ARNs when a second AWS account is added (0.3.1) |
 | Q5 | The residency list of each model, once compliance answers |
+| Q6 | `bedrock:InvokeModelWithResponseStream` on the pods' role in every account and region that is listed (E127) |
 | Q4 | Compliance sign-off that request text may be processed in every region listed as confirmed or fallback (the cohere list includes EU, US, Canada and Brazil) |
 
 ## 9. Review: gaps found and fixed (2026-11-11)
