@@ -370,8 +370,10 @@ levels are in §3.9 and §3.19.
 | Key | Holds |
 |---|---|
 | `P:{reg}:doc` | The registry JSON (accounts, models) |
-| `P:{reg}:version` | The published `registry_version`, its content hash, a change counter; processes reload on change or every `cfg_reload_secs` |
-| `P:audit` | Every publish and live edit as path diffs: who, when, path, before, after; also a redacted log event |
+| `P:{reg}:meta` | The published `registry_version`, the content hash of the config it came from, a change counter (compare-and-set of live edits); processes reload every `cfg_reload_secs` |
+| `P:{reg}:history` | The last 20 published documents by version, for `registry publish --from-audit` / rollback |
+| `P:{m:ALIAS}:cfg` | The model's resolved numbers and the change counter they belong to, written in the same script call as the document (read by `PICK_TAKE`) |
+| `P:{reg}:audit` | Every publish and live edit as path diffs: who, when, path, before, after; also a redacted log event |
 
 - **Source.** `LLMQ_REGISTRY` (JSON in the secret or env), or `LLMQ_REGISTRY_FILE` /
   `LLMQ_REGISTRY_SECRET` (its own secret) when it outgrows the shared secret (Secrets Manager
@@ -1550,7 +1552,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 |---|---|---|---|
 | **0.3.0** | A0 | Test prerequisites: fakellm with account identity, RPM and TPM quotas per account × region × model, usage-missing mode, response speed in tokens per second, latency / error injection; Redis next to Valkey in compose; baseline store-command counts recorded from 0.2.1 | harness self-test |
 | | A1 | Registry schema (one document), every setting name, level, type and range (§3.9, §3.19), inference parameters and limits, validation, resolve. Pure and additive: nothing removed yet | unit; B12 (config half) |
-| | A2 | Registry store: compare-and-set publish, version + hash rule, resolved numbers per model, live edits with protected fields, audit as diffs plus log event, rollback publish, lenient read, reset detection, CLI `registry` | B12 (stored half), B40, B85 |
+| | A2 | Registry store: compare-and-set publish, version + hash rule, resolved numbers per model, live edits with protected fields, audit as diffs plus log event, rollback publish, lenient read, reset detection (Python API; the `registry` commands come with the new CLI in A12) | B12 (stored half), B40, B85 |
 | | A3 | Deployments replace targets: key schema 3, client pool per account and region, API-key accounts, AWS accounts on the pod's own credentials, provider calls take a deployment and use the streaming API under the hood | unit; B05 (alias and model id) |
 | | A4 | Lanes replaced by the priority flag: envelope version 2, context, result reader (read without delete), request status store, metric labels, LangChain adapters; the existing scenario harness and samples ported | the ported harness passes |
 | | A5 | Queues: stream backend default, queue pair per model, generation and failure counters, `return`, queues created at start, two stores, store clock in every script, `max_waiting`, dead-letter notice and `dlq` commands; SQS as the reduced backend | B23, B39, B80 |
@@ -1560,7 +1562,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | | A9 | Region and model fallback rules and hook, per-deployment params, inference defaults per provider, tool calls in the estimate, `allowed_regions` / `allowed_accounts`, residency, blocked regions | B06, B07, B09, B38, B45, B47, B52, B61, B72, B84, B87 |
 | | A10 | Pod-count logic removed; `store_down` modes; once-locks; duplicate request ids; caller-gone cancel; shutdown order; kill switch and `queue_pct`; store failover re-registration; out-of-memory handling; secrets re-read on an auth error | B11, B16, B22 (shares), B33, B48, B69, B74, B75, B88, B89, B90, B95, B96, B99, B101, B103 |
 | | A11 | Health: auto-disable with its safeguards, probe, credential rule, `model_unavailable`, quota-drop alert, new deployment at full share | B22 (one probe), B29, B37, B44, B54, B68, B78 |
-| | A12 | Status reader, Python API, CLI views, HTTP router, health routes, alerts as gauges, both metric sinks, `llmq_call_finished` event, model drain and removal, `block`, `debug_capture` | B13, B14, B22 (one alert), B30, B36, B55, B79, B91 (status) |
+| | A12 | Status reader, Python API, the new CLI (`registry`, `settings`, `status`, `request`, `block`, `drain`, `dlq`, `queues`; the 0.2 commands removed), HTTP router, health routes, alerts as gauges, both metric sinks, `llmq_call_finished` event, model drain and removal, `block`, `debug_capture` | B13, B14, B22 (one alert), B30, B36, B55, B79, B91 (status) |
 | | A13 | Embeddings: batch size per model, optional token limiting, token estimator hook and token metrics, result size handling | B15, B32, B76, B97 |
 | | A14 | The app's config moved to the registry; deployment notes (§6.1); text-at-rest and secrets checks; load and deploy scenarios; docs, samples, CHANGELOG | B17, B24, B34, B35, B41, B86, B92 |
 | **0.3.1** | A15 | Second AWS account: assume role, credential failure across accounts | B05 (two accounts), B08, B77 |

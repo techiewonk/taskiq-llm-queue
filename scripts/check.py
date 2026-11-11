@@ -40,7 +40,24 @@ STEPS: dict[str, Step] = {
         sources=("src/taskiq_llm_queue/registry",),
         tests=("tests/unit/registry",),
     ),
+    "a2": Step(
+        "Registry store: version rule, live edits, audit, rollback, reload",
+        sources=("src/taskiq_llm_queue/registry",),
+        tests=("tests/integration/registry",),
+        needs_stack=True,
+    ),
 }
+
+
+def stack_up() -> str | None:
+    """None when the Docker stack's Valkey answers; otherwise why not."""
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", 6379), timeout=1):
+            return None
+    except OSError as exc:
+        return f"Valkey on 127.0.0.1:6379 is not reachable ({exc}); run `make up`"
 
 
 def _run(label: str, cmd: list[str]) -> bool:
@@ -57,6 +74,9 @@ def _run(label: str, cmd: list[str]) -> bool:
 def run_step(name: str, step: Step) -> bool:
     """Run every check of one step; print one line per check."""
     print(f"[{name}] {step.title}")
+    if step.needs_stack and (why := stack_up()):
+        print(f"  FAIL  stack: {why}")
+        return False
     paths = [*step.sources, *step.tests]
     results = [
         _run("ruff check", [PY, "-m", "ruff", "check", *paths]),
@@ -64,7 +84,7 @@ def run_step(name: str, step: Step) -> bool:
         _run("mypy", [PY, "-m", "mypy", "--no-incremental", *paths]),
         _run(
             "pytest",
-            [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", *step.tests],
+            [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs", *step.tests],
         ),
     ]
     results += [_run(" ".join(cmd), [PY, *cmd]) for cmd in step.extra]
