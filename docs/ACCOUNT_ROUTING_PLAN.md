@@ -773,9 +773,7 @@ sequenceDiagram
   C->>V: request status = waiting
   C->>WQ: send envelope (request id, priority, deadline)
   W->>WQ: receive (priority calls first)
-  W->>V: claim; sticky lookup (session s)
-  W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token + concurrency slot + in-progress entry
-  W->>V: account budget (when set)
+  W->>V: claim + PICK_TAKE (one round trip) → aws-main/ap-south-1: RPM / TPM, account budget, slot, in-progress entry, sticky
   W->>B: converse via the client of (aws-main, ap-south-1), deployment params merged
   B-->>W: response + usage
   W->>V: TPM correction, slot release, breaker ok, latency sample, sticky renew
@@ -902,8 +900,8 @@ instead of `resolve_fallback`.
 | `registry/schema.py` | `Registry`, `Account`, `ModelEntry`, `AccountDeployments`, `ProfileRef`, `Quota`, `RegionOverride`, `FallbackRule`, `StickyRule` | `Registry.problems() -> list[str]`; `Registry.alias_of(model) -> str` (alias or model id) |
 | `registry/resolve.py` | `Deployment` (frozen dataclass), `ResolvedRegistry` | `resolve(registry, defaults)`; `deployments(alias, group=None)`; `effective(alias, deployment, name) -> (value, level)` |
 | `registry/store.py` | `RegistryStore` | `publish(registry, actor)` (version + hash rule), `load()`, `set()`, `enable()`, `disable()`, `diff()`, `run()` reload loop |
-| `reliability/_lua.py` | — | new scripts `PICK_TAKE`, `DEPLOY_HEALTH`, `LATENCY`, `ONCE` (lock / marker) |
-| `broker/stream_queue.py` (was `valkey_queue.py`) | — | new `defer` operation (visible after a delay, receive count unchanged); priority and normal streams under one queue name |
+| `reliability/_lua.py` | — | new scripts `PICK_TAKE` (budgets, account budget, slot per class, in-progress entry with owner token, waiters, health and breaker read), `PICK_UNDO`, `DEPLOY_HEALTH`, `LATENCY`, `ONCE` (lock / marker), `STATUS_SET` (never replaces a final state), registry compare-and-set |
+| `broker/stream_queue.py` (was `valkey_queue.py`) | — | queue pair per model; `return` operation (visible again in place); generation and failure counters; store clock; dead-lettered ids returned to the worker |
 | `routing/balance.py` | `Balancer` (Protocol), `register_balancer` | `pick_take(alias, strategy, candidates, preferred, costs, priority) -> Grant \| Wait` |
 | `routing/plan.py` | `CallPlan`, `plan_call` | `plan_call(alias, ctx, resolved, sticky) -> CallPlan`; `CallPlan.next(cause)` |
 | `routing/fallback_rule.py` | `register_fallback_policy` | `allowed(rule, cause, waited_secs) -> bool` |
@@ -914,6 +912,11 @@ instead of `resolve_fallback`.
 | `clients/credentials.py` | `AccountCredentials` | `session_for(account)` (assume role, refreshable) |
 | `clients/pool.py` | `ClientPool` | `get(account, region)`, `aclose()` |
 | `tracking/inprogress.py` | `InProgressTracker` | `add()`, `remove()`, `sweep()`, `count(alias, deployment)` |
+| `routing/order.py` | `HeldCalls` | per model and class: `hold(call)`, `retry_due()`, `release()`; batch admitted in order; waiter registration is inside `PICK_TAKE` |
+| `reliability/retry_budget.py` | `RetryBudget` | `allow(alias)`; `max_attempts` across deployments and models |
+| `tracking/callers.py` | `CallerLiveness` | `renew()`, `alive(pod)`; cancel on task cancellation |
+| `reliability/output_sample.py` | `OutputSample` | `record(alias, tokens)`, read by `PICK_TAKE` for `output_reserve: observed` |
+| `registry/guard.py` | — | protected fields (`registry_live_edit`), residency check, `base_url` host check |
 | `tracking/requests.py` | `RequestStatusStore`, `RequestStatus` | `mark(request_id, state, **fields)` (pipelined with existing writes), `get(id)` |
 | `streaming.py` | `ChunkWriter`, `ChunkReader` | `write(request_id, chunk)`, `end()`, `error()`, `read(request_id)` |
 | `status/reader.py` | `StatusReader`, `StatusReport` | `report(model, account, region, by)`, `request(id)` |
@@ -1487,6 +1490,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E109 | No quota numbers | Limiter only; `exhausted` = no slot; `headroom` refused |
 | E110 | Work plan | Reordered into A0-A17 (§6) |
 | E111 | Per-user limits | Not in 0.3; `register_admission` can reject by user |
+| E112 | Owner confirmation (2026-11-12) | Environments share one AWS account and split it with `quota_share`; residency lists per model; live edits limited to safe fields; no per-user cap in 0.3 |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1498,6 +1502,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | Q1 | RPM / TPM per region for the four first models |
 | Q2 | For each of the four first models: which regions are confirmed and which fallback |
 | Q3 | Account ids and role ARNs when a second AWS account is added (0.3.1) |
+| Q5 | `quota_share` per environment (for example prod 0.8, uat 0.15, dev 0.05) and the residency list of each model |
 | Q4 | Compliance sign-off that request text may be processed in every region listed as confirmed or fallback (the cohere list includes EU, US, Canada and Brazil) |
 
 ## 9. Review: gaps found and fixed (2026-11-11)
