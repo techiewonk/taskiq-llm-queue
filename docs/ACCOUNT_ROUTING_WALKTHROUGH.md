@@ -46,7 +46,7 @@ result is the same for 1 pod or 50.
 | Model (alias) | One model the app can call, named by the owner | `gpt120b` |
 | Account | Where the model is called from: an AWS account or an endpoint | `aws-main` |
 | Deployment | One model in one account and one region. This is what has an RPM / TPM budget | `aws-main/ap-south-1` |
-| Confirmed regions | Regions the model normally uses | `ap-south-1`, `us-east-1` |
+| Confirmed regions | Regions the model normally uses | `ap-south-1`, `ap-south-2` |
 | Fallback regions | Regions used only when the fallback rule allows it | `us-west-2` |
 | RPM | Requests per minute allowed on one deployment | 500 |
 | TPM | Tokens per minute allowed on one deployment | 400,000 |
@@ -74,9 +74,9 @@ One document, `LLMQ_REGISTRY`, read from the secret or env. This walkthrough use
       "fallback": {"on": ["exhausted", "broken"], "after_secs": 2},
       "model_fallback": {"on": ["exhausted", "broken"], "after_secs": 5,
                          "models": [{"model": "gpt20b", "require_headroom": true}]},
-      "deployments": {"aws-main": {"confirmed": ["ap-south-1", "us-east-1"],
-                                   "fallback": ["us-west-2"],
-                                   "overrides": {"us-east-1": {"rpm": 300}}}}
+      "deployments": {"aws-main": {"confirmed": ["ap-south-1", "ap-south-2"],
+                                   "fallback": ["us-east-1", "us-west-2"],
+                                   "overrides": {"ap-south-2": {"rpm": 300}}}}
     },
     "gpt20b": {
       "type": "chat", "provider": "bedrock", "model_id": "openai.gpt-oss-20b-1:0",
@@ -101,7 +101,7 @@ After resolving, the library holds this table in memory (rebuilt on every regist
 | Model | Deployment | Group | rpm | tpm | max_tokens | balance | Where rpm came from |
 |---|---|---|---|---|---|---|---|
 | gpt120b | aws-main/ap-south-1 | confirmed | 500 | 400,000 | 4096 | headroom | model |
-| gpt120b | aws-main/us-east-1 | confirmed | 300 | 400,000 | 4096 | headroom | deployment override |
+| gpt120b | aws-main/ap-south-2 | confirmed | 300 | 400,000 | 4096 | headroom | deployment override |
 | gpt120b | aws-main/us-west-2 | fallback | 500 | 400,000 | 4096 | headroom | model |
 | gpt20b | aws-main/ap-south-1 | confirmed | 1000 | 800,000 | 2048 | ordered | model |
 | embed-titan | aws-main/ap-south-1 | confirmed | 2000 | not used | — | ordered | model |
@@ -166,7 +166,7 @@ Each pod does this in `await llmq.start()`.
 | 5 | Create missing queues (existing ones keep their attributes) | `{P:q:ra-prod-llm-gpt120b}:cfg` … |
 | 6 | Resolve the deployment table of §3 | in memory |
 | 7 | Start queue readers and the reload loop (every 30 s) | |
-| 8 | `GET /llmq/health` → 200 | |
+| 8 | `GET /llmq/health/ready` → 200 | |
 
 Version rule in step 4:
 
@@ -270,7 +270,7 @@ breaker and latency itself and keeps the **usable** ones (always exact, no extra
 | Deployment | Group | Enabled | Healthy | Breaker | Slow | Usable |
 |---|---|---|---|---|---|---|
 | aws-main/ap-south-1 | confirmed | yes | yes | closed | no | yes |
-| aws-main/us-east-1 | confirmed | yes | yes | closed | no | yes |
+| aws-main/ap-south-2 | confirmed | yes | yes | closed | no | yes |
 | aws-main/us-west-2 | fallback | yes | yes | closed | no | not passed yet (fallback group) |
 
 Input to the script:
@@ -279,7 +279,7 @@ Input to the script:
 {"strategy": "headroom", "pick": "percent",
  "candidates": [
    {"name": "aws-main/ap-south-1", "rpm": 500, "tpm": 400000},
-   {"name": "aws-main/us-east-1",  "rpm": 300, "tpm": 400000}],
+   {"name": "aws-main/ap-south-2",  "rpm": 300, "tpm": 400000}],
  "preferred": null,
  "cost": {"requests": 1, "tokens": 7096},
  "priority": true, "priority_reserve": 0.2, "normal_min_share": 0.1,
@@ -291,7 +291,7 @@ What the script sees and decides (all inside the store, atomically):
 | Deployment | RPM left | TPM left | Headroom (the smaller share) | Fits 1 request + 7,096 tokens |
 |---|---|---|---|---|
 | aws-main/ap-south-1 | 350 of 500 (70 %) | 264,000 of 400,000 (66 %) | **66 %** | yes |
-| aws-main/us-east-1 | 120 of 300 (40 %) | 220,000 of 400,000 (55 %) | 40 % | yes |
+| aws-main/ap-south-2 | 120 of 300 (40 %) | 220,000 of 400,000 (55 %) | 40 % | yes |
 
 `headroom` picks the one with the most left: **aws-main/ap-south-1**. (With
 `balance_priority: "ordered"` a priority call would take the first region in config while it
@@ -310,7 +310,7 @@ Other strategies with the same data: `ordered` → ap-south-1 (first in config);
 
 | Check | Key | Here |
 |---|---|---|
-| Concurrency slot (adaptive limiter), taken inside `PICK_TAKE` | `P:{m:gpt120b}:ac:aws-main/ap-south-1`, `…:lease:…` | limit 24, 11 in use → slot granted, `lease: req-7f3a → now + 90 s`. A deployment with no free slot counts as full in step 6 |
+| Concurrency slot (adaptive limiter), taken inside `PICK_TAKE` | `P:{m:gpt120b}:ac:aws-main/ap-south-1`, `…:lease:…` | limit 24, 11 in use → slot granted, `lease: req-7f3a:pod-b-3:1 → now + 60 s`. A deployment with no free slot counts as full in step 6 |
 | Account-wide cap (`shared_rpm` / `shared_tpm`), checked inside `PICK_TAKE` when set | `P:{a:aws-main}:rate` | not set, skipped. When set and full, the deployments of that account are skipped like any deployment without budget |
 
 The limiter is the safety net: it learns the real concurrency the provider accepts and shrinks
@@ -470,7 +470,7 @@ background work. In the store this is a second clock per class next to the main 
 | Setting | Default | Meaning |
 |---|---|---|
 | `rate_limits` | `both` for chat, `rpm` for embedding | `both`, `rpm`, `tpm` or `off`, at any level, changeable live |
-| `shared_rpm` / `shared_tpm` (account settings) | none | A cap across all models of an account, checked after the deployment budget |
+| `shared_rpm` / `shared_tpm` (account settings) | none | A cap across all models of an account, checked and taken inside `PICK_TAKE` |
 | `tpm_output_weight` | 1 | How many quota tokens one output token costs (some Bedrock models count more; unverified per model) |
 | `tpm_count_cached` | true | Whether cache-read tokens count |
 | `default_output_tokens` | 1000 | Output reservation when nothing sets `max_tokens` |
@@ -509,7 +509,7 @@ A model without `fallback` and `model_fallback` simply waits for budget until it
 |---|---|
 | The request and the whole estimate go back | RPM +1, TPM +7,096 on that deployment |
 | The limiter cuts that deployment's concurrency | `ac: limit 24 → 18` |
-| The call retries on the next usable deployment | a new `PICK_TAKE` without the one that throttled |
+| The call retries on the next usable deployment | a new `PICK_TAKE` with the one that throttled as the last choice |
 | Many throttles while the budget still had room | alert "configured quota above observed" with the observed rate |
 
 ### 8.3 Server error or timeout (5xx)
@@ -548,10 +548,10 @@ A model without `fallback` and `model_fallback` simply waits for budget until it
 
 ## 9. Health of one deployment
 
-`P:{m:gpt120b}:health`, one entry per deployment *(field layout proposed)*:
+`P:{m:gpt120b}:health`, one entry per deployment:
 
 ```json
-{"aws-main/us-east-1": {"errors": [1731400100, 1731400160, 1731400230],
+{"aws-main/ap-south-2": {"errors": [1731400100, 1731400160, 1731400230],
                         "disabled_until": 1731401130, "probe_wait_secs": 900,
                         "p95_ms": 2600, "samples": 412}}
 ```
@@ -562,7 +562,7 @@ A model without `fallback` and `model_fallback` simply waits for budget until it
 | Auto-disabled | 3 target errors (access denied, model not in region) in 5 min with no success in between; never the last usable deployment | A probe call succeeds. First probe after 15 min; each failure doubles the wait, up to 2 h |
 | Slow (skipped) | p95 above `slow_ratio` × the model's median and above `slow_min_secs`, with ≥ 3 usable deployments | p95 recovers. The last usable deployment is never skipped |
 | Breaker open | Repeated failures | The breaker's own timer and trial call |
-| Disabled by an operator | `llm-queue registry disable gpt120b aws-main/us-east-1` | `… enable …` |
+| Disabled by an operator | `llm-queue registry disable gpt120b aws-main/ap-south-2` | `… enable …` |
 
 Health lives apart from the registry, so a deploy never switches a broken deployment back on.
 One process at a time runs the probe (a lock in the store).
@@ -595,7 +595,7 @@ shows what is live but not in config. Adding or removing a whole model needs a d
     "rpm": {"limit": 500, "used": 151, "left": 349},
     "tpm": {"limit": 400000, "used": 140100, "left": 259900, "in_flight": 42000},
     "concurrency": {"limit": 24, "in_use": 12}, "breaker": "closed", "p95_ms": 2400},
-   {"name": "aws-main/us-east-1", "group": "confirmed", "usable": true,
+   {"name": "aws-main/ap-south-2", "group": "confirmed", "usable": true,
     "rpm": {"limit": 300, "used": 180, "left": 120},
     "tpm": {"limit": 400000, "used": 180000, "left": 220000, "in_flight": 31000},
     "concurrency": {"limit": 20, "in_use": 19}, "breaker": "closed", "p95_ms": 2900},
@@ -643,7 +643,7 @@ Setting `rate_limits: "both"` and a `tpm` on the model turns token limiting on f
 
 ## 14. Decisions on the open details
 
-Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E91; the second review added E92 to E111).
+Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E91; later reviews added E92 to E126).
 
 | # | Point | Decision |
 |---|---|---|
@@ -674,5 +674,13 @@ timeouts are 120 s per call and 60 s per attempt; a call makes at most 4 attempt
 caller that is gone are cancelled; results are read without deleting them; 0.3 keeps no
 compatibility with 0.2.
 
-Still needed from the owner: real RPM / TPM per region for the first four models, and which
-regions are confirmed or fallback. This page uses sample numbers only.
+**Third pass (2026-11-12, plan §11 and §3.19).** A waiting call starts whenever budget remains
+after setting aside what older waiters need (not only the oldest one), so a backlog uses the
+whole quota. The 60 s attempt limit is the time until the provider starts answering; chat calls
+use the streaming API under the hood, so long answers are not cut. Provider throttles do not
+count toward the 4 attempts. A result stays 30 s after its first read. `/llmq/health/ready` does
+not depend on the stores. Releases: 0.3.0 and 0.3.1. Regions follow E114: India confirmed,
+others fallback and unused until the residency list allows them.
+
+Still needed from the owner: real RPM / TPM per region for the first four models, and the
+residency list once compliance answers. This page uses sample numbers only.
