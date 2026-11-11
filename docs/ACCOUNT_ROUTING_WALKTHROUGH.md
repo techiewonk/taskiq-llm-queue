@@ -220,6 +220,8 @@ estimate                                 = 7,096 tokens
 ```
 
 A request whose input alone is above `tpm` (400,000) fails here with `request_too_large`.
+With `output_reserve: "observed"` on the model, the output part is the 90th percentile of its
+recent real output (for example 1,100) instead of 4,096, so more calls fit into the TPM budget.
 
 ### Step 4. Write the status and send the message (caller → both stores)
 
@@ -255,7 +257,7 @@ Any pod's worker reads the queue; priority messages are read before normal ones.
 |---|---|
 | `{P:q:…}:vis` | `1731400000123-0 → now + 60 s` (hidden from other workers for `visibility_secs`) |
 | `{P:q:…}:rc` | `1731400000123-0 → 1` |
-| `P:{r:req-7f3a}:job` | `state=running, worker=pod-b-3, heartbeat=…` (the claim: a duplicate delivery is dropped) |
+| `P:{r:req-7f3a}:job` | `state=running, worker=pod-b-3, heartbeat=…` (the claim: a duplicate delivery is dropped). Sent in the same round trip as step 6 |
 
 ### Step 6. Choose a deployment, take RPM + TPM and a concurrency slot (`PICK_TAKE`, one script)
 
@@ -288,7 +290,9 @@ What the script sees and decides (all inside the store, atomically):
 | aws-main/ap-south-1 | 350 of 500 (70 %) | 264,000 of 400,000 (66 %) | **66 %** | yes |
 | aws-main/us-east-1 | 120 of 300 (40 %) | 220,000 of 400,000 (55 %) | 40 % | yes |
 
-`headroom` picks the one with the most left: **aws-main/ap-south-1**. The script takes 1 from its
+`headroom` picks the one with the most left: **aws-main/ap-south-1**. (With
+`balance_priority: "ordered"` a priority call would take the first region in config while it
+has budget, whatever the headroom, to stay close to the app.) The script takes 1 from its
 RPM budget, 7,096 from its TPM budget and one concurrency slot in the same step (all or
 nothing) and returns:
 
@@ -309,15 +313,16 @@ Other strategies with the same data: `ordered` → ap-south-1 (first in config);
 The limiter is the safety net: it learns the real concurrency the provider accepts and shrinks
 on throttles, whatever the configured RPM says.
 
-### Step 8. Mark in progress (worker → state store)
+### Step 8. Mark in progress (written by `PICK_TAKE` in step 6, no extra call)
 
 ```
 P:{m:gpt120b}:inprog                 req-7f3a → 1731400090.10          (deadline)
 P:{m:gpt120b}:inprog:req-7f3a        {deployment: aws-main/ap-south-1, priority: 1,
                                       attempt: 1, started: 1731400000.31}
-P:req:req-7f3a                       state=in_progress, deployment=aws-main/ap-south-1,
-                                      started_at=1731400000.31, attempts=1
 ```
+
+`request_status` reads `in_progress` and the deployment from this entry, so `P:req:req-7f3a` is
+not written again until the end.
 
 ### Step 9. Call the provider (worker → Bedrock)
 
@@ -372,7 +377,7 @@ sequenceDiagram
   C->>Q: send message
   W->>Q: receive (priority first)
   W->>S: PICK_TAKE → ap-south-1, RPM −1, TPM −7,096
-  W->>S: concurrency slot, in progress, status = in_progress
+  Note over W,S: the same call takes the slot and writes the in-progress entry
   W->>B: converse (aws-main, ap-south-1)
   B-->>W: response, usage 4,100 tokens
   W->>S: TPM +2,996 back, slot free, result stored, status = done
@@ -481,8 +486,8 @@ Both confirmed deployments are full when `req-7f3a` arrives.
 
 | Time since send | What happens | Data |
 |---|---|---|
-| 0.2 s | `PICK_TAKE` refuses, wait 0.8 s. The message is **deferred**: back to the queue, visible in 0.8 s, receive count unchanged | `{P:q:…}:delay: msg → now + 0.8`; status stays `waiting`, `deferred=1` |
-| 1.0 s | Tried again, refused again | `deferred=2` |
+| 0.2 s | `PICK_TAKE` refuses, wait 0.8 s. The worker **holds** this call and stops reading priority calls of `gpt120b`; the calls behind it stay in the queue untouched | status stays `waiting`; no queue change, receive count unchanged |
+| 1.0 s | The same worker tries the admission again, refused again | one store call, nothing else |
 | 2.0 s | `fallback.after_secs` (2) passed and the cause `exhausted` is listed → fallback regions are offered too: `us-west-2` | `PICK_TAKE` candidates now include `aws-main/us-west-2` |
 | 2.0 s | Granted on `us-west-2` | reply `meta.fallback = "region"` |
 
@@ -630,7 +635,7 @@ Setting `rate_limits: "both"` and a `tpm` on the model turns token limiting on f
 
 ## 14. Decisions on the open details
 
-Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E86).
+Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E91).
 
 | # | Point | Decision |
 |---|---|---|
@@ -645,9 +650,13 @@ Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76
 | 9 | Request status | Full (waiting, in progress, final), inside pipelines that are sent anyway; `request_status` per model can reduce it |
 | 10 | Stream chunks | First chunk at once, then batched for 30 ms |
 | 11 | Usable check | Read inside `PICK_TAKE` on every call |
+| 12 | Waiting for budget | The worker holds the head call per model and class and stops reading; no receive-and-defer loop |
+| 13 | Admission round trip | Claim + `PICK_TAKE` (budget, slot, in-progress entry) together; no status write at admission |
+| 14 | Output reservation | `output_reserve`: `max_tokens` (default) or `observed`, per model |
+| 15 | Strategy per class | `balance_priority`; chat models use `ordered` for priority calls |
 
-Store calls of one queued request: caller 1 (status and send, in parallel); worker 6 (receive,
-claim, `PICK_TAKE`, mark in progress, finish, acknowledge). Target: the queue path adds at most
+Store calls of one queued request: caller 1 (status and send, in parallel); worker 4 (receive,
+admit, finish, acknowledge). Target: the queue path adds at most
 20 ms at p95 with no backlog (measured in B34).
 
 Still needed from the owner: real RPM / TPM per region for the first four models, and which

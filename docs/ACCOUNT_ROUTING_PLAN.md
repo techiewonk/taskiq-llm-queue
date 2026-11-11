@@ -112,8 +112,10 @@ flowchart LR
   Kept 30 min; results 5 min (settings). While the state store is down no status is written.
   Every status write rides in a pipeline that is sent anyway (send, mark in progress, finish), so
   it adds no store call; `request_status` per model is `full` (default), `final` or `off`.
-- **Deferring without a receive count.** A call sent back to wait for budget
-  must not move toward the DLQ. The Valkey queue gets a `defer` operation (visible again after a
+  `in_progress` is read from the in-progress entry, not written to `P:req:<id>` (§3.17).
+- **Waiting for budget.** The worker holds the head call and stops reading that model's class
+  instead of receiving and deferring every message (§3.17). A call that is sent back all the
+  same must not move toward the DLQ. The Valkey queue gets a `defer` operation (visible again after a
   delay, receive count unchanged); on SQS the message is re-sent with a delay and the old one
   deleted. Only failures and crashes count toward `max_receives`.
 - Missing Valkey queues are created at worker start, and by `llm-queue queues create` in the
@@ -576,6 +578,9 @@ Everything is live-editable except the rows marked *deploy*.
 | `retry_attempts`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | as in 0.2 | D, A, M, R | Retry budget and backoff per deployment |
 | `breaker_threshold`, `breaker_cooldown_secs` | 5, 15 | D, A, M, R | Circuit breaker per deployment |
 | `balance`, `balance_opts` | `ordered` | D, M | Strategy (§3.4); `balance_opts.pick` for `headroom` |
+| `balance_priority` | the model's `balance` | M | Strategy for priority calls (§3.17) |
+| `output_reserve` | `max_tokens` | M, R | Output tokens reserved before a call: `max_tokens` or `observed` (§3.17) |
+| `hold_max_secs` | 5 | R | How long a process that is stopping keeps a held call before it defers it |
 | `weight` | 1 | R | Share for `weighted` |
 | `sticky` | off | D, M | `{"key": "session" \| "custom:<name>", "idle_ttl_secs": 1800}` |
 | `fallback` | none | D, M | Region fallback rule (§3.5) |
@@ -760,9 +765,8 @@ sequenceDiagram
   C->>WQ: send envelope (request id, priority, deadline)
   W->>WQ: receive (priority calls first)
   W->>V: claim; sticky lookup (session s)
-  W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token + concurrency slot
+  W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token + concurrency slot + in-progress entry
   W->>V: account budget (when set)
-  W->>V: in-progress add, request status = in_progress
   W->>B: converse via the client of (aws-main, ap-south-1), deployment params merged
   B-->>W: response + usage
   W->>V: TPM correction, slot release, breaker ok, latency sample, sticky renew
@@ -914,6 +918,68 @@ Removed: `Target`, `ModelConfig.targets`, `FallbackConfig.skip_targets`, `resolv
 (`rt_rate_share`, `bg_share`, `lane_max_concurrency`, per-lane timeouts), `QueueConfig.models` /
 `LLMQ_MODELS`. Key schema goes from 2 to 3.
 
+### 3.17 Performance
+
+Target: with no backlog the queue path adds at most 20 ms at p95 over a direct call (B34). The
+rules below keep the number of store calls small; none of them is measured yet.
+
+**Store calls of one queued request**
+
+| Who | Calls |
+|---|---|
+| Caller | 1: request status `waiting` and the send (two stores, in parallel) |
+| Worker | 4: receive (up to 10 messages); admit; finish; acknowledge |
+
+- **Admit is one round trip.** `PICK_TAKE` picks the deployment, takes RPM / TPM, takes the
+  concurrency slot and writes the in-progress entry (all under the model tag). The claim of the
+  message is sent in the same round trip; on the rare duplicate delivery the grant is given back.
+- **No status write at admission.** `request_status` reads `in_progress` and the deployment from
+  the in-progress entry; `P:req:<id>` is written at send and at the end only.
+- **Finish is one pipeline:** token correction, slot release, breaker, latency sample, result,
+  final status, in-progress removal.
+
+**No budget: hold the head call, stop reading** (replaces the receive-and-defer loop)
+
+When `PICK_TAKE` refuses a call for lack of budget or slots, the worker keeps that one call (the
+head of its class), retries the admission itself after the wait the script returned, and reads
+no more calls of that model and class until it is granted, spilled by the fallback rule or
+expired. Other calls already received in the same batch go back to the queue in their place
+without a receive count. So during a backlog each process makes one admission call per wait
+instead of receiving and deferring every waiting message, and the queue keeps its order.
+
+- Priority and normal are held separately: a held normal call never stops priority calls.
+- The fallback rule works on the held call's age (`after_secs`), as before.
+- Strict first in, first out: a large call at the head holds smaller ones behind it until it
+  starts or expires. `request_too_large` keeps a call that can never start out of the queue.
+- `defer` stays for a held call of a process that is shutting down (after `hold_max_secs`, 5),
+  and for the SQS backend.
+
+**Output reservation** (`output_reserve`, per model)
+
+| Value | Reserved for the output |
+|---|---|
+| `max_tokens` (default) | The effective `max_tokens` of the call. Safe for providers that count `max_tokens` against the quota at the start of a request |
+| `observed` | The 90th percentile of the model's recent real output tokens (kept in the state store, read with the registry reload), never above the call's `max_tokens`; `max_tokens` until 50 calls were seen. More calls fit when TPM is the tighter limit; a call that uses more is charged the extra afterwards |
+
+Whether a provider counts `max_tokens` up front is model-dependent and **unverified** for the
+first four models; `observed` is turned on per model after checking.
+
+**Strategy per class** (`balance_priority`, per model)
+
+Priority calls may use their own strategy; unset means the model's `balance`. A chat model sets
+`"balance": "headroom", "balance_priority": "ordered"` so chat calls stay in the first (home)
+region while it has budget, and other work spreads by headroom.
+
+**After the first benchmark** (independent of the design, added where B34 shows the time goes)
+
+| Candidate | Gain |
+|---|---|
+| One queue message for many embedding texts; the worker takes N requests at once | Far fewer queue operations for bulk indexing |
+| Clients and credentials of confirmed regions built in `start()` | The first call to a region is not slow |
+| Status reads from a replica | Dashboards never load the request path |
+| Message bodies above a size threshold compressed | Less queue-store memory, faster sends |
+| Dedicated worker pods scaled on queue depth | Workers do not share the app's CPU |
+
 ## 4. User stories
 
 | # | As | I want | So that |
@@ -998,6 +1064,9 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B53 | One region returns 5xx on every call | each retry lands on another deployment; 0 failed calls while another region is usable; the breaker opens for the bad one |
 | B54 | A deployment added live to a busy model | it takes its quota share within one reload, no ramp; throttles still cut it |
 | B55 | Health: stores reachable; state store down; draining; every deployment disabled | 200; 503; 503; 503 from the Python call and the route |
+| B56 | Backlog: 5,000 normal calls waiting on a model with rpm 500, 20 processes | store calls per second stay proportional to the processes, not to the waiting calls; receive counts unchanged; start order = send order; priority calls still start within 2 s |
+| B57 | `output_reserve=observed` on a TPM-bound model whose calls use ~20 % of `max_tokens`; then calls that suddenly use all of it | throughput at least 2× the `max_tokens` run; tokens per minute still ≤ the quota within the correction of one call; the first 50 calls reserve `max_tokens` |
+| B58 | `balance=headroom`, `balance_priority=ordered`, home region half used | priority calls all land on the first region while it has budget; normal calls spread by headroom |
 
 ## 6. Work plan by release
 
@@ -1006,15 +1075,15 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | **0.3.0** | A0 | Test prerequisites: fakellm quotas per key × region × model, latency / error injection, fake STS, Redis + second Valkey in compose | harness self-test |
 | | A1 | Registry schema (one document: defaults, routing, accounts, models), all setting names and levels, inference parameters and limits, validation, resolve; alias or model id in calls, queue name from the alias; the five old `LLMQ_*` model configs, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
 | | A2 | Registry store: version + hash rule, live edits, audit, CLI `registry`, registry file / own secret | B11, B40 |
-| | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22 |
-| | A4 | Deployment and provider budgets on RPM and TPM, token refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`; `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42, B49-B51 |
+| | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22, B58; strategy per class (`balance_priority`) |
+| | A4 | Deployment and provider budgets on RPM and TPM, token refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`; `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42, B49-B51; `output_reserve` (B57) |
 | | A5 | Region fallback and model fallback rules and hook, per-deployment params, inference defaults merged per provider (locked names, limits, model change), tool calls in the token estimate | B06, B07, B38, B45, B47, B48 |
-| | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43 |
+| | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43; held head call instead of a defer loop (B56) |
 | | A7 | Pod-count logic removed; `store_down` modes; once-locks | B16, B22 |
 | | A8 | Upgrade guide and the app's config moved to the registry | B41 |
 | **0.3.1** | A9 | Accounts: assume role, API-key accounts, client pool | B08, B09 |
 | | A10 | Sticky sessions; latency-aware exclusion; health, auto-disable and probe; quota-drop alert | B10, B28, B29, B37 |
-| **0.3.2** | A11 | In-progress set, per-request status, sweeper | B13, B30; extra Valkey cost per call measured |
+| **0.3.2** | A11 | In-progress set, per-request status, sweeper | B13, B30; extra Valkey cost per call measured; in-progress entry written inside `PICK_TAKE`, status read from it |
 | | A12 | Status reader, Python API, CLI views, HTTP router, alerts, both metric sinks, `debug_capture` | B14, B36 |
 | | A13 | Embedding batching, optional token limiting for embeddings, token estimator hook and token metrics | B15, B32 |
 | **0.3.3** | A14 | Streaming, queued and direct | B25-B27 |
@@ -1088,7 +1157,7 @@ off (uat / prod today) there is nothing to drain.
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
 | E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
-| E41 | Tests | fakellm scenarios B01-B55; a small `live` suite off by default; balancing bench gated |
+| E41 | Tests | fakellm scenarios B01-B58; a small `live` suite off by default; balancing bench gated |
 | E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
@@ -1131,6 +1200,11 @@ off (uat / prod today) there is nothing to drain.
 | E84 | Request status | Full by default, written inside pipelines that are sent anyway; `request_status: full \| final \| off` per model |
 | E85 | Stream chunks | First chunk at once, then batched for `stream_flush_ms` (30) |
 | E86 | Usable check | Health, breaker and latency are read inside `PICK_TAKE` on every call; no cache in the pod |
+| E87 | Waiting for budget | The worker holds the head call per model and class and stops reading; no receive-and-defer loop; strict first in, first out |
+| E88 | Admission round trip | Claim + `PICK_TAKE` (budget, slot, in-progress entry) in one round trip; no status write at admission; 4 worker store calls per request |
+| E89 | Output reservation | `output_reserve`: `max_tokens` (default) or `observed` (p90 of recent output), per model |
+| E90 | Strategy per class | `balance_priority` for priority calls; chat models use `ordered` to stay in the home region |
+| E91 | Later optimisations | Embedding multi-text messages, client warm-up, replica status reads, compression, worker pods: after the first benchmark |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
