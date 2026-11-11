@@ -68,7 +68,8 @@ async def test_large_results_go_to_object_storage(make: Make, store: redis.async
         assert reply.response is not None
         raw = await store.get(engine.keys.request("big-one", "res"))
         assert raw is not None
-        assert bytes(raw).startswith(MARKER)  # the state store keeps only a reference
+        assert isinstance(raw, bytes)
+        assert raw.startswith(MARKER)  # the state store keeps only a reference
         objects = await s3.list_objects_v2(Bucket="llmq-results")
         assert objects["KeyCount"] == 1
     finally:
