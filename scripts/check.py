@@ -56,6 +56,12 @@ STEPS: dict[str, Step] = {
         sources=("src/taskiq_llm_queue/clients",),
         tests=("tests/unit/clients",),
     ),
+    "a4": Step(
+        "Engine keys (schema 3), message format v2, claim / result / status records",
+        sources=("src/taskiq_llm_queue/engine",),
+        tests=("tests/integration/engine/test_requests.py",),
+        needs_stack=True,
+    ),
 }
 
 
