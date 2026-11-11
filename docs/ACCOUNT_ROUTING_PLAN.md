@@ -610,7 +610,7 @@ fields (`params`, the `confirmed` / `fallback` lists, account `kind` / `base_url
 | `health.*` | see example | D, A, M, R | Auto-disable, probe and slow-region numbers |
 | `alerts.*` | see example | D, M | Alert thresholds |
 | `admission`, `fallback_policy`, `token_estimator`, `probe` | none (built-in behaviour) | D, M | Names of registered hooks (§3.10) |
-| `debug_capture` | off | M | Truncated text for ≤ 60 min (§3.12) |
+| `debug_capture` | false | M | Truncated text for ≤ 60 min (§3.12). Prod: turned on by an audited live edit only, never from config |
 | `routing.kill_switch`, `routing.allow_users` | false, [] | top level | Kill switch sends every call direct; listed users always use the queue |
 
 **Per call** (all optional): `priority`, `timeout_secs`, `max_wait_secs`, `session_id`,
