@@ -112,6 +112,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_ops.py",),
         needs_stack=True,
     ),
+    "a13": Step(
+        "Embeddings: batching, provider bodies, vectors in order, large results in S3",
+        sources=("src/taskiq_llm_queue/engine",),
+        tests=("tests/integration/engine/test_embed.py",),
+        needs_stack=True,
+    ),
 }
 
 

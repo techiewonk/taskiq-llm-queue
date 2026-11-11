@@ -41,6 +41,7 @@ from taskiq_llm_queue.engine.errors import CallFailed
 from taskiq_llm_queue.engine.health import Health
 from taskiq_llm_queue.engine.keys import Keys
 from taskiq_llm_queue.engine.metrics import Metrics, NullSink
+from taskiq_llm_queue.engine.offload import ResultOffload
 from taskiq_llm_queue.engine.queue import Message, QueueFull, QueueSettings, StreamQueues
 from taskiq_llm_queue.engine.requests import RequestStore
 from taskiq_llm_queue.engine.status import AlertEvaluator, StatusReader
@@ -168,6 +169,8 @@ class Engine:
         settings: EngineSettings | None = None,
         worker_id: str | None = None,
         metrics: Metrics | None = None,
+        offload: ResultOffload | None = None,
+        offload_bytes: int | None = None,
     ) -> None:
         """Wire the stores; nothing runs until `start`."""
         self.settings = settings or EngineSettings()
@@ -183,6 +186,8 @@ class Engine:
             result_ttl_secs=self.settings.result_ttl_secs,
             result_dedupe_secs=self.settings.result_dedupe_secs,
             status_ttl_secs=self.settings.status_ttl_secs,
+            offload=offload,
+            offload_bytes=offload_bytes,
         )
         self.admission = Admission(
             state,
@@ -429,6 +434,20 @@ class Engine:
             self._waiters.pop(rid, None)
             if not self._waiters:
                 self._idle.set()
+
+    async def embed(
+        self,
+        model: str,
+        texts: Sequence[str],
+        *,
+        priority: bool = False,
+        timeout_secs: float | None = None,
+        **call: Any,
+    ) -> list[list[float]]:
+        """One vector per text, in order (batched by the model's `embed_batch_size`)."""
+        from taskiq_llm_queue.engine.embed import embed
+
+        return await embed(self, model, texts, priority=priority, timeout_secs=timeout_secs, **call)
 
     async def _send(
         self,

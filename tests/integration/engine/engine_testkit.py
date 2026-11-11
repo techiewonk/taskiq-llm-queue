@@ -48,6 +48,14 @@ def registry(models: dict[str, Any] | None = None) -> dict[str, Any]:
                 "inference": {"dimensions": 256},
                 "deployments": {"aws-a": {"confirmed": ["r1"]}},
             },
+            "cohere": {
+                "type": "embedding",
+                "provider": "bedrock",
+                "model_id": "cohere.embed-english-v3",
+                "embed_batch_size": 96,
+                "inference": {"input_type": "search_document"},
+                "deployments": {"aws-a": {"confirmed": ["r1"]}},
+            },
         },
     }
     for alias, extra in (models or {}).items():

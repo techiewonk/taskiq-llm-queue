@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from taskiq_llm_queue.engine.envelope import Reply
 from taskiq_llm_queue.engine.keys import Keys
+from taskiq_llm_queue.engine.offload import MARKER, ResultOffload
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -166,6 +167,8 @@ class RequestStore:
         status_ttl_secs: int = 1800,
         unconfirmed_secs: int = 30,
         takeover_grace_secs: int = 5,
+        offload: ResultOffload | None = None,
+        offload_bytes: int | None = None,
     ) -> None:
         """Register the scripts; no I/O until the first call."""
         self._client = client
@@ -175,6 +178,8 @@ class RequestStore:
         self.status_ttl = status_ttl_secs
         self.unconfirmed = unconfirmed_secs
         self.takeover_grace = takeover_grace_secs
+        self.offload = offload
+        self.offload_bytes = offload_bytes
         self._register = client.register_script(REGISTER)
         self._confirm = client.register_script(CONFIRM)
         self._abandon = client.register_script(ABANDON)
@@ -236,10 +241,13 @@ class RequestStore:
     async def put_result(self, reply: Reply, *, final_state: str) -> bool:
         """Store a result once and wake its callers; False when one was already stored."""
         job, callers, _, result = self._req(reply.request_id)
+        data = reply.dumps()
+        if self.offload is not None and self.offload_bytes and len(data) > self.offload_bytes:
+            data = MARKER + (await self.offload.put(reply.request_id, data)).encode()
         written = await self._put(
             [result, job, callers],
             [
-                reply.dumps(),
+                data,
                 self.result_ttl,
                 final_state,
                 self.status_ttl,
@@ -253,7 +261,13 @@ class RequestStore:
         """A stored result (not deleted; a library id keeps it `result_dedupe_secs` more)."""
         job, _, _, result = self._req(request_id)
         raw = await self._take([result, job], [self.dedupe])
-        return None if raw is None else Reply.model_validate_json(raw)
+        if raw is None:
+            return None
+        if raw.startswith(MARKER) and self.offload is not None:
+            raw = await self.offload.get(raw[len(MARKER) :].decode())
+            if raw is None:
+                return None
+        return Reply.model_validate_json(raw)
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""
