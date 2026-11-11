@@ -135,7 +135,7 @@ read the priority queue first. Each queue has the keys below.
 |---|---|---|---|---|
 | `P:{reg}:doc` | String (JSON) | The registry document | none | publish at boot, live edits |
 | `P:{reg}:version` | Hash | `version=7, hash=ab12…, changes=3` | none | publish, live edits |
-| `P:audit` | Stream | Every publish and edit: who, when, before, after | 90 days | publish, live edits |
+| `P:audit` | Stream | Every publish and edit as path diffs: who, when, path, before, after | 90 days | publish, live edits |
 | `P:{m:ALIAS}:rate:DEPLOYMENT` | Hash | RPM / TPM budget of one deployment (§7) | 2 min idle | `PICK_TAKE`, token correction |
 | `P:{a:ACCOUNT}:rate` | Hash | Account-wide `shared_rpm` / `shared_tpm`, when set | 2 min idle | `PICK_TAKE` |
 | `P:{m:ALIAS}:wait:p`, `:wait:n` | Sorted set | Waiters per class: held calls ordered by queue position; only the oldest is granted | twice the wait | `PICK_TAKE` |
@@ -172,7 +172,7 @@ Version rule in step 4:
 
 | Config says | Store has | Result |
 |---|---|---|
-| version 7 | nothing, or version 6 | Config is published; the old document goes to `P:audit` |
+| version 7 | nothing, or version 6 | Config is published; the diff goes to `P:audit` |
 | version 7 | version 7, same content | The stored one is used, with its live edits |
 | version 7 | version 7, different content | The stored one is kept; alert `registry_version_not_bumped` |
 | version 6 | version 7 | Config is ignored (an old pod during a rolling deploy) |
@@ -681,6 +681,14 @@ use the streaming API under the hood, so long answers are not cut. Provider thro
 count toward the 4 attempts. A result stays 30 s after its first read. `/llmq/health/ready` does
 not depend on the stores. Releases: 0.3.0 and 0.3.1. Regions follow E114: India confirmed,
 others fallback and unused until the residency list allows them.
+
+**Owner decisions E127 to E143.** The library creates request ids unless the app passes one. Calls
+are normal unless the app marks its live-chat model as priority. A send above 50,000 waiting
+calls fails with `queue_full`. A per-call timeout is capped at 15 minutes. Large requests and
+results may go to an encrypted bucket for one day. Checked against the AWS documentation:
+Bedrock reserves `max_tokens` when a request starts and returns the unused part at the end
+(the same rule this page describes), cache reads are not counted, and embedding models are
+throttled by requests per minute only.
 
 Still needed from the owner: real RPM / TPM per region for the first four models, and the
 residency list once compliance answers. This page uses sample numbers only.
