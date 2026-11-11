@@ -1,6 +1,6 @@
 [project]
 name = "taskiq-llm-queue"
-description = "An LLM request client with its own durable queue: taskiq + Amazon SQS, adaptive limits, retry and fallback."
+description = "LLM calls through a queue on Valkey / Redis: RPM and TPM budgets per account and region, balancing, fallback, health and status."
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -9,7 +9,7 @@ license = "MIT"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "The taskiq-llm-queue authors" }]
 keywords = [
-    "taskiq", "sqs", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain", "langgraph",
+    "valkey", "redis", "llm", "bedrock", "openai", "queue", "rate-limit", "langchain", "langgraph",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -30,13 +30,9 @@ classifiers = [
 # Ranges, not pins: a library that pins exact versions locks every user into one botocore
 # patch window. Exact versions live only in the consuming app's lockfile.
 dependencies = [
-    # Bounded: the broker builds on taskiq's AsyncBroker / Receiver internals (ack timing,
-    # listen()), which may change between minor versions.
-    "taskiq>=0.13,<0.14",
-    # Async SQS (and Bedrock) client. aiobotocore pins a narrow botocore window per release.
+    # Async Bedrock (and S3 offload) client. aiobotocore pins a narrow botocore window.
     "aiobotocore>=2.23",
-    # Limiter, claims, live config and results on Redis/Valkey. >=5.0.1 so apps aren't forced
-    # onto redis 8 (taskiq-redis would force it; we ship our own JSON result backend).
+    # Queues, budgets, registry and results on any Redis-protocol store (Valkey, Redis).
     "redis>=5.0.1",
     "pydantic>=2.10,<3",
     # JSON on every hot path (envelopes, params, provider bodies): Rust, ~3-10x stdlib json.
@@ -46,7 +42,7 @@ dependencies = [
 ]
 
 [project.scripts]
-llm-queue = "taskiq_llm_queue.cli:console_main"
+llm-queue = "taskiq_llm_queue.engine.cli:main"
 
 [project.optional-dependencies]
 openai = ["openai>=1.40,<4", "httpx>=0.27,<1"]
@@ -54,6 +50,8 @@ openai = ["openai>=1.40,<4", "httpx>=0.27,<1"]
 langchain-aws = ["langchain-aws>=0.2.24,<2", "langchain-core>=0.3.68,<2"]
 langchain-openai = ["langchain-openai>=0.3.26,<2", "langchain-core>=0.3.68,<2"]
 metrics = ["prometheus-client>=0.20"]
+# Status / registry / health routes for a FastAPI app (`LLMQueue.http_router`).
+http = ["fastapi>=0.110,<1"]
 # C RESP parser; redis-py picks it up automatically when installed.
 speedups = ["hiredis>=3"]
 
@@ -115,10 +113,10 @@ convention = "google"
 [tool.mypy]
 strict = true
 python_version = "3.11"
-files = ["src", "tests", "tools", "samples"]
+files = ["src", "tests", "tools", "scripts"]
 # Test folders have no __init__.py (several conftest.py files): map modules from paths.
 explicit_package_bases = true
-mypy_path = ["src", "tools/fakellm", "samples"]
+mypy_path = ["src", "tools/fakellm"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]

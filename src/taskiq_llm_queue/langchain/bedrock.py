@@ -16,8 +16,6 @@ from typing import TYPE_CHECKING, Any
 from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from pydantic import Field, model_validator
 
-from taskiq_llm_queue.config import Lane
-from taskiq_llm_queue.envelope import FallbackPolicy
 from taskiq_llm_queue.errors import LLMQueueError
 from taskiq_llm_queue.langchain._client import resolve_queue
 
@@ -29,7 +27,7 @@ if TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
     from langchain_core.outputs import ChatResult
 
-    from taskiq_llm_queue.langchain._client import ConverseResultLike, QueueClient
+    from taskiq_llm_queue.langchain._client import QueueClient, ReplyLike
 
 # Per-call Converse handler of the placeholder client (a ContextVar: concurrent calls on one
 # model instance never see each other's handler).
@@ -87,21 +85,20 @@ def _looks_like_bedrock_id(model_id: str) -> bool:
 def _alias_values(values: Any) -> Any:
     """Resolve `model_alias` / `model_id` and reject a queue alias passed as the model id.
 
-    Without `model_id`, it is looked up from `llmq.config` when a queue is given.
+    Without `model_id`, it is looked up from the queue's registry when a queue is given.
     """
     if not isinstance(values, dict):
         return values
     model_id = values.get("model_id", values.get("model"))
     alias = values.get("model_alias")
     if model_id is None and alias is not None:
-        config = getattr(values.get("llmq"), "config", None)
-        resolve = getattr(config, "resolve", None)
-        if not callable(resolve):
+        registry = getattr(values.get("llmq"), "registry", None)
+        if registry is None:
             raise ValueError(
                 f"model_alias={alias!r} needs model_id='<Bedrock model id>' "
-                "(or llmq=<LLMQueue> so it can be looked up from the queue config)"
+                "(or llmq=<LLMQueue> so it can be looked up from the registry)"
             )
-        values["model_id"] = resolve(alias)[1].model_id
+        values["model_id"] = registry.current.model(alias).model_id
     elif isinstance(model_id, str) and alias is None and not _looks_like_bedrock_id(model_id):
         raise ValueError(
             f"model={model_id!r} looks like a queue alias, not a Bedrock model id; pass "
@@ -118,15 +115,15 @@ def _service_tier(tier: Any) -> dict[str, Any]:
 class QueuedChatBedrockConverse(ChatBedrockConverse):
     """`ChatBedrockConverse` whose Converse calls go through the LLM queue.
 
-    `model_alias` is the queue alias (`gpt120b`, `gpt120b@apac`); `model_id` is the Bedrock id
-    (looked up from `llmq.config` when omitted) and drives the parent's provider-specific
-    request building. Streaming is always off (one full message).
+    `model_alias` is the registry alias (`gpt120b`); `model_id` is the Bedrock id (looked up
+    from the registry when omitted) and drives the parent's provider-specific request building.
+    `priority=None` takes the class from `request_context`. Streaming is off (one full message).
     """
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    fallback_policy: FallbackPolicy | None = None
-    lane: Lane | str | None = None
+    allow_fallback: str = "all"
+    priority: bool | None = None
     service_tier: str | None = None
     queue_timeout_secs: float | None = None
 
@@ -190,18 +187,19 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         messages: list[BaseMessage],
         stop: list[str] | None,
         call_kwargs: dict[str, Any],
-        result: ConverseResultLike,
+        result: ReplyLike,
     ) -> ChatResult:
         """Parse like the parent (same call, canned reply), then add how the queue served it."""
-        chat = self._run_parent(messages, stop, call_kwargs, lambda _request: result.response)
+        response = result.response or {}
+        chat = self._run_parent(messages, stop, call_kwargs, lambda _request: response)
         meta = result.meta.model_dump()
         for generation in chat.generations:
             generation.message.response_metadata.update(meta)
-        served = result.meta.served_model.partition("@")[0]
-        if served and served != self._alias.partition("@")[0]:
-            # Fallback: report the model that answered (tracers price by `llm_output`).
-            models = getattr(getattr(self._queue(), "config", None), "models", {})
-            served_id = models[served].model_id if served in models else served
+        served = result.meta.served_model
+        if served and served != self._alias:
+            # Model fallback: report the model that answered (tracers price by `llm_output`).
+            registry = getattr(self._queue(), "registry", None)
+            served_id = registry.current.model(served).model_id if registry else served
             chat.llm_output = {**(chat.llm_output or {}), "model_name": served_id}
         return chat
 
@@ -217,8 +215,8 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         result = self._queue().converse_sync(
             self._alias,
             request,
-            lane=self.lane,
-            fallback=self.fallback_policy,
+            priority=self.priority,
+            allow_fallback=self.allow_fallback,
             timeout_secs=self.queue_timeout_secs,
         )
         return self._parse(messages, stop, call_kwargs, result)
@@ -235,8 +233,8 @@ class QueuedChatBedrockConverse(ChatBedrockConverse):
         result = await self._queue().converse(
             self._alias,
             request,
-            lane=self.lane,
-            fallback=self.fallback_policy,
+            priority=self.priority,
+            allow_fallback=self.allow_fallback,
             timeout_secs=self.queue_timeout_secs,
         )
         return self._parse(messages, stop, call_kwargs, result)
@@ -252,7 +250,7 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    lane: Lane | str | None = None
+    priority: bool | None = None
     queue_timeout_secs: float | None = None
 
     @model_validator(mode="before")
@@ -274,7 +272,7 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
         result = self._queue().embed_sync(
             self.model_alias or self.model_id,
             self._prepare(texts),
-            lane=self.lane,
+            priority=self.priority,
             input_type=input_type,
             timeout_secs=self.queue_timeout_secs,
         )
@@ -284,7 +282,7 @@ class QueuedBedrockEmbeddings(BedrockEmbeddings):
         result = await self._queue().embed(
             self.model_alias or self.model_id,
             self._prepare(texts),
-            lane=self.lane,
+            priority=self.priority,
             input_type=input_type,
             timeout_secs=self.queue_timeout_secs,
         )

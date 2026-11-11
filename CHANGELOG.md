@@ -6,6 +6,35 @@ a minor release may break the public API, with a deprecation announced one minor
 
 ## [Unreleased]
 
+## [0.3.0] - unreleased
+
+A clean break from 0.2 (plan E101): nothing is carried over. Empty the 0.2 queues, deploy 0.3.
+
+### Added
+
+- One registry document (`LLMQ_REGISTRY`): accounts (AWS by pod identity, OpenAI-compatible
+  endpoints), models with deployments per account and region (confirmed and fallback), every
+  setting at four levels with types, ranges and defaults; validated with every problem listed.
+- Registry in the store: publish by version, compare-and-set live edits with protected
+  fields, audit as path diffs, rollback, lenient read, restore after a store reset.
+- Admission in one store call: pick a deployment (ordered, round robin, weighted, headroom,
+  custom) and take RPM / TPM, the account budget, a slot per class and an in-progress entry;
+  waiters keep their order (reservation rule); priority calls go first.
+- Queues on Valkey / Redis streams: a pair per model (normal, priority), return in place,
+  failures and dead letters, a waiting limit, the store's clock everywhere.
+- Fallback regions and fallback models by cause; health with auto-disable, probes and safeguards;
+  credentials per process; kill switch, `queue_pct`, `store_down` modes; cancel; caller gone.
+- Token accounting (estimate, corrections, refunds by outcome), inference defaults and limits
+  per provider, embeddings batched per model, large results in S3.
+- Status, alerts, metrics (CloudWatch EMF, Prometheus), one `llmq_call_finished` record per call,
+  HTTP routes, the new `llm-queue` CLI, jobs on the stream queue.
+
+### Removed
+
+- taskiq, the SQS broker, lanes, targets, `QueueConfig`, `LLMQ_MODELS`, `LLMQ_SETTINGS`,
+  `LLMQ_FALLBACK_CHAINS`, `LLMQ_ROUTING_*`, `LLMQ_WORKER_SLOTS`, pod-count logic and every 0.2
+  module, test, sample and scenario harness.
+
 ### Changed
 
 - Queue names (model `queues` and `job_queues`) are checked when the config is built: 1-80 of

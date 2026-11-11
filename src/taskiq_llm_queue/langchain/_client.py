@@ -1,4 +1,4 @@
-"""The client interface the adapters call, and the process-wide default queue (D85).
+"""The client interface the adapters call, and the process-wide default queue.
 
 Adapters type against `QueueClient` instead of importing `LLMQueue`, so they work with any object
 that has the same methods (tests use a fake). Classes created at import time find the running
@@ -7,122 +7,74 @@ queue on first call through `get_default_queue`. This module never imports langc
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, cast, runtime_checkable
 
 from taskiq_llm_queue.errors import LLMQueueError
 
-if TYPE_CHECKING:
-    from taskiq_llm_queue.config import Lane
-    from taskiq_llm_queue.envelope import CallMeta, FallbackPolicy
 
-
-class ConverseResultLike(Protocol):
-    """What `converse` returns: the exact Bedrock Converse dict and how it was served."""
+class ReplyLike(Protocol):
+    """What `converse` / `chat` return: the provider-native body and how it was served."""
 
     @property
-    def response(self) -> dict[str, Any]: ...
+    def response(self) -> dict[str, Any] | None: ...
 
     @property
-    def meta(self) -> CallMeta: ...
-
-
-class ChatResultLike(Protocol):
-    """What `chat` returns: the OpenAI-compatible completion body and how it was served."""
-
-    @property
-    def response(self) -> dict[str, Any]: ...
-
-    @property
-    def meta(self) -> CallMeta: ...
+    def meta(self) -> Any: ...
 
 
 class EmbedResultLike(Protocol):
-    """What `embed` returns: one vector per text, in input order, and how they were served."""
+    """What `embed` returns: one vector per text, in input order."""
 
     @property
     def vectors(self) -> list[list[float]]: ...
-
-    @property
-    def meta(self) -> CallMeta: ...
 
 
 @runtime_checkable
 class QueueClient(Protocol):
     """The subset of `LLMQueue` the LangChain adapters and the HTTP transport use.
 
-    `lane=None` means "take the lane from `current_context()`"; adapters pass only explicit
-    overrides. Sync methods run on the caller's thread (direct path under the shared limiter).
+    `priority=None` takes it from `request_context`. Sync methods run on the direct path.
     """
 
     async def converse(
-        self,
-        model: str,
-        request: dict[str, Any],
-        *,
-        lane: Lane | str | None = None,
-        fallback: FallbackPolicy | None = None,
-        timeout_secs: float | None = None,
-        deadline_at: float | None = None,
-        request_id: str | None = None,
-    ) -> ConverseResultLike: ...
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> ReplyLike: ...
 
     def converse_sync(
-        self,
-        model: str,
-        request: dict[str, Any],
-        *,
-        lane: Lane | str | None = None,
-        fallback: FallbackPolicy | None = None,
-        timeout_secs: float | None = None,
-        deadline_at: float | None = None,
-        request_id: str | None = None,
-    ) -> ConverseResultLike: ...
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> ReplyLike: ...
+
+    async def chat(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> ReplyLike: ...
 
     async def embed(
         self,
         model: str,
-        texts: list[str],
+        texts: Sequence[str],
         *,
-        lane: Lane | str | None = None,
+        priority: bool | None = None,
         input_type: str | None = None,
-        timeout_secs: float | None = None,
-        deadline_at: float | None = None,
-        request_id: str | None = None,
+        **kw: Any,
     ) -> EmbedResultLike: ...
 
     def embed_sync(
         self,
         model: str,
-        texts: list[str],
+        texts: Sequence[str],
         *,
-        lane: Lane | str | None = None,
+        priority: bool | None = None,
         input_type: str | None = None,
-        timeout_secs: float | None = None,
-        deadline_at: float | None = None,
-        request_id: str | None = None,
+        **kw: Any,
     ) -> EmbedResultLike: ...
-
-    async def chat(
-        self,
-        model: str,
-        request: dict[str, Any],
-        *,
-        lane: Lane | str | None = None,
-        fallback: FallbackPolicy | None = None,
-        timeout_secs: float | None = None,
-        deadline_at: float | None = None,
-        request_id: str | None = None,
-    ) -> ChatResultLike: ...
 
 
 _default_queue: QueueClient | None = None
 
 
 def set_default_queue(llmq: QueueClient | None) -> None:
-    """Register the queue that adapters built without `llmq=` use; `None` clears it.
-
-    `LLMQueue.start()` is expected to call this, and `stop()` to clear it.
-    """
+    """Register the queue that adapters built without `llmq=` use; `None` clears it."""
     global _default_queue
     _default_queue = llmq
 

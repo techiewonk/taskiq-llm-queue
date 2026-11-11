@@ -222,12 +222,16 @@ class Engine:
 
     async def start(self, *, worker: bool = True, caller: bool = True) -> None:
         """Boot the registry, then start the worker loops and the result reader."""
-        await self.registry.boot()
-        await self.clock.sync(self.state)
-        await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
+        await self.registry.boot()  # runs on its own config when the store is down
+        try:
+            await self.clock.sync(self.state)
+            await self.state.set(self.keys.epoch, str(self.clock.now()), nx=True)
+        except STORE_ERRORS as exc:
+            # Start anyway (plan §3.18): calls follow each model's `store_down` rule and
+            # the background loops keep retrying until the store answers.
+            logger.error("state_store_unreachable_at_start", error=str(exc))
         if caller:
             self._pubsub = self.state.pubsub()
-            await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
             self._tasks.append(asyncio.create_task(self._result_reader()))
         if worker:
             for alias in self.registry.current.registry.models:
@@ -238,7 +242,6 @@ class Engine:
             self._tasks.append(asyncio.create_task(self._prober()))
             self._tasks.append(asyncio.create_task(self._alert_loop()))
             self._cancels = self.state.pubsub()
-            await self._cancels.subscribe(self.keys.cancel_channel)
             self._tasks.append(asyncio.create_task(self._cancel_reader()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
         self._tasks.append(asyncio.create_task(self.registry.run(30)))
@@ -296,8 +299,12 @@ class Engine:
         allow_fallback: str = "all",
         allowed_regions: Sequence[str] | None = None,
         allowed_accounts: Sequence[str] | None = None,
+        force_direct: bool = False,
     ) -> Reply:
-        """Run one call through the queue and return its reply; `CallFailed` on failure."""
+        """Run one call through the queue and return its reply; `CallFailed` on failure.
+
+        `force_direct` runs it in this process (sync calls), with the same admission.
+        """
         view = self.registry.current
         alias = view.registry.alias_of(model)
         if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
@@ -335,7 +342,7 @@ class Engine:
             verdict = hooks.call_safely("admission", hook_name, hook, ctx, default=None)
             if isinstance(verdict, hooks.Reject):
                 raise CallFailed("rejected", verdict.reason, request_id=rid)
-        direct = self._direct_route(view, alias, rid, user_id)
+        direct = force_direct or self._direct_route(view, alias, rid, user_id)
         try:
             return await self._call_once(
                 view, alias, envelope, params, priority, timeout, request_id, direct
@@ -442,12 +449,21 @@ class Engine:
         *,
         priority: bool = False,
         timeout_secs: float | None = None,
+        input_type: str | None = None,
         **call: Any,
     ) -> list[list[float]]:
         """One vector per text, in order (batched by the model's `embed_batch_size`)."""
         from taskiq_llm_queue.engine.embed import embed
 
-        return await embed(self, model, texts, priority=priority, timeout_secs=timeout_secs, **call)
+        return await embed(
+            self,
+            model,
+            texts,
+            priority=priority,
+            timeout_secs=timeout_secs,
+            input_type=input_type,
+            **call,
+        )
 
     async def _send(
         self,
@@ -496,13 +512,20 @@ class Engine:
 
     async def _cancel_reader(self) -> None:
         """Stop running attempts whose call was cancelled (by any process)."""
+        subscribed = False
         while True:
             try:
+                if not subscribed:
+                    await self._cancels.subscribe(self.keys.cancel_channel)
+                    subscribed = True
                 message = await self._cancels.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
             except Exception as exc:
                 logger.warning("cancel_reader_error", error=str(exc))
+                subscribed = False
+                with contextlib.suppress(Exception):
+                    await self._cancels.reset()
                 await asyncio.sleep(1)
                 continue
             if not message:
@@ -652,14 +675,21 @@ class Engine:
                 self._waiters[rid] = waiter
 
     async def _result_reader(self) -> None:
-        """Wake waiting callers when their result is published."""
+        """Wake waiting callers when their result is published (re-subscribes after errors)."""
+        subscribed = False
         while True:
             try:
+                if not subscribed:
+                    await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
+                    subscribed = True
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
             except Exception as exc:  # the reader must survive store hiccups
                 logger.warning("result_reader_error", error=str(exc))
+                subscribed = False
+                with contextlib.suppress(Exception):
+                    await self._pubsub.reset()
                 await asyncio.sleep(1)
                 continue
             if not message:

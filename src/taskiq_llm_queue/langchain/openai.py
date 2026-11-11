@@ -2,8 +2,8 @@
 
 Both SDK clients get an httpx client whose transport answers from the LLM queue (D88), so every
 LangChain/SDK code path is queued and parsed unchanged. Streaming and SDK retries are forced off:
-the queue's workers own retry and fallback. Chat replies get the queue's `CallMeta`
-(served model/target, attempts, queue wait) in `response_metadata`, like the Bedrock adapter.
+the queue's workers own retry and fallback. Chat replies get how the queue served
+them (served model, deployment, attempts, queue wait) in `response_metadata`.
 """
 
 from __future__ import annotations
@@ -14,8 +14,6 @@ import httpx
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import Field, model_validator
 
-from taskiq_llm_queue.config import Lane
-from taskiq_llm_queue.envelope import FallbackPolicy
 from taskiq_llm_queue.http_transport import META_KEY, QUEUED_BASE_URL, QueuedHTTPTransport
 
 if TYPE_CHECKING:
@@ -32,8 +30,8 @@ def _queued_client_values(values: Any) -> Any:
     transport = QueuedHTTPTransport(
         values.get("llmq"),
         values.get("model_alias"),
-        lane=values.get("lane"),
-        fallback=values.get("fallback_policy"),
+        priority=values.get("priority"),
+        allow_fallback=values.get("allow_fallback", "all"),
         timeout_secs=values.get("queue_timeout_secs"),
     )
     values["http_async_client"] = httpx.AsyncClient(transport=transport, base_url=QUEUED_BASE_URL)
@@ -56,8 +54,8 @@ class QueuedChatOpenAI(ChatOpenAI):
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    fallback_policy: FallbackPolicy | None = None
-    lane: Lane | str | None = None
+    allow_fallback: str = "all"
+    priority: bool | None = None
     queue_timeout_secs: float | None = None
 
     @model_validator(mode="before")
@@ -94,7 +92,7 @@ class QueuedOpenAIEmbeddings(OpenAIEmbeddings):
 
     llmq: Any = Field(default=None, exclude=True)
     model_alias: str | None = None
-    lane: Lane | str | None = None
+    priority: bool | None = None
     queue_timeout_secs: float | None = None
     check_embedding_ctx_length: bool = False
 

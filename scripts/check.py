@@ -118,6 +118,17 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_embed.py",),
         needs_stack=True,
     ),
+    "a14": Step(
+        "Front door (LLMQueue.from_env), jobs, sync calls, LangChain adapters",
+        sources=(
+            "src/taskiq_llm_queue/llm_queue.py",
+            "src/taskiq_llm_queue/langchain",
+            "src/taskiq_llm_queue/http_transport.py",
+            "src/taskiq_llm_queue/engine/jobs.py",
+        ),
+        tests=("tests/integration/engine/test_front.py",),
+        needs_stack=True,
+    ),
 }
 
 

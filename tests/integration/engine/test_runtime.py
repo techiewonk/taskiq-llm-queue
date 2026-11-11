@@ -91,6 +91,7 @@ async def test_model_fallback(make: Make) -> None:
         {
             "big": {
                 "rpm": 1,
+                "rate_window": "smooth",  # no minute boundary to cross mid-test
                 "deployments": {"aws-a": {"confirmed": ["r1"]}},
                 "model_fallback": {"on": ["exhausted"], "after_secs": 0, "models": ["small"]},
             }

@@ -49,13 +49,18 @@ class EmfSink:
     """CloudWatch embedded metric format: one JSON line per point on `write` (stdout)."""
 
     def __init__(
-        self, write: Callable[[str], Any] | None = None, namespace: str = NAMESPACE
+        self,
+        write: Callable[[str], Any] | None = None,
+        namespace: str = NAMESPACE,
+        static: Mapping[str, str] | None = None,
     ) -> None:
-        """`write` receives each line (default: stdout)."""
+        """`write` receives each line (default: stdout); `static` labels go on every point."""
         self._write = write or (lambda line: sys.stdout.write(line + "\n"))
         self.namespace = namespace
+        self.static = dict(static or {})
 
     def _emit(self, name: str, value: float, unit: str, labels: Mapping[str, str]) -> None:
+        labels = {**self.static, **labels}
         dims = sorted(labels)
         line = {
             "_aws": {

@@ -51,7 +51,7 @@ async def test_status_of_model_and_request(make: Make) -> None:
     assert dep["concurrency"]["in_use"] == 0
     assert status["waiting"] == {"priority": 0, "normal": 0}
     everything = await engine.status()
-    assert {m["model"] for m in everything["models"]} == {"big", "small", "titan"}
+    assert {m["model"] for m in everything["models"]} == {"big", "small", "titan", "cohere"}
     assert await engine.request_status("nope") == {}
 
 

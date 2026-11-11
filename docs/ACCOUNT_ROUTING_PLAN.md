@@ -1746,6 +1746,12 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E142 | Timeout cap | `timeout_max_secs` per model, default 900 |
 | E143 | Verification results | `max_tokens` is reserved up front by Bedrock: `observed` refused for `bedrock` models; `tpm_count_cached` false; embeddings on RPM only confirmed (§12) |
 | E144 | Build order | The new engine is built next to the 0.2 code (registry, client pool and providers, admission, worker loop), each step green on its own; `LLMQueue` then switches over in one cut and every 0.2 module it no longer uses (targets, lanes, `LiveConfigStore`, model settings, fallback chains, routing config, `PodRegistry`, the 0.2 providers and core) is deleted in the same step. No compatibility layer is kept |
+| E145 | Jobs | `register_job` / `send_job` kept for the app (E136) but re-built on the stream queue (`<queue_prefix>jobs-<name>`), so the taskiq broker and SQS code could be removed; at least once, retries with backoff, dead letters after `max_receives` |
+| E146 | Model-level disable | `enabled: false` on a model refuses new calls (`model_disabled`, or the first `model_fallback` model) while its deployments keep serving waiting calls (drain) |
+| E147 | Target-error counting | Recorded only when the call's outcome is known (success elsewhere, or failure on that one deployment), so one bad request never disables a deployment |
+| E148 | Inference defaults by type | Values in `defaults` / account settings apply only to models of the matching type (found while loading the plan's own example) |
+| E149 | HTTP without a framework dependency | Handlers are plain functions; `status_router()` mounts them on FastAPI only when the `http` extra is installed |
+| E150 | Unreachable store at start | The process starts on its own registry; calls follow `store_down`; readers re-subscribe when the store answers |
 
 ## 8. Needed from the owner
 
@@ -1922,3 +1928,34 @@ counted in Amazon Bedrock", "Quotas for Amazon Bedrock" and "Amazon Titan Text E
 | V4 | A throttled or failed request gives its reservation back at the provider | **Not documented** | The refund rule of §3.7a stays an assumption; the limiter corrects it if it is wrong. To be measured with the live suite |
 | V5 | A queue store at its memory limit can still drain | **Confirmed** on Valkey 8.1 and Redis 7.4 (`noeviction`, 40 MB, 20 KB messages, the 0.2.1 stream queue): sends fail with `OutOfMemoryError` at about 1,980 messages; every waiting message is then received and deleted (memory back to 1.5 MB). The same holds with memory far above the limit (limit lowered to 20 MB while 42 MB are used) | No change: `max_waiting` stays as the first guard, and a full queue store still drains. Re-checked in step A5 for the new queue scripts |
 | V6 | Quota numbers and regions of the first four models | **Not confirmed.** A documentation search suggests 10,000 requests / min per region for the two chat models and 6,000 (Titan V2) and 2,000 (Cohere Embed English) for the embedding models, and that `gpt-oss-120b` is offered in `ap-south-1`; `ap-south-2` was confirmed only for Titan V2 | The owner confirms the numbers and the region lists in the Service Quotas console (Q1, Q2) |
+
+## 13. Implementation status (2026-11-12)
+
+Built on branch `feat/accounts-routing` as version 0.3.0 (not released). Every step's checks run
+with `python scripts/check.py <step>` (lint, format, types, tests); stack-backed steps run on
+Valkey 8.1 and Redis 7.4 against fakellm. No test calls a real LLM.
+
+| Step | Built | Check |
+|---|---|---|
+| A0 | fakellm: accounts by access key / API key, TPM reserving max_tokens, pacing, usage-missing, hang, ConverseStream and OpenAI SSE; Redis in the stack; `scripts/stack.py` | `a0` |
+| A1 | Registry schema, settings table (levels, types, ranges, defaults), validation, resolve | `a1` |
+| A2 | Registry store: version rule, compare-and-set edits, protected fields, audit diffs, rollback, lenient read, reset restore | `a2` |
+| A3 | Client pool per account and region; providers on routes; chat over the streaming APIs; attempt timers | `a3` |
+| A4 | Key schema 3, message format v2, claim / result / status records (duplicate ids, results read without delete) | `a4` |
+| A5 | Stream queue: order, return in place, generation and failure counters, dead letters, waiting limit | `a5` |
+| A6 | PICK_TAKE / FINISH / UNDO / RENEW / SWEEP: budgets, class shares, slots per class, waiter reservation, strategies, tiers, sticky, foreign calls | `a6` |
+| A7 | Token estimate and refunds; inference defaults and limits per provider | `a7` |
+| A8 | Engine runtime: caller, worker loop, held calls, retries, fallback, duplicate ids | `a8` |
+| A9 | Hooks (balancer, fallback policy, admission, sticky key), fallback by cause, deployment params | `a9` |
+| A10 | Direct path, store_down, cancel, caller gone, shutdown order, store reset | `a10` |
+| A11 | Health: auto-disable with safeguards, probes, credentials per process | `a11` |
+| A12 | Status, readiness, alerts, metrics, call record, drain, HTTP handlers, CLI, process settings | `a12` |
+| A13 | Embeddings batched per model; large results in S3 | `a13` |
+| A14 | `LLMQueue` front door, jobs on the stream queue, sync calls, LangChain adapters; every 0.2 module, test, sample and harness removed; the app moved to 0.3 | `a14` |
+| A15 | Assume-role accounts (0.3.1) | not built: the pool refuses `role_arn` with a clear error |
+| A16 | Latency-aware exclusion (0.3.1); sticky sessions are built (A6) | latency samples are recorded; exclusion not built |
+| A17 | Streaming to the caller (0.3.1); chat already streams underneath | not built |
+
+Open items for the owner: real quotas (Q1), region lists (Q2), residency sign-off (Q4), the
+streaming permission in every listed account and region (Q6), and releasing 0.3.0 through the
+GitHub release workflow before the app's pin (`==0.3.0`) can install it.

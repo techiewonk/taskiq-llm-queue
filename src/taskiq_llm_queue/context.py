@@ -1,7 +1,7 @@
-"""Per-request context (lane, session, user) carried through async tasks and threads.
+"""Per-request context (priority, session, user, tenant) carried through tasks and threads.
 
-Routers set it once with `request_context(...)`; queued adapters read it on every call to pick
-the lane and the canary bucket. Raw threads must run under `contextvars.copy_context().run`.
+Routers set it once with `request_context(...)`; queued calls and the LangChain adapters read
+it when the call itself does not say. Raw threads must run under `contextvars.copy_context()`.
 """
 
 from __future__ import annotations
@@ -11,49 +11,41 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
-from taskiq_llm_queue.config import Lane
-
 
 @dataclass(frozen=True, slots=True)
 class RequestContext:
-    """What the current request is: its lane and the ids used for routing and tracing.
+    """What the current request is: its class and the ids used for sticky sessions and records."""
 
-    `defaulted` is True when no `request_context` was set, so callers can warn once about
-    calls that silently land in the background lane.
-    """
-
-    lane: Lane = Lane.BG
+    priority: bool = False
     session_id: str | None = None
     user_id: str | None = None
-    defaulted: bool = True
+    tenant_id: str | None = None
 
 
 _CURRENT: ContextVar[RequestContext | None] = ContextVar("taskiq_llm_queue_context", default=None)
 
 
 def current_context() -> RequestContext:
-    """The active context, or the default (`bg` lane, `defaulted=True`) when none is set."""
+    """The active context, or the default (normal priority, no ids)."""
     return _CURRENT.get() or RequestContext()
 
 
 @contextmanager
 def request_context(
     *,
-    lane: Lane | str | None = None,
+    priority: bool | None = None,
     session_id: str | None = None,
     user_id: str | None = None,
+    tenant_id: str | None = None,
 ) -> Iterator[RequestContext]:
-    """Set the lane and ids for everything run inside the block; unset fields are inherited.
-
-    Nesting is allowed, so a background job inside a request can switch only the lane.
-    """
+    """Set priority and ids for everything run inside the block; unset fields are inherited."""
     base = current_context()
     ctx = replace(
         base,
-        lane=Lane(lane) if lane is not None else base.lane,
+        priority=base.priority if priority is None else priority,
         session_id=session_id if session_id is not None else base.session_id,
         user_id=user_id if user_id is not None else base.user_id,
-        defaulted=False,
+        tenant_id=tenant_id if tenant_id is not None else base.tenant_id,
     )
     token = _CURRENT.set(ctx)
     try:

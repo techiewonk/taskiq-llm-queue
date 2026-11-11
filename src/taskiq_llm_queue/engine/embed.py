@@ -25,12 +25,20 @@ def batch_size(provider: str, model_id: str, setting: int) -> int:
     return max(1, min(int(setting), max_batch_size(provider, model_id)))
 
 
-def request_for(provider: str, model_id: str, texts: Sequence[str]) -> dict[str, Any]:
-    """The provider-native request of one batch (defaults are merged by the worker)."""
+def request_for(
+    provider: str, model_id: str, texts: Sequence[str], input_type: str | None = None
+) -> dict[str, Any]:
+    """The provider-native request of one batch (defaults are merged by the worker).
+
+    `input_type` (Cohere: `search_query` / `search_document`) wins over the registry default.
+    """
     if provider == "openai":
         return {"input": list(texts)}
     if "cohere" in model_id.lower():
-        return {"body": {"texts": list(texts)}}
+        body: dict[str, Any] = {"texts": list(texts)}
+        if input_type:
+            body["input_type"] = input_type
+        return {"body": body}
     return {"body": {"inputText": texts[0]}}
 
 
@@ -50,6 +58,7 @@ async def embed(
     priority: bool = False,
     timeout_secs: float | None = None,
     concurrency: int = 16,
+    input_type: str | None = None,
     **call: Any,
 ) -> list[list[float]]:
     """One vector per text, in order; the batches run through the queue concurrently."""
@@ -66,7 +75,7 @@ async def embed(
         async with gate:
             reply = await engine.call(
                 alias,
-                request_for(entry.provider, entry.model_id, group),
+                request_for(entry.provider, entry.model_id, group, input_type),
                 priority=priority,
                 timeout_secs=timeout_secs,
                 **call,
