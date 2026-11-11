@@ -31,6 +31,7 @@ async def test_status_of_model_and_request(make: Make) -> None:
         {"big": {"rpm": 50}},
         {"defaults": {"latency_ms": {"p50": 600, "p95": 600}}},
     )
+    minute = engine.clock.now() // 60
     task = asyncio.create_task(engine.call("big", CHAT, request_id="r-status"))
     await asyncio.sleep(0.3)
     running = await engine.request_status("r-status")
@@ -41,7 +42,10 @@ async def test_status_of_model_and_request(make: Make) -> None:
     assert done["state"] == "done"
     status = await engine.status("big")
     dep = next(d for d in status["deployments"] if d["name"] == "aws-a/r1")
-    assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49}
+    if engine.clock.now() // 60 == minute:  # the counters are per calendar minute
+        assert dep["rpm"] == {"limit": 50, "used": 1, "left": 49}
+    else:
+        assert dep["rpm"]["used"] + dep["rpm"]["left"] == 50
     assert dep["healthy"]
     assert dep["breaker"] == "closed"
     assert dep["concurrency"]["in_use"] == 0
