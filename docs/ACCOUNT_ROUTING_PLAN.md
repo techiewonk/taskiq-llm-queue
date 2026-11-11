@@ -110,6 +110,8 @@ flowchart LR
 - **Request status** = `P:req:<id>`, for every call on the queue path and the direct path:
   `waiting → in_progress(deployment) → done | failed | expired | cancelled`, with timestamps.
   Kept 30 min; results 5 min (settings). While the state store is down no status is written.
+  Every status write rides in a pipeline that is sent anyway (send, mark in progress, finish), so
+  it adds no store call; `request_status` per model is `full` (default), `final` or `off`.
 - **Deferring without a receive count.** A call sent back to wait for budget
   must not move toward the DLQ. The Valkey queue gets a `defer` operation (visible again after a
   delay, receive count unchanged); on SQS the message is re-sent with a delay and the old one
@@ -140,7 +142,9 @@ flowchart LR
 
 A call starts only when it holds a token from every budget that applies and a concurrency slot.
 A call without quota waits in the queue until a token is free or its own deadline passes
-(`timeout_secs`: a default per model, or passed per call), then `rate_limited`. The direct
+(`timeout_secs`: a default per model, or passed per call), then `rate_limited`. **Every call
+goes through the queue**: there is no fast path that runs a call in the calling pod when budget
+is free. The direct
 path (canary route `direct`, sync calls, direct streaming) runs the same admission. The canary
 route name `sqs` becomes `queue`. No new cancel work; the existing `llmq.cancel` is unchanged.
 
@@ -162,11 +166,14 @@ processes and cannot herd.
 | `headroom` | By `balance_opts.pick`: `percent` (most left as a share of quota, the default), `max` (most left), `spread` (random, weighted by what is left) |
 | `custom:<name>` | A Python hook orders the deployments; the script takes from the first one with budget |
 
-- **Inputs** from the worker: the strategy, the usable candidates, the preferred (sticky)
+- **Inputs** from the worker: the strategy, the enabled candidates of the group, the preferred (sticky)
   deployment, the costs (1 request, the token estimate), the priority flag, and a random number for
   `spread` (scripts do not draw their own).
 - **Usable** = enabled by the operator, not disabled by health, breaker not open, not paused, not
-  slow, and inside the call's `allowed_regions` / `allowed_accounts` when it has them.
+  slow, and inside the call's `allowed_regions` / `allowed_accounts` when it has them. Health,
+  breaker and latency are read **inside `PICK_TAKE`** on every call (their keys carry the model
+  tag), so the pick is always exact and costs no extra store call; the worker filters only by
+  `enabled` and the call's region / account filter.
 - **Retries go to the next deployment.** After a retryable failure (5xx, timeout) the retry runs
   `PICK_TAKE` again without the deployment that just failed, so it lands on another region or
   account when one is usable, and on the same one only when it is the only one.
@@ -558,6 +565,8 @@ Everything is live-editable except the rows marked *deploy*.
 | `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
 | `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | `smooth` (default: starts spread evenly, small burst allowance) or `fixed` (calendar minute) |
+| `request_status` | `full` | M, R | Per-request status written: `full` (waiting, in progress, final), `final`, `off` |
+| `stream_flush_ms` | 30 | M, R | Queued streaming: chunks within this time are written together; the first chunk is never delayed; 0 = every chunk |
 | `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Hard cap and start value of calls in flight per deployment. The adaptive limiter stays on next to RPM / TPM as the safety net when the real quota is lower |
 | `priority_reserve` | 0.2 | D, M | Share of quota and slots only priority calls may use |
 | `normal_min_share` | 0.1 | D, M | Share priority calls cannot take |
@@ -709,7 +718,7 @@ sweep, alert) is taken with a short Valkey lock, so it is correct for any number
 
 | Mode | How |
 |---|---|
-| Queued | The worker calls `ConverseStream` and appends chunks to a per-request Valkey stream in the state store (capped, expiring with the result TTL). One reader per caller process multiplexes all its open streams, so open streams do not each hold a connection |
+| Queued | The worker calls `ConverseStream` and appends chunks to a per-request Valkey stream in the state store (capped, expiring with the result TTL). The first chunk is written at once; after that, chunks arriving within `stream_flush_ms` (30, per model; 0 = every chunk) are written together. One reader per caller process multiplexes all its open streams, so open streams do not each hold a connection |
 | Direct | The caller streams itself but takes its budget tokens and slot from Valkey first, like any call |
 
 A failure after chunks were sent ends the stream with an error event that carries the partial
@@ -1118,6 +1127,10 @@ off (uat / prod today) there is nothing to drain.
 | E80 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added; workers accept v1 and v2 during the upgrade rule of §6.1 |
 | E81 | Expired calls | Status `expired`; the caller gets `rate_limited` with `retry_after_secs` |
 | E82 | One admission call | The concurrency slot is taken inside `PICK_TAKE`; overhead target ≤ 20 ms p95 with no backlog (B34) |
+| E83 | No fast path | Every call goes through the queue, also when budget is free; the direct path stays only for the kill switch, `queue_pct` and queue-store failover |
+| E84 | Request status | Full by default, written inside pipelines that are sent anyway; `request_status: full \| final \| off` per model |
+| E85 | Stream chunks | First chunk at once, then batched for `stream_flush_ms` (30) |
+| E86 | Usable check | Health, breaker and latency are read inside `PICK_TAKE` on every call; no cache in the pod |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |

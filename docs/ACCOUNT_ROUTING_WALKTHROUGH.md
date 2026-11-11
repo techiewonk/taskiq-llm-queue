@@ -259,13 +259,14 @@ Any pod's worker reads the queue; priority messages are read before normal ones.
 
 ### Step 6. Choose a deployment, take RPM + TPM and a concurrency slot (`PICK_TAKE`, one script)
 
-The worker first works out which deployments are **usable**:
+The worker passes the enabled deployments of the confirmed group; the script reads health,
+breaker and latency itself and keeps the **usable** ones (always exact, no extra store call):
 
 | Deployment | Group | Enabled | Healthy | Breaker | Slow | Usable |
 |---|---|---|---|---|---|---|
 | aws-main/ap-south-1 | confirmed | yes | yes | closed | no | yes |
 | aws-main/us-east-1 | confirmed | yes | yes | closed | no | yes |
-| aws-main/us-west-2 | fallback | yes | yes | closed | no | not offered yet (fallback group) |
+| aws-main/us-west-2 | fallback | yes | yes | closed | no | not passed yet (fallback group) |
 
 Input to the script:
 
@@ -622,14 +623,14 @@ Setting `rate_limits: "both"` and a `tpm` on the model turns token limiting on f
 | Step | Data |
 |---|---|
 | Send, receive, budgets, slot: as in §6 | |
-| The worker calls `ConverseStream`; each chunk is appended | `P:req:req-7f3a:chunks: {seq: 14, delta: "…"}` |
+| The worker calls `ConverseStream`; the first chunk is written at once, later chunks within 30 ms (`stream_flush_ms`) together | `P:req:req-7f3a:chunks: {seq: 14, delta: "…"}` |
 | The caller's single stream reader passes chunks to the app | |
 | End of stream carries the usage; TPM is corrected then | `{end: true, usage: {…}}` |
 | Failure after chunks were sent | an error event with the partial text; no silent switch to another deployment |
 
 ## 14. Decisions on the open details
 
-Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E82).
+Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E86).
 
 | # | Point | Decision |
 |---|---|---|
@@ -640,6 +641,10 @@ Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76
 | 5 | Reserves | A cap per class: normal ≤ 80 %, priority ≤ 90 %; `priority_reserve: 0` on models without priority traffic |
 | 6 | Expired calls | Status `expired`; the caller's error is `rate_limited` with `retry_after_secs` |
 | 7 | Admission | The concurrency slot is taken inside `PICK_TAKE`: one store call |
+| 8 | Fast path | None: every call goes through the queue, also when budget is free |
+| 9 | Request status | Full (waiting, in progress, final), inside pipelines that are sent anyway; `request_status` per model can reduce it |
+| 10 | Stream chunks | First chunk at once, then batched for 30 ms |
+| 11 | Usable check | Read inside `PICK_TAKE` on every call |
 
 Store calls of one queued request: caller 1 (status and send, in parallel); worker 6 (receive,
 claim, `PICK_TAKE`, mark in progress, finish, acknowledge). Target: the queue path adds at most
