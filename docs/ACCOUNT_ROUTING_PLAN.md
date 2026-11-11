@@ -74,11 +74,16 @@ flowchart LR
 
 | Store | Setting | Holds | Hosting |
 |---|---|---|---|
-| **Queue store** | `queue_redis_url` (unset = the state store) | Per queue: the waiting Stream, its DLQ, delays | ElastiCache Multi-AZ, `maxmemory-policy noeviction` |
-| **State store** | `redis_url` / `redis_host` | Registry, budgets, limiter, breaker, leases, in-progress sets, request status, sticky map, health, results, stream chunks | ElastiCache Multi-AZ |
+| **Queue store** | `queue_store_url` (unset = the state store) | Per queue: the waiting Stream, its DLQ, delays | ElastiCache Multi-AZ, `maxmemory-policy noeviction` |
+| **State store** | `store_url` (or `store_host`, `store_port`, `store_password`, `store_ssl`) | Registry, budgets, limiter, breaker, leases, in-progress sets, request status, sticky map, health, results, stream chunks | ElastiCache Multi-AZ |
 
-- `queue_backend=valkey` is the **default**; `sqs` stays as an optional backend and runs the same
-  suites. Redis ≥ 7.2 and Valkey ≥ 8 are both tested in CI.
+- `queue_backend=stream` is the **default** (Streams on any Redis-protocol store); `sqs` stays
+  as an optional backend and runs the same suites.
+- **Store kinds.** Any store that speaks the Redis protocol with Lua scripts and Streams: Valkey,
+  Redis, ElastiCache, MemoryDB and compatible servers. Redis ≥ 7.2 and Valkey ≥ 8 are tested in
+  CI; the others are expected to work. Setting names are generic (`store_*`, `queue_store_url`,
+  `store_down`); the 0.2 names `redis_*`, `queue_redis_url` and `queue_backend=valkey` are
+  removed in 0.3.0 (env: `LLMQ_STORE_URL`, `LLMQ_QUEUE_STORE_URL`).
 - **Topology.** The tested topology is cluster mode **disabled** (one primary + replicas) for
   both stores. Per-key scripts are cluster-safe through hash tags, but two reads span keys
   (multiplexed stream reads, status pipelines), so cluster mode stays untested and unsupported in
@@ -616,7 +621,7 @@ sequenceDiagram
   participant P as Process (LLMQueue.start)
   participant V as State store
   participant Q as Queue store
-  SM->>P: LLMQ_REGISTRY, LLMQ_QUEUE_REDIS_URL
+  SM->>P: LLMQ_REGISTRY, LLMQ_STORE_URL, LLMQ_QUEUE_STORE_URL
   P->>P: validate the registry (all errors at once; boot fails on any)
   P->>V: publish if registry_version is higher (old one to audit); else load the stored one
   P->>Q: ensure queues (create the missing ones)
@@ -773,7 +778,7 @@ instead of `resolve_fallback`.
 | `registry/resolve.py` | `Deployment` (frozen dataclass), `ResolvedRegistry` | `resolve(registry, defaults)`; `deployments(alias, group=None)`; `effective(alias, deployment, name) -> (value, level)` |
 | `registry/store.py` | `RegistryStore` | `publish(registry, actor)` (version + hash rule), `load()`, `set()`, `enable()`, `disable()`, `diff()`, `run()` reload loop |
 | `reliability/_lua.py` | — | new scripts `PICK_TAKE`, `DEPLOY_HEALTH`, `LATENCY`, `ONCE` (lock / marker) |
-| `broker/valkey_queue.py` | — | new `defer` operation (visible after a delay, receive count unchanged); priority and normal streams under one queue name |
+| `broker/stream_queue.py` (was `valkey_queue.py`) | — | new `defer` operation (visible after a delay, receive count unchanged); priority and normal streams under one queue name |
 | `routing/balance.py` | `Balancer` (Protocol), `register_balancer` | `pick_take(alias, strategy, candidates, preferred, costs, priority) -> Grant \| Wait` |
 | `routing/plan.py` | `CallPlan`, `plan_call` | `plan_call(alias, ctx, resolved, sticky) -> CallPlan`; `CallPlan.next(cause)` |
 | `routing/fallback_rule.py` | `register_fallback_policy` | `allowed(rule, cause, waited_secs) -> bool` |
@@ -974,6 +979,8 @@ off (uat / prod today) there is nothing to drain.
 | E52 | Lanes | Removed: no rt / bg / bulk, no per-lane settings |
 | E53 | Timeouts | One default per model (settable at every level), and per call |
 | E54 | Models in the registry | Adding or removing a whole model needs a new `registry_version` (a deploy); everything else is live |
+| E57 | Store kinds and names | Any Redis-protocol store (Lua + Streams); generic names `store_url`, `queue_store_url`, `store_down`, `queue_backend=stream`; the 0.2 `redis_*` / `valkey` names are removed in 0.3.0 |
+| E58 | Canary | `queue_pct` defaults to 100 (the queue is the normal path); `routing.kill_switch` for incidents |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
