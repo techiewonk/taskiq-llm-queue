@@ -261,6 +261,69 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - **Tokens:** estimated before the call (`register_token_estimator` replaces characters / 4),
   corrected by the real usage after it. Token metrics per model × account × region. No prices.
 
+### 3.7a Token accounting (TPM next to RPM)
+
+Every call is admitted on **both** budgets of its deployment: one request against RPM and its
+tokens against TPM, taken together in `PICK_TAKE` (both or neither). A model with only `rpm` or
+only `tpm` is limited on that one.
+
+```mermaid
+flowchart LR
+  A["call"] --> E["estimate tokens:<br/>input (text, tool schemas) + effective max_tokens"]
+  E --> T{"PICK_TAKE: 1 request from RPM<br/>+ estimate from TPM,<br/>on the same deployment"}
+  T -->|granted| C["provider call"]
+  C -->|"ok: usage in the response"| U["charge the real tokens:<br/>return estimate − used<br/>(or charge the extra)"]
+  C -->|"throttled / refused before running"| R["return the whole estimate<br/>and the request"]
+  C -->|"timeout / 5xx / stream cut"| K["keep the input estimate,<br/>return the unused output part"]
+  U & R & K --> M["counters per deployment:<br/>tokens used, tokens left, estimate error"]
+```
+
+| Step | Rule |
+|---|---|
+| Estimate (before the call) | Input: characters / 4 of every text in the request, **including tool definitions and tool results**; plus the effective `max_tokens` (the call's, else the model's inference default, else 1,000). Embeddings: input only. `register_token_estimator` replaces it (a real tokenizer) |
+| Take | RPM and TPM of the chosen deployment in one atomic step; then the account's `shared_rpm` / `shared_tpm` when set. `priority_reserve` and `normal_min_share` apply to both budgets |
+| Success | The response's usage replaces the estimate: the difference goes back to the budget (or is charged when the call used more) |
+| Provider throttled it (429) or refused it before running | Nothing was consumed: the request and the whole estimate go back |
+| Timeout, 5xx, connection lost | Unknown: the input part stays charged, the unused output part goes back |
+| Streaming | Usage arrives with the last event and is charged then; a stream cut mid-way is charged its input estimate plus the tokens of the chunks received |
+| No usage in the response (Cohere embeddings report it only in the `x-amzn-bedrock-input-token-count` header) | The provider adapter reads the header; with no number at all the estimate stays charged and `llmq_token_usage_missing_total` counts it |
+| Retries and model fallback | Every attempt takes its own tokens; on another model the estimate is made again with that model's `max_tokens` |
+| A request larger than the whole budget | Input estimate alone above `tpm` → refused at once with `request_too_large` (it could never start). Input fits but input + `max_tokens` does not → admitted when the bucket is idle (existing rule), so a generous `max_tokens` never blocks a call forever |
+
+**Kept up to date and visible:**
+
+- Status per deployment: RPM used / left and TPM used / left this minute, tokens in flight
+  (reserved, not yet corrected).
+- Metrics per model × account × region: `llmq_tokens_input_total`, `llmq_tokens_output_total`,
+  `llmq_rate_used` / `llmq_rate_remaining` for both budgets, and `llmq_token_estimate_ratio`
+  (estimate ÷ real usage) so a poor estimator is seen and tuned.
+- `headroom` balancing looks at both budgets: a deployment's headroom is the smaller of its RPM
+  share left and its TPM share left.
+- Alerts "quota near its limit" and "configured quota above observed" fire for RPM and for TPM.
+
+**Settings** (optional, every level):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `tpm` | none | Tokens per minute of a deployment |
+| `tpm_output_weight` | 1 | How many quota tokens one output token costs. Some Bedrock models count output tokens several times against the quota (**unverified** per model; set it from the model's quota page) |
+| `tpm_count_cached` | true | Whether prompt-cache read tokens count against TPM (model-dependent) |
+| `default_output_tokens` | 1000 | Output reservation when neither the call nor the model sets `max_tokens` |
+| `token_estimator` | built in | Name of a registered estimator hook |
+
+**What 0.2.1 does today, and what changes** (checked in `reliability/rate.py` and `core.py`):
+
+| # | Today | 0.3 |
+|---|---|---|
+| T1 | Tokens are corrected only after a successful call; a throttled or failed attempt keeps its whole reservation, so a throttle storm also eats the token budget | Refund rules above |
+| T2 | Cohere embeddings return no token count in the body, so their estimate is never corrected | Read the token-count response header |
+| T3 | Tool definitions are counted only as far as they are plain strings in the request | Counted explicitly; scenario B47 |
+| T4 | The default output reservation is a fixed 1,000 when a call has no `max_tokens` | The model's inference default is used first |
+| T5 | No measure of how good the estimate is | `llmq_token_estimate_ratio` |
+| T6 | Output tokens always cost 1 | `tpm_output_weight` |
+| T7 | A request bigger than the budget waits until its deadline | `request_too_large` at once |
+| T8 | Streaming has no token accounting (no streaming) | Rules above |
+
 ### 3.8 Registry in Valkey
 
 | Key | Holds |
@@ -455,7 +518,8 @@ Everything is live-editable except the rows marked *deploy*.
 | `type` | required | M (*deploy*) | `chat` or `embedding` |
 | `provider`, `model_id` | required | M (*deploy*) | Provider kind and its model id; one alias per model id |
 | `enabled` | true | A, M, R | false stops new calls there (in-flight calls finish) |
-| `rpm`, `tpm` | none | D, M, R | Requests and tokens per minute of a deployment; none = no budget, only the adaptive limiter |
+| `rpm`, `tpm` | none | D, M, R | Requests and tokens per minute of a deployment, both enforced (§3.7a); none = no budget, only the adaptive limiter |
+| `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
 | `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | Token bucket or calendar minute; burst allowance |
 | `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Cap and start value of calls in flight per deployment |
@@ -878,6 +942,9 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B46 | A call with `max_wait_secs=5` while the quota is used up | `rate_limited` with `retry_after_secs` after 5 s, not at the deadline |
 | B47 | A tool-calling turn (tool definitions, tool call, tool result), also across a model fallback | request and response pass through unchanged; the token estimate counts the tool schemas; the other model receives the same tools |
 | B48 | The same request id sent twice, 100 ms apart and after the first finished | one provider call; both callers get the same result within the result TTL |
+| B49 | TPM is the tighter limit: RPM 1,000, TPM 100K, calls of ~2K tokens | starts per minute ≈ 50, tokens per minute ≤ 100K in every window on every deployment; RPM never the reason for a refusal |
+| B50 | Token refunds: 30 % of attempts throttled by the provider; calls that use far fewer tokens than `max_tokens` | throttled attempts return their tokens (throughput within 5 % of the no-throttle run); the budget follows real usage, not the reservations |
+| B51 | Usage missing (Cohere header only), a stream cut mid-way, `tpm_output_weight=5`, a request larger than `tpm` | header read; partial stream charged for what was received; weighted tokens held under the quota; `request_too_large` at once |
 
 ## 6. Work plan by release
 
@@ -887,7 +954,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | | A1 | Registry schema (one document: defaults, routing, accounts, models), all setting names and levels, inference parameters and limits, validation, resolve; alias or model id in calls, queue name from the alias; the five old `LLMQ_*` model configs, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
 | | A2 | Registry store: version + hash rule, live edits, audit, CLI `registry`, registry file / own secret | B11, B40 |
 | | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22 |
-| | A4 | Deployment and provider budgets, `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42 |
+| | A4 | Deployment and provider budgets on RPM and TPM, token refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`; `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42, B49-B51 |
 | | A5 | Region fallback and model fallback rules and hook, per-deployment params, inference defaults merged per provider (locked names, limits, model change), tool calls in the token estimate | B06, B07, B38, B45, B47, B48 |
 | | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43 |
 | | A7 | Pod-count logic removed; `store_down` modes; once-locks | B16, B22 |
@@ -968,7 +1035,7 @@ off (uat / prod today) there is nothing to drain.
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
 | E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
-| E41 | Tests | fakellm scenarios B01-B48; a small `live` suite off by default; balancing bench gated |
+| E41 | Tests | fakellm scenarios B01-B51; a small `live` suite off by default; balancing bench gated |
 | E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
@@ -990,6 +1057,7 @@ off (uat / prod today) there is nothing to drain.
 | E63 | Prompt caching | No special handling: cache points pass through and `sticky` keeps a session in one region |
 | E64 | Propagation of live edits | Polling only: every process reloads within `cfg_reload_secs` (30 s) |
 | E65 | Edit rights and audit | Whoever can reach the CLI / the store may edit; every edit records the actor, time, before and after; the audit stream is kept 90 days (`audit_retention_days`) |
+| E66 | Token accounting | Every call is admitted on RPM and TPM together; tokens are estimated, then corrected from real usage; refunds on throttles, partial charge on failures and cut streams; output weight, estimate-quality metric, `request_too_large` (§3.7a) |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1062,3 +1130,4 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 | S15 | Tenant share was one number | Tenant shares removed by the owner; `tenant_id` is a label only |
 | S16 | A call could wait its whole timeout for quota | Optional `max_wait_secs` per model and per call |
 | S17 | Model parameters (temperature, max tokens, ...) had to be repeated by every caller and could not be changed live | `inference` defaults and `inference_limits` at every level |
+| S18 | Token accounting was only one line in the plan; the code refunds nothing on a failed attempt and misses Cohere usage | §3.7a with T1-T8 |
