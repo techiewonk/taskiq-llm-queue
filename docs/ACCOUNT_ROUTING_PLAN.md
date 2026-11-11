@@ -40,7 +40,7 @@ loop ([ARCHITECTURE §4b, §5, §5a](ARCHITECTURE.md)).
 | **Account** | Where calls are billed and quota lives; has its own credentials and provider kind | `aws-main` (pod identity), `aws-dr` (assume role), `vllm-dc1` (API key) |
 | **Region group** | Per model and account: `confirmed` (normal serving) and `fallback` (used only under the model's fallback rule) | confirmed `ap-south-1`, `ap-south-2`; fallback `ap-southeast-2` |
 | **Deployment** | One model served from one account + region, or from an inference profile. Replaces `Target` | `gpt120b @ aws-main/ap-south-1` |
-| **Model policy** | Per model: balancing strategy, region fallback, model fallback, stickiness, reserves, Valkey-down mode, inference defaults | `balance=headroom`, `fallback.after_secs=2` |
+| **Model policy** | Per model: balancing strategy, region fallback, model fallback, stickiness, reserves, store-down mode, inference defaults | `balance=headroom`, `fallback.after_secs=2` |
 | **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias) and per provider | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
 | **Registry** | The one config document for models: accounts, and per model its provider, model id, deployments, quota and policy; lives in Valkey, published from config | §3.8 |
 
@@ -304,7 +304,7 @@ unknown name is refused at boot with the nearest valid name suggested.
     "priority_reserve": 0.2,
     "normal_min_share": 0.1,
     "balance": "ordered",
-    "valkey_down": "pause",
+    "store_down": "pause",
     "request_status": true,
     "queue_pct": 100,
     "worker_slots": 20,
@@ -343,7 +343,7 @@ unknown name is refused at boot with the nearest valid name suggested.
       "balance": "headroom",
       "balance_opts": {"pick": "percent"},
       "sticky": {"key": "session", "idle_ttl_secs": 1800},
-      "valkey_down": "static_cap",
+      "store_down": "static_cap",
       "inference": {"temperature": 0.2, "top_p": 0.9, "max_tokens": 4096,
                     "stop": ["</answer>"], "extra": {"reasoning_effort": "low"}},
       "inference_limits": {"max_tokens": 8192, "locked": ["top_p"]},
@@ -466,7 +466,7 @@ Everything is live-editable except the rows marked *deploy*.
 | `sticky` | off | D, M | `{"key": "session" \| "custom:<name>", "idle_ttl_secs": 1800}` |
 | `fallback` | none | D, M | Region fallback rule (§3.5) |
 | `model_fallback` | none | M | Model fallback rule (§3.5) |
-| `valkey_down` | `pause` | D, M | `pause`, `static_cap`, `fail_fast` (§3.11); `local_limit_cap` (10) is the cap |
+| `store_down` | `pause` | D, M | `pause`, `static_cap`, `fail_fast` (§3.11); `local_limit_cap` (10) is the cap |
 | `queue_pct` | 100 | D, M | Share of calls sent through the queue; the rest run direct under the same budgets (canary) |
 | `worker_slots` | 20 | D, M | Messages of this model one process works on at once |
 | `queue` | derived | D, M (*deploy* for `name`) | `{"name", "visibility_secs", "max_receives", "retention_secs"}` |
@@ -571,7 +571,7 @@ sweep, alert) is taken with a short Valkey lock, so it is correct for any number
 | Outage | Behaviour |
 |---|---|
 | **Queue store down, state store up** | Existing queue failover: after `sqs_failover_secs` of send / receive errors, calls run on the direct path under the shared budgets and limiter; queued messages wait in the store; back to the queue when a probe succeeds |
-| **State store down** | Per model, `valkey_down`: `pause` (default: no call starts without the shared budget; queued work waits; a direct call waits up to its deadline, then `queue_unavailable`; quotas never exceeded), `static_cap` (a fixed `local_limit_cap` per process, calls keep flowing, quotas may be exceeded and 429s are retried), `fail_fast` (`queue_unavailable` at once) |
+| **State store down** | Per model, `store_down`: `pause` (default: no call starts without the shared budget; queued work waits; a direct call waits up to its deadline, then `queue_unavailable`; quotas never exceeded), `static_cap` (a fixed `local_limit_cap` per process, calls keep flowing, quotas may be exceeded and 429s are retried), `fail_fast` (`queue_unavailable` at once) |
 | **Both down** | As "state store down" |
 | **One region / account down** | Breaker and health exclude its deployments; the fallback rule decides the rest (§3.5) |
 
@@ -840,7 +840,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B13 | Per-request status under a worker kill | `in_progress → waiting → done`; counts match the call log |
 | B14 | Python API, HTTP and CLI status | the same numbers within one sample interval; no secret reference in HTTP output |
 | B15 | Embeddings across accounts | balanced across deployments; never another model |
-| B16 | State store down, one model per `valkey_down` mode | `pause`: 0 calls start, all served after it returns; `static_cap`: ≤ cap in flight per process; `fail_fast`: `queue_unavailable` within 100 ms |
+| B16 | State store down, one model per `store_down` mode | `pause`: 0 calls start, all served after it returns; `static_cap`: ≤ cap in flight per process; `fail_fast`: `queue_unavailable` within 100 ms |
 | B17 | 10K mixed calls, 3 accounts × 3 regions | no budget exceeded; throughput ≥ 0.9 × the sum of quotas; priority-call wait p95 ≤ 2 s |
 | B18 | Steady 17 / s, RPM 600 / 300 / 100, every strategy | shares within ± 5 % of the strategy's target; 0 overruns |
 | B19 | Burst of 2,000 in 10 s | refusals per call ≤ 0.05; Valkey calls per request no higher than in 0.2.1 |
@@ -883,7 +883,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | | A4 | Deployment and provider budgets, `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42 |
 | | A5 | Region fallback and model fallback rules and hook, per-deployment params, inference defaults merged per provider (locked names, limits, model change) | B06, B07, B38, B45 |
 | | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43 |
-| | A7 | Pod-count logic removed; `valkey_down` modes; once-locks | B16, B22 |
+| | A7 | Pod-count logic removed; `store_down` modes; once-locks | B16, B22 |
 | | A8 | Upgrade guide and the app's config moved to the registry | B41 |
 | **0.3.1** | A9 | Accounts: assume role, API-key accounts, client pool | B08, B09 |
 | | A10 | Sticky sessions; latency-aware exclusion; health, auto-disable and probe; quota-drop alert | B10, B28, B29, B37 |
@@ -946,7 +946,7 @@ off (uat / prod today) there is nothing to drain.
 | E23 | Slow region | Latency-aware exclusion (`slow_ratio` × the model median) |
 | E24 | Quota below configured | Limiter cuts, traffic shifts, one alert with the observed rate |
 | E25 | Pod count | No logic depends on it; `PodRegistry` and the `/ live pods` shares removed |
-| E26 | Valkey down | Per model: `pause` (default), `static_cap`, `fail_fast` |
+| E26 | State store down | Per model: `pause` (default), `static_cap`, `fail_fast` |
 | E27 | Extra AWS accounts | `role_arn` from the pod role, optional `external_id`, 1 h sessions refreshed 5 min early |
 | E28 | Deployment params | Per deployment: guardrail config, extra model fields |
 | E29 | Request status | Every call; cost measured before it ships on by default |
