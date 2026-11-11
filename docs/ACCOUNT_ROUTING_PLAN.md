@@ -389,7 +389,7 @@ flowchart LR
   stored registry is kept and `registry_version_not_bumped` is logged and alerted, so a config
   change is never silently ignored.
 - **Live edits.** Every field of an existing model or account, except the rows marked *deploy* and the protected fields of §3.18, can be changed from the CLI or the
-  Python API (HTTP is read only). Adding or removing a whole model needs a new
+  Python API (HTTP only when the app turns writes on, and then for safe fields only). Adding or removing a whole model needs a new
   `registry_version` (a deploy), because workers start and stop queue readers for it.
   Each edit is audited and the CLI warns that it lasts until the next config version;
   `llm-queue registry diff` shows what is live but not in config.
@@ -580,6 +580,7 @@ fields (`params`, the `confirmed` / `fallback` lists, account `kind` / `base_url
 | `priority_reserve` | 0.2 (chat), 0 (embedding) | D, M | Share of quota and slots only priority calls may use. A default that depends on `type` applies only when no level sets the value |
 | `normal_min_share` | 0.1 | D, M | Share priority calls cannot take |
 | `timeout_secs` | 120 | D, A, M + per call | Deadline of a call, queue wait included |
+| `timeout_max_secs` | 900 | D, M | Highest per-call `timeout_secs`; a call asking for more is lowered to it and a warning is logged once |
 | `max_wait_secs` | none | D, M + per call | Longest wait for quota; then `rate_limited` with `retry_after_secs`. None = until the deadline |
 | `attempt_timeout_secs` | 60 | D, A, M, R | Limit of one provider attempt; must be below `timeout_secs` when the model has more than one deployment (§3.18) |
 | `retry_attempts`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | as in 0.2 | D, A, M, R | Retry budget and backoff per deployment |
@@ -717,7 +718,7 @@ sweep, alert) is taken with a short Valkey lock, so it is correct for any number
 |---|---|
 | `await llmq.status(model=, account=, region=, by=)` | Per model × deployment: waiting (priority and normal), in progress, started this minute, RPM / TPM used and left, concurrency limit, breaker, paused, enabled, healthy, p95 latency |
 | `await llmq.request_status(request_id)` | State, deployment, priority, attempts, timings, error kind |
-| HTTP (extra `[http]`) | Read-only FastAPI router the app mounts with its own auth dependency: `/status`, `/requests/{id}`, `/registry` (secret references and role ARNs redacted), and `/health/live`, `/health/ready` without auth |
+| HTTP (extra `[http]`) | FastAPI router the app mounts with its own auth dependency (read-only by default; `status_router(..., allow_writes=True)` also accepts changes to safe fields: limits, enable / disable, block, each audited): `/status`, `/requests/{id}`, `/registry` (secret references and role ARNs redacted), and `/health/live`, `/health/ready` without auth |
 | Health | `await llmq.health()` and `GET /llmq/health/ready`: 200 when the registry is loaded and the process is not draining; the state of the stores is in the body and a metric. `GET /llmq/health/live`: 200 while the process runs. Neither depends on stores, providers or deployments, so an outage never removes app pods |
 | CLI | `llm-queue status --by account\|region\|model --watch`, `llm-queue request ID`, `llm-queue registry get\|set\|enable\|disable\|import\|diff` |
 
@@ -1174,6 +1175,7 @@ region in it is allowed. An `openai` endpoint is checked by its named region.
 |---|---|---|
 | Queue messages, `params_ref` | The request | Until served; at most the call's deadline |
 | Dead-letter queue | The request | 1 day |
+| Object storage (when configured) | Requests and results above the size threshold | 1 day (bucket lifecycle), encrypted |
 | Result | The response | 5 min |
 | Stream chunks | The response text | 5 min |
 | `debug_capture` | Truncated request and response | ≤ 60 min, with an alert while it is on |
@@ -1726,6 +1728,14 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E132 | Status over HTTP | The app mounts `/llmq/status`, `/llmq/requests/{id}` and `/llmq/registry` behind its admin check, and the two health routes without auth |
 | E133 | Queue full | A send above `max_waiting` fails at once with `queue_full`; priority and normal are counted apart |
 | E134 | Usage record | One `llmq_call_finished` log event per call (model, deployment, tokens, timings, hashed user, tenant; no text); no daily summary job |
+| E135 | Sync API | Kept; sync calls run on the direct path only, under the same budgets |
+| E136 | Job queue | `send_job` kept unchanged, outside budgets, waiters and priority |
+| E137 | Object storage | Requests and results above a size threshold may go to an encrypted bucket with a 1-day lifecycle; the stores hold a reference. S3 is added to the text-at-rest table |
+| E138 | Channels for live changes | All three allowed: the command line, HTTP for safe fields (off unless the app enables it, behind its admin check), and a deploy |
+| E139 | Rollout | dev 100 %; uat 10 % then 100 % after the load scenarios; prod 10 %, 50 %, 100 % over several days; kill switch as the way back |
+| E140 | Unverified claims | Checked before any code: `max_tokens` counted up front, token quota on embedding models, a full queue store draining |
+| E141 | Live tests | About 20 real calls, run by hand before a release; never in the normal test run |
+| E142 | Timeout cap | `timeout_max_secs` per model, default 900 |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
