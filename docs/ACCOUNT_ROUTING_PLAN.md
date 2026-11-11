@@ -571,7 +571,7 @@ fields (`params`, the `confirmed` / `fallback` lists, account `kind` / `base_url
 | `rpm` | none | D, M, R | Requests per minute of a deployment; none = no budget, only the adaptive limiter |
 | `tpm` | none | D, M, R | Tokens per minute of a deployment (§3.7a) |
 | `rate_limits` | `both` (chat), `rpm` (embedding) | D, A, M, R | Which budgets are enforced: `both`, `rpm`, `tpm`, `off`; switches enforcement without deleting the numbers |
-| `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
+| `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, false, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
 | `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | `smooth` (default: starts spread evenly, small burst allowance) or `fixed` (calendar minute) |
 | `request_status` | `full` | D, M | Per-request status written: `full` (waiting and final; in progress is read from the in-progress entry), `final`, `off` |
@@ -978,8 +978,9 @@ instead of receiving and deferring every waiting message, and the queue keeps it
 | `max_tokens` (default) | The effective `max_tokens` of the call. Safe for providers that count `max_tokens` against the quota at the start of a request |
 | `observed` | The 90th percentile of the model's recent real output tokens (kept under the model tag, written by the finish script, read by `PICK_TAKE`), never above the call's `max_tokens`; `max_tokens` until 50 calls were seen. More calls fit when TPM is the tighter limit; a call that uses more is charged the extra afterwards |
 
-Whether a provider counts `max_tokens` up front is model-dependent and **unverified** for the
-first four models; `observed` is turned on per model after checking.
+Bedrock reserves `max_tokens` up front on the `bedrock-runtime` endpoint (verified, §12), so
+`observed` is refused at boot for a `bedrock` model; it is meant for providers that do not
+reserve, such as a vLLM endpoint.
 
 **Strategy per class** (`balance_priority`, per model)
 
@@ -1266,8 +1267,7 @@ offload size) are dropped first, new sends get `queue_unavailable`, and one aler
 
 **Embeddings and tokens (T20).** Embedding models are limited on RPM only by default. A `tpm`
 set on an embedding model turns token limiting on for it (`rate_limits` becomes `both` unless a
-level sets it). Whether a provider applies a token quota to an embedding model is **unverified**
-per model; check its quota page before a bulk run.
+level sets it). Bedrock throttles embedding models by requests per minute, not tokens (verified, §12).
 
 **Error kinds** (what a caller can receive; all are `LLMQueueError` subclasses or reply errors)
 
@@ -1303,7 +1303,7 @@ This completes the settings reference of §3.9 for step A1.
 | `rate_window` | `smooth`, `fixed` | `smooth` |
 | `rate_burst` | fraction 0 to 1 of each budget (RPM and TPM) | 0.1 |
 | `tpm_output_weight` | number ≥ 1 | 1 |
-| `tpm_count_cached` | boolean | true |
+| `tpm_count_cached` | boolean | false |
 | `default_output_tokens` | integer ≥ 1 | 1000 |
 | `max_concurrency`, `limiter_initial` | integer ≥ 1 | none, 20 |
 | `priority_reserve`, `normal_min_share` | fraction 0 to 1; their sum below 1 | by `type`, 0.1 |
@@ -1361,7 +1361,7 @@ plus any setting allowed at level R. Account names, region names and profile nam
 set; `priority_reserve` + `normal_min_share` below 1; account fields that do not fit the `kind`;
 a profile name equal to a region name of the same account; `headroom` (in `balance` or
 `balance_priority`) and `require_headroom` only where every confirmed deployment has an `rpm` or
-`tpm`; `output_reserve: observed` only where TPM is enforced; a chat-only inference parameter on
+`tpm`; `output_reserve: observed` only where TPM is enforced and never on a `bedrock` model; a chat-only inference parameter on
 an embedding model and the reverse; `seed` on a Bedrock model; an inference default above its
 limit; `embed_batch_size` and `model_fallback` rules by `type`; queue names (and their
 `-priority` names) unique. Warnings, not errors: fallback regions listed on a model without a
@@ -1736,6 +1736,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E140 | Unverified claims | Checked before any code: `max_tokens` counted up front, token quota on embedding models, a full queue store draining |
 | E141 | Live tests | About 20 real calls, run by hand before a release; never in the normal test run |
 | E142 | Timeout cap | `timeout_max_secs` per model, default 900 |
+| E143 | Verification results | `max_tokens` is reserved up front by Bedrock: `observed` refused for `bedrock` models; `tpm_count_cached` false; embeddings on RPM only confirmed (§12) |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1901,3 +1902,17 @@ Two verifiers checked the plan against its decisions and tested the rules of §3
 | T22 | `debug_capture` could not be turned on in prod | Live-editable in prod, audited | §3.18, E126 |
 | T23 | No table of error kinds; `deadline_exceeded` undefined | Error kinds table | §3.19 |
 | T24 | A1 could not be built without guessing | Types, ranges, defaults, account fields, validation list | §3.19 |
+
+## 12. Verification of the open claims (2026-11-12)
+
+Checked before any code (E140). Sources are the Amazon Bedrock User Guide pages "How tokens are
+counted in Amazon Bedrock", "Quotas for Amazon Bedrock" and "Amazon Titan Text Embeddings models".
+
+| # | Claim | Result | Effect on the plan |
+|---|---|---|---|
+| V1 | Bedrock counts `max_tokens` against the token quota when a request starts | **Confirmed** for the `bedrock-runtime` endpoint: input tokens + `max_tokens` are deducted at the start; at the end the charge becomes input + cache-write tokens + output tokens × the model's burndown rate, and the unused part is returned. The rate is 1:1 unless the model card says otherwise | `output_reserve: max_tokens` stays the default and `observed` is refused at boot for a `bedrock` model (it is for providers that do not reserve, such as vLLM). `tpm_output_weight` is the model's burndown rate. A sensible `max_tokens` default per model matters: a high one holds quota while calls run |
+| V2 | Cache-read tokens count against the quota | **No**: cache reads are not counted; cache writes are counted once | `tpm_count_cached` defaults to false |
+| V3 | Bedrock applies a token quota to embedding models | **No**: embedding models are throttled by requests per minute, not tokens per minute | Embeddings on RPM only is right (E57). Token limiting for embeddings stays an option |
+| V4 | A throttled or failed request gives its reservation back at the provider | **Not documented** | The refund rule of §3.7a stays an assumption; the limiter corrects it if it is wrong. To be measured with the live suite |
+| V5 | A queue store at its memory limit can still drain | **Not checked**: needs a local store in Docker, which is not running | Checked in step A5; `max_waiting` keeps the store away from the limit meanwhile |
+| V6 | Quota numbers and regions of the first four models | **Not confirmed.** A documentation search suggests 10,000 requests / min per region for the two chat models and 6,000 (Titan V2) and 2,000 (Cohere Embed English) for the embedding models, and that `gpt-oss-120b` is offered in `ap-south-1`; `ap-south-2` was confirmed only for Titan V2 | The owner confirms the numbers and the region lists in the Service Quotas console (Q1, Q2) |

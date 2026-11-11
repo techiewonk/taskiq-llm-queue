@@ -471,8 +471,8 @@ background work. In the store this is a second clock per class next to the main 
 |---|---|---|
 | `rate_limits` | `both` for chat, `rpm` for embedding | `both`, `rpm`, `tpm` or `off`, at any level, changeable live |
 | `shared_rpm` / `shared_tpm` (account settings) | none | A cap across all models of an account, checked and taken inside `PICK_TAKE` |
-| `tpm_output_weight` | 1 | How many quota tokens one output token costs (some Bedrock models count more; unverified per model) |
-| `tpm_count_cached` | true | Whether cache-read tokens count |
+| `tpm_output_weight` | 1 | How many quota tokens one output token costs: the model's burndown rate on Bedrock (1 unless its model card says otherwise) |
+| `tpm_count_cached` | false | Whether cache-read tokens count (Bedrock does not count them) |
 | `default_output_tokens` | 1000 | Output reservation when nothing sets `max_tokens` |
 | `token_estimator` | characters / 4 | Name of a registered estimator (a real tokenizer) |
 | `max_concurrency` | none | A hard cap on calls in progress per deployment, on top of the adaptive limiter |
