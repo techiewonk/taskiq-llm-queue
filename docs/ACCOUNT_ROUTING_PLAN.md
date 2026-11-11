@@ -6,6 +6,9 @@ gaps in §9 (all confirmed by the owner). Builds on the rate budgets ([RATE_LIMI
 queue backend ([VALKEY_QUEUE_PLAN.md](VALKEY_QUEUE_PLAN.md)) and the limiter, breaker and retry
 loop ([ARCHITECTURE §4b, §5, §5a](ARCHITECTURE.md)).
 
+A step-by-step walkthrough of one request, with every key and sample data, is in
+[ACCOUNT_ROUTING_WALKTHROUGH.md](ACCOUNT_ROUTING_WALKTHROUGH.md).
+
 ## 1. The ask
 
 > Serve every model from several **accounts**. Each account has **confirmed regions** and
