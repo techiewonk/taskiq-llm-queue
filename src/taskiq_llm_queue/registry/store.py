@@ -217,15 +217,20 @@ def admission_numbers(view: ResolvedRegistry, alias: str) -> dict[str, Any]:
     deployments = []
     for dep in view.deployments(alias):
         row = {name: view.value(alias, name, dep.key) for name in ADMISSION_SETTINGS}
+        account = view.registry.accounts[dep.account]
+        routing = view.registry.routing
         row.update(
             key=dep.key,
             account=dep.account,
             group=dep.group,
             region=dep.region,
             outside_residency=view.outside_residency(dep),
-            account_enabled=view.registry.accounts[dep.account].enabled,
-            shared_rpm=view.registry.accounts[dep.account].settings.get("shared_rpm"),
-            shared_tpm=view.registry.accounts[dep.account].settings.get("shared_tpm"),
+            account_enabled=account.enabled,
+            blocked=dep.region in routing.blocked_regions
+            or dep.account in routing.blocked_accounts,
+            shared_rpm=account.settings.get("shared_rpm"),
+            shared_tpm=account.settings.get("shared_tpm"),
+            account_priority_reserve=account.settings.get("priority_reserve", 0),
         )
         deployments.append(row)
     return {"model": model, "deployments": deployments}

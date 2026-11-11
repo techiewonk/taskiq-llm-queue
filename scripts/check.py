@@ -68,6 +68,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_queue.py",),
         needs_stack=True,
     ),
+    "a6": Step(
+        "Admission: PICK_TAKE, FINISH, UNDO, RENEW, SWEEP (budgets, slots, waiters, strategies)",
+        sources=("src/taskiq_llm_queue/engine", "src/taskiq_llm_queue/registry"),
+        tests=("tests/integration/engine/test_admission.py",),
+        needs_stack=True,
+    ),
 }
 
 
