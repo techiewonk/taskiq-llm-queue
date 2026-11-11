@@ -74,6 +74,20 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_admission.py",),
         needs_stack=True,
     ),
+    "a7": Step(
+        "Token estimate and refund rules; inference defaults and limits per provider",
+        sources=(
+            "src/taskiq_llm_queue/engine/tokens.py",
+            "src/taskiq_llm_queue/engine/inference.py",
+        ),
+        tests=("tests/unit/engine",),
+    ),
+    "a8": Step(
+        "Engine end to end: caller, worker loop, held calls, retries, fallback (fakellm)",
+        sources=("src/taskiq_llm_queue/engine",),
+        tests=("tests/integration/engine/test_runtime.py",),
+        needs_stack=True,
+    ),
 }
 
 

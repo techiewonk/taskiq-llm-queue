@@ -66,11 +66,13 @@ class Ask:
     sticky_move_secs: float = 1.0
     foreign_from: str | None = None
     require_pct: int = 0
+    tag: str = ""
 
     @property
     def owner(self) -> str:
-        """The owner token of this attempt's grant."""
-        return owner_token(self.request_id, self.worker, self.attempt)
+        """The owner token of this attempt's grant (`tag` tells two deliveries apart)."""
+        worker = f"{self.worker}@{self.tag}" if self.tag else self.worker
+        return owner_token(self.request_id, worker, self.attempt)
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,7 +21,9 @@ pytestmark = pytest.mark.integration
 
 
 def _store(client: redis.asyncio.Redis, prefix: str) -> RequestStore:
-    return RequestStore(client, Keys(prefix), result_ttl_secs=300, result_dedupe_secs=2)
+    return RequestStore(
+        client, Keys(prefix), result_ttl_secs=300, result_dedupe_secs=2, takeover_grace_secs=0
+    )
 
 
 async def _register(store: RequestStore, caller: str, params: str = "p", user: str = "u") -> str:

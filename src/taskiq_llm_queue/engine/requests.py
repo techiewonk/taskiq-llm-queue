@@ -20,12 +20,15 @@ if TYPE_CHECKING:
 FINAL_STATES = ("done", "failed", "expired", "cancelled")
 
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
-# status ttl, model, priority. Reply: new | attached | takeover | done | expired | conflict.
+# status ttl, model, priority, takeover grace secs.
+# Reply: new | attached | takeover | done | expired | conflict.
 REGISTER = """
 local job = redis.call('HGETALL', KEYS[1])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1])
 if #job == 0 then
   redis.call('HSET', KEYS[1], 'state', 'queued', 'user', ARGV[1], 'params', ARGV[2],
-    'caller', ARGV[3], 'confirmed', '0')
+    'caller', ARGV[3], 'confirmed', '0', 'created', now)
   redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
   redis.call('SADD', KEYS[2], ARGV[3])
   redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
@@ -45,8 +48,9 @@ if state == 'done' or state == 'failed' or state == 'expired' or state == 'cance
   if redis.call('EXISTS', KEYS[4]) == 1 then return 'done' end
   return 'expired'
 end
-if fields['confirmed'] == '0' then
-  redis.call('HSET', KEYS[1], 'caller', ARGV[3])
+-- An unconfirmed record older than the grace: its send failed or its sender died; take over.
+if fields['confirmed'] == '0' and now - tonumber(fields['created'] or '0') >= tonumber(ARGV[8]) then
+  redis.call('HSET', KEYS[1], 'caller', ARGV[3], 'created', now)
   redis.call('SADD', KEYS[2], ARGV[3])
   return 'takeover'
 end
@@ -146,6 +150,7 @@ class RequestStore:
         result_dedupe_secs: int = 30,
         status_ttl_secs: int = 1800,
         unconfirmed_secs: int = 30,
+        takeover_grace_secs: int = 5,
     ) -> None:
         """Register the scripts; no I/O until the first call."""
         self._client = client
@@ -154,6 +159,7 @@ class RequestStore:
         self.dedupe = result_dedupe_secs
         self.status_ttl = status_ttl_secs
         self.unconfirmed = unconfirmed_secs
+        self.takeover_grace = takeover_grace_secs
         self._register = client.register_script(REGISTER)
         self._confirm = client.register_script(CONFIRM)
         self._abandon = client.register_script(ABANDON)
@@ -193,6 +199,7 @@ class RequestStore:
                 self.status_ttl,
                 model,
                 "1" if priority else "0",
+                self.takeover_grace,
             ],
         )
         text = _text(outcome)

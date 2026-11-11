@@ -164,9 +164,9 @@ if held then
   end
   local holder = redis.call('HGET', entry_key, 'worker')
   local hb = hnum(job_key, 'hb', 0)
-  local fresh = redis.call('HGET', job_key, 'owner') == holder and now - hb < num(req.lease_ms, 60000)
-  if fresh and holder ~= req.worker then return cjson.encode({r = 'duplicate'}) end
-  -- An older attempt of this worker, or a dead owner: drop its slot and entry (no refund).
+  local fresh = now - hb < num(req.lease_ms, 60000) and redis.call('HGET', entry_key, 'started') ~= false
+  if fresh then return cjson.encode({r = 'duplicate'}) end
+  -- A dead owner (no heartbeat for a lease): drop its slot and entry (no refund).
   local old_dep = redis.call('HGET', entry_key, 'dep')
   local old_cls = redis.call('HGET', entry_key, 'cls')
   if old_dep then redis.call('ZREM', mk(alias, 'lease:' .. old_dep .. ':' .. old_cls), held) end
