@@ -9,118 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
-import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
-from pathlib import Path
-from typing import Any
 
 import pytest
 import redis.asyncio
-from aiohttp.test_utils import TestServer
+from engine_testkit import CHAT, GPT, SMALL, Make, stats
 
-from taskiq_llm_queue.clients import ClientPool, Providers
 from taskiq_llm_queue.engine.errors import CallFailed
 from taskiq_llm_queue.engine.queue import QueueSettings
-from taskiq_llm_queue.engine.runtime import Engine, EngineSettings
-from taskiq_llm_queue.registry.store import RegistryStore
-
-TOOLS = Path(__file__).resolve().parents[3] / "tools" / "fakellm"
-if str(TOOLS) not in sys.path:
-    sys.path.insert(0, str(TOOLS))
-from fakellm import Engine as FakeEngine  # noqa: E402  # needs the sys.path entry
-from fakellm import Scenario, create_app  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
-GPT = "openai.gpt-oss-120b-1:0"
-SMALL = "openai.gpt-oss-20b-1:0"
-TITAN = "amazon.titan-embed-text-v2:0"
-CHAT = {"messages": [{"role": "user", "content": [{"text": "hello"}]}]}
-
-
-def registry(models: dict[str, Any] | None = None) -> dict[str, Any]:
-    doc: dict[str, Any] = {
-        "registry_version": 1,
-        "defaults": {"rate_window": "fixed", "timeout_secs": 10, "attempt_timeout_secs": 2},
-        "accounts": {"aws-a": {"kind": "aws"}},
-        "models": {
-            "big": {
-                "type": "chat",
-                "provider": "bedrock",
-                "model_id": GPT,
-                "retry_base_secs": 0.05,
-                "deployments": {"aws-a": {"confirmed": ["r1", "r2"], "fallback": ["r3"]}},
-            },
-            "small": {
-                "type": "chat",
-                "provider": "bedrock",
-                "model_id": SMALL,
-                "deployments": {"aws-a": {"confirmed": ["r1"]}},
-            },
-            "titan": {
-                "type": "embedding",
-                "provider": "bedrock",
-                "model_id": TITAN,
-                "inference": {"dimensions": 256},
-                "deployments": {"aws-a": {"confirmed": ["r1"]}},
-            },
-        },
-    }
-    for alias, extra in (models or {}).items():
-        doc["models"][alias].update(copy.deepcopy(extra))
-    return doc
-
-
-Make = Callable[..., Awaitable[tuple[Engine, FakeEngine]]]
-
-
-@pytest.fixture
-async def make(store: redis.asyncio.Redis, prefix: str) -> AsyncIterator[Make]:
-    servers: list[TestServer] = []
-    engines: list[Engine] = []
-
-    async def build(
-        models: dict[str, Any] | None = None,
-        scenario: dict[str, Any] | None = None,
-        *,
-        worker: bool = True,
-    ) -> tuple[Engine, FakeEngine]:
-        fake = FakeEngine(Scenario.from_mapping(scenario or {}))
-        server = TestServer(create_app(engine=fake), host="127.0.0.1")
-        await server.start_server()
-        servers.append(server)
-        url = str(server.make_url("")).rstrip("/")
-        pool = ClientPool(
-            bedrock_endpoint_url=url,
-            credentials=lambda account: {
-                "aws_access_key_id": account.name,
-                "aws_secret_access_key": "x",
-            },
-        )
-        reg = RegistryStore(store, prefix, config=registry(models))
-        engine = Engine(
-            store,
-            reg,
-            Providers(pool),
-            settings=EngineSettings(lease_secs=3, poll_secs=0.2, sweep_secs=1),
-        )
-        await engine.start(worker=worker)
-        engines.append(engine)
-        return engine, fake
-
-    yield build
-    for engine in engines:
-        await engine.stop(drain_secs=1)
-        await engine.providers.aclose()
-    for server in servers:
-        await server.close()
-
-
-def _stats(fake: FakeEngine, key: str) -> dict[str, int]:
-    models = fake.snapshot()["models"]
-    assert isinstance(models, dict)
-    return dict(models.get(key, {}))
+_stats = stats
 
 
 async def test_chat_round_trip(make: Make) -> None:

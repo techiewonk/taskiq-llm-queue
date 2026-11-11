@@ -122,13 +122,18 @@ mypy_path = ["src", "tools/fakellm", "samples"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["moto.*"]
+module = ["moto.*", "fastapi", "fastapi.*"]
 ignore_missing_imports = true
+
+# FastAPI is an optional extra: its decorators are untyped when it is not installed.
+[[tool.mypy.overrides]]
+module = ["taskiq_llm_queue.engine.http"]
+disallow_untyped_decorators = false
 
 # Test helpers are imported by bare name (pytest puts their folder on sys.path); the helper
 # files themselves are still type-checked as part of `files`.
 [[tool.mypy.overrides]]
-module = ["fakellm_testkit", "providers_fake", "clients_testkit"]
+module = ["fakellm_testkit", "providers_fake", "clients_testkit", "engine_testkit"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

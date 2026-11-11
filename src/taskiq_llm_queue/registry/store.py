@@ -217,6 +217,9 @@ def admission_numbers(view: ResolvedRegistry, alias: str) -> dict[str, Any]:
     deployments = []
     for dep in view.deployments(alias):
         row = {name: view.value(alias, name, dep.key) for name in ADMISSION_SETTINGS}
+        # A model disabled as a whole still serves its waiting calls (drain, plan §3.18).
+        if view.effective(alias, "enabled", dep.key).level == "model":
+            row["enabled"] = True
         account = view.registry.accounts[dep.account]
         routing = view.registry.routing
         row.update(

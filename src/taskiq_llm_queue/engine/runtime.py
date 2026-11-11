@@ -40,8 +40,10 @@ from taskiq_llm_queue.engine.envelope import Envelope, Meta, Reply, params_hash,
 from taskiq_llm_queue.engine.errors import CallFailed
 from taskiq_llm_queue.engine.health import Health
 from taskiq_llm_queue.engine.keys import Keys
+from taskiq_llm_queue.engine.metrics import Metrics, NullSink
 from taskiq_llm_queue.engine.queue import Message, QueueFull, QueueSettings, StreamQueues
 from taskiq_llm_queue.engine.requests import RequestStore
+from taskiq_llm_queue.engine.status import AlertEvaluator, StatusReader
 from taskiq_llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
 from taskiq_llm_queue.providers.classify import is_target_error
 
@@ -165,6 +167,7 @@ class Engine:
         queue_store: redis.asyncio.Redis | None = None,
         settings: EngineSettings | None = None,
         worker_id: str | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """Wire the stores; nothing runs until `start`."""
         self.settings = settings or EngineSettings()
@@ -201,6 +204,9 @@ class Engine:
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
+        self.metrics: Metrics = metrics or NullSink()
+        self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
+        self.alerts = AlertEvaluator(state, self.keys)
         # Accounts whose credentials failed in this process: account -> (until, backoff).
         self._bad_accounts: dict[str, tuple[float, float]] = {}
         self._idle = asyncio.Event()
@@ -225,6 +231,7 @@ class Engine:
                 self._tasks.append(asyncio.create_task(self._model_loop(alias)))
             self._tasks.append(asyncio.create_task(self._sweeper()))
             self._tasks.append(asyncio.create_task(self._prober()))
+            self._tasks.append(asyncio.create_task(self._alert_loop()))
             self._cancels = self.state.pubsub()
             await self._cancels.subscribe(self.keys.cancel_channel)
             self._tasks.append(asyncio.create_task(self._cancel_reader()))
@@ -288,6 +295,12 @@ class Engine:
         """Run one call through the queue and return its reply; `CallFailed` on failure."""
         view = self.registry.current
         alias = view.registry.alias_of(model)
+        if view.effective(alias, "enabled").level == "model" and not view.value(alias, "enabled"):
+            rule = view.value(alias, "model_fallback")
+            if rule and allow_fallback == "all" and rule["models"]:
+                alias = rule["models"][0]["model"]
+            else:
+                raise CallFailed("model_disabled", f"{alias} is disabled")
         entry = view.registry.models[alias]
         op = OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
         timeout = float(timeout_secs or view.value(alias, "timeout_secs"))
@@ -1005,6 +1018,8 @@ class Engine:
             await self._finish_call(held, "request_too_large", "input above the token budget")
             return None
         decision = await self.admission.pick_take(ask, self.registry.changes)
+        if decision.kind == "wait":
+            self.metrics.count("llmq_admission_refusals_total", model=alias, reason=decision.reason)
         if decision.kind == "stale_config":
             await self.registry.load()
             decision = await self.admission.pick_take(ask, self.registry.changes)
@@ -1354,6 +1369,9 @@ class Engine:
         reply = Reply(request_id=env.request_id, ok=True, response=result.response, meta=meta)
         await self.requests.put_result(reply, final_state="done")
         await self._count_target_errors(held, succeeded=True)
+        self._record(held, alias, deployment.account, deployment.region, "ok", meta)
+        if view.value(alias, "debug_capture"):
+            await self._debug(env.request_id, params, result.response)
         await self.requests.set_status(
             env.request_id,
             "done",
@@ -1487,7 +1505,103 @@ class Engine:
     ) -> None:
         await self._reply(held.envelope, kind, message, final=final, retry_after=retry_after)
         await self._count_target_errors(held, succeeded=False)
+        self._record(held, held.envelope.model, "", "", kind, None)
         await self._ack(held)
+
+    def _record(
+        self, held: _Held, alias: str, account: str, region: str, outcome: str, meta: Meta | None
+    ) -> None:
+        """Metrics and the durable per-call record (`llmq_call_finished`, no text; E134)."""
+        env = held.envelope
+        labels = {"model": alias, "account": account or "-", "region": region or "-"}
+        self.metrics.count("llmq_calls_total", 1.0, outcome=outcome, **labels)
+        wait = max(0.0, held.first_seen - held.position_ms / 1000.0)
+        self.metrics.observe(
+            "llmq_wait_seconds", wait, model=env.model, priority="1" if env.priority else "0"
+        )
+        if meta is not None:
+            self.metrics.count("llmq_tokens_input_total", float(meta.tokens_in or 0), **labels)
+            self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
+            if meta.fallback:
+                self.metrics.count("llmq_fallback_total", kind=meta.fallback, model=env.model)
+        user = hashlib.sha256(env.user_id.encode()).hexdigest()[:16] if env.user_id else None
+        logger.info(
+            "llmq_call_finished",
+            request_id=env.request_id,
+            model=env.model,
+            served_model=alias,
+            deployment=meta.deployment if meta else None,
+            outcome=outcome,
+            priority=env.priority,
+            attempts=meta.attempts if meta else None,
+            tokens_in=meta.tokens_in if meta else None,
+            tokens_out=meta.tokens_out if meta else None,
+            queue_wait_ms=int(wait * 1000),
+            provider_ms=meta.provider_ms if meta else None,
+            user=user,
+            tenant=env.tenant_id,
+        )
+
+    async def _debug(
+        self, request_id: str, params: Mapping[str, Any], response: Mapping[str, Any]
+    ) -> None:
+        """`debug_capture`: truncated text for at most 60 minutes (plan §3.12)."""
+        import orjson
+
+        body = orjson.dumps(
+            {
+                "request": orjson.dumps(params).decode()[:2000],
+                "response": orjson.dumps(response).decode()[:2000],
+            }
+        )
+        await self.state.set(self.keys.request(request_id, "debug"), body, ex=3600)
+
+    async def status(self, model: str | None = None) -> dict[str, Any]:
+        """Status of one model, or of everything (plan §3.12)."""
+        view = self.registry.current
+        if model is not None:
+            return await self.status_reader.model(view, view.registry.alias_of(model))
+        return await self.status_reader.report(view)
+
+    async def request_status(self, request_id: str) -> dict[str, Any]:
+        """Status of one call (empty when unknown or expired)."""
+        return await self.status_reader.request(request_id)
+
+    async def health_check(self) -> dict[str, Any]:
+        """Liveness and readiness (plan E124): ready = registry loaded and not draining.
+
+        The stores' state is reported but never makes the process unready.
+        """
+        stores = {}
+        for name, client in (("state", self.state), ("queue", self._queue_store or self.state)):
+            try:
+                await client.ping()
+                stores[name] = "ok"
+            except STORE_ERRORS:
+                stores[name] = "down"
+        loaded = self.registry._current is not None
+        return {"live": True, "ready": bool(self.ready and loaded), "stores": stores}
+
+    async def _alert_loop(self) -> None:
+        """Every 30 s one process evaluates alerts: gauges every time, a log line per change."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                lock = await self.state.set(
+                    f"{self.keys.prefix}:lock:alerts", self.worker_id, nx=True, ex=25
+                )
+                if not lock:
+                    continue
+                view = self.registry.current
+                report = await self.status_reader.report(view)
+                alerts = self.alerts.evaluate(view, report)
+                for alert in alerts:
+                    self.metrics.gauge(
+                        f"llmq_alert_{alert.name}", 1.0 if alert.on else 0.0, **alert.labels
+                    )
+                await self.alerts.changed(alerts)
+            except Exception as exc:
+                logger.warning("alerts_failed", error=str(exc))
 
     async def _ack(self, held: _Held) -> None:
         if held.message is not None:
