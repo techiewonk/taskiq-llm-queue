@@ -314,6 +314,30 @@ if present(req.sticky) then
   sticky_dep = redis.call('GET', sticky_key)
 end
 
+-- Latency-aware exclusion (plan §3.4): a deployment much slower than the model's median,
+-- with enough samples and at least 3 to compare, becomes a last choice (never excluded alone).
+local slow = {}
+do
+  local hs = model.health or {}
+  local ratio, min_ms, min_n = num(hs.slow_ratio, 3), num(hs.slow_min_secs, 5) * 1000, num(hs.slow_min_samples, 20)
+  local health_key = mk(alias, 'health')
+  local values, lat_of = {}, {}
+  for _, cand in ipairs(req.candidates) do
+    local lat = hnum(health_key, cand.key .. '|lat', nil)
+    if lat and hnum(health_key, cand.key .. '|n', 0) >= min_n then
+      lat_of[cand.key] = lat
+      table.insert(values, lat)
+    end
+  end
+  if #values >= 3 then
+    table.sort(values)
+    local median = values[math.floor((#values + 1) / 2)]
+    for key, lat in pairs(lat_of) do
+      if lat > ratio * median and lat > min_ms then slow[key] = true end
+    end
+  end
+end
+
 local fitting = {confirmed = {}, fallback = {}}
 local last = {}
 local results = {}
@@ -324,7 +348,7 @@ for _, cand in ipairs(req.candidates) do
     any_usable = true
     results[cand.key] = res
     if res.fits then
-      if cand.last then table.insert(last, cand) else table.insert(fitting[cand.tier], cand) end
+      if cand.last or slow[cand.key] then table.insert(last, cand) else table.insert(fitting[cand.tier], cand) end
     else
       note(res.wait, res.reason)
     end

@@ -135,6 +135,7 @@ class StatusReader:
             "latency_ms": round(_num(health.get(f"{dep}|lat")), 1)
             if f"{dep}|lat" in health
             else None,
+            "samples": int(_num(health.get(f"{dep}|n"))),
             "throttles_1m": int(_num(throttles)),
         }
 

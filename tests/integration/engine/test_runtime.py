@@ -430,3 +430,33 @@ async def test_credential_failure_is_per_process(make: Make) -> None:
         await engine.call("small", CHAT)
     assert info.value.kind == "credentials_unavailable"
     assert "aws-a" in engine._bad_accounts
+
+
+# ---------------------------------------------------------------- A16: slow deployments
+
+
+async def test_slow_deployment_becomes_last_choice(make: Make) -> None:
+    three = {"aws-a": {"confirmed": ["r1", "r2", "r3"]}}
+    engine, fake = await make(
+        {
+            "big": {
+                "deployments": three,
+                "health": {"slow_ratio": 3, "slow_min_secs": 0.1, "slow_min_samples": 2},
+            }
+        },
+        {
+            "models": {
+                f"{GPT}@r1": {"latency_ms": {"p50": 600, "p95": 600}},
+                f"{GPT}@r2": {"latency_ms": {"p50": 20, "p95": 20}},
+                f"{GPT}@r3": {"latency_ms": {"p50": 20, "p95": 20}},
+            }
+        },
+    )
+    for region in ("r1", "r2", "r3"):
+        for _ in range(2):  # samples for every deployment
+            await engine.call("big", CHAT, allowed_regions=[region])
+    served = [(await engine.call("big", CHAT)).meta.deployment for _ in range(4)]
+    assert "aws-a/r1" not in served  # ordered would pick r1 first; it is slow
+    only = await engine.call("big", CHAT, allowed_regions=["r1"])
+    assert only.meta.deployment == "aws-a/r1"  # never excluded when it is the only one
+    assert stats(fake, f"{GPT}@r1")["calls"] == 3

@@ -129,6 +129,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_front.py",),
         needs_stack=True,
     ),
+    "a16": Step(
+        "Latency-aware exclusion: slow deployments become last choices",
+        sources=("src/taskiq_llm_queue/engine",),
+        tests=("tests/integration/engine/test_runtime.py",),
+        needs_stack=True,
+    ),
 }
 
 

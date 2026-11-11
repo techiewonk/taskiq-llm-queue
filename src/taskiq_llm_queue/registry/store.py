@@ -58,6 +58,7 @@ MODEL_ADMISSION_SETTINGS = (
     "require_headroom_pct",
     "output_reserve",
     "max_waiting",
+    "health",
 )
 
 
