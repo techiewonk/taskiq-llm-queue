@@ -2,7 +2,8 @@
 
 Status: **design agreed, nothing built** (2026-11-11). Target releases 0.3.0 to 0.3.3 (§6). All
 decisions are in §7, what is needed from the owner in §8, and the review that found and fixed 30
-gaps in §9 (all confirmed by the owner). Builds on the rate budgets ([RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md)), the Valkey
+gaps in §9 (all confirmed by the owner). A second review by five reviewers (2026-11-12) is in
+§10; its rules are in §3.18. 0.3 does not keep compatibility with 0.2 (E101). Builds on the rate budgets ([RATE_LIMIT_PLAN.md](RATE_LIMIT_PLAN.md)), the Valkey
 queue backend ([VALKEY_QUEUE_PLAN.md](VALKEY_QUEUE_PLAN.md)) and the limiter, breaker and retry
 loop ([ARCHITECTURE §4b, §5, §5a](ARCHITECTURE.md)).
 
@@ -23,7 +24,7 @@ A step-by-step walkthrough of one request, with every key and sample data, is in
 
 | Need | Today | Gap |
 |---|---|---|
-| RPM / TPM budget | ✅ Per (model alias, target) and per provider, in Valkey, `smooth` or `fixed` window, rt reserve, live settings (R01-R12) | No account key. Bedrock quotas are per account × region × model id |
+| RPM / TPM budget | ✅ Per (model alias, target) and per account, in Valkey, `smooth` or `fixed` window, rt reserve, live settings (R01-R12) | No account key. Bedrock quotas are per account × region × model id |
 | Registry in Valkey | ⚠️ Limits, usage, limiter, breaker, routing and fallback are live in Valkey | Models and targets are static config; a new region needs a redeploy |
 | Waiting queue | ✅ One queue per model and lane, on SQS or Valkey Streams | SQS is the default backend |
 | In-progress queue | ⚠️ Concurrency leases per target, in-flight messages | Not per request |
@@ -44,7 +45,7 @@ A step-by-step walkthrough of one request, with every key and sample data, is in
 | **Region group** | Per model and account: `confirmed` (normal serving) and `fallback` (used only under the model's fallback rule) | confirmed `ap-south-1`, `ap-south-2`; fallback `ap-southeast-2` |
 | **Deployment** | One model served from one account + region, or from an inference profile. Replaces `Target` | `gpt120b @ aws-main/ap-south-1` |
 | **Model policy** | Per model: balancing strategy, region fallback, model fallback, stickiness, reserves, store-down mode, inference defaults | `balance=headroom`, `fallback.after_secs=2` |
-| **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias) and per provider | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
+| **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias) and per account | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
 | **Registry** | The one config document for models: accounts, and per model its provider, model id, deployments, quota and policy; lives in Valkey, published from config | §3.8 |
 
 A deployment is named `account/region` (or `account/name` for a profile, e.g. `aws-main/apac`).
@@ -99,26 +100,27 @@ flowchart LR
 - **Waiting** = one queue per model, named from its alias by default (`<prefix>llm-<alias>`;
   `queue` in the model's entry overrides the name). There are **no lanes**. Two models sharing
   one queue is refused at boot.
-- **Priority flag.** A call may pass `priority=True` (live chat); the queue serves priority
-  calls before the others, first in first out within each class. It is still one queue: on
-  Valkey it holds a priority stream and a normal stream under one name; on SQS a second queue
-  `<name>-priority` plays that part. Nothing else differs between the two classes.
-- **In progress** = per model a zset `P:{m:ALIAS}:inprog` (request id → deadline) and a small hash
-  per request (deployment, priority, attempt, started). Written when a slot is granted, removed at the
-  end. Entries past their deadline are swept by whichever worker holds the sweep lock (`SET NX`,
+- **Priority flag.** A call may pass `priority=True` (live chat). Each model has a queue pair on
+  both backends: `<name>` for normal calls and `<name>-priority` for priority calls, each with
+  its own bookkeeping and dead-letter queue. Workers read the priority queue first; callers see
+  one model and one flag. Order inside a class is kept in the store (§3.18).
+- **In progress** = per model a zset `P:{m:ALIAS}:inprog` (request id → lease expiry, renewed on the worker's heartbeat) and a small hash
+  per request (deployment, priority, attempt, started). Written by `PICK_TAKE` with an owner token (worker + attempt), removed at the
+  end by that owner only. Entries not renewed for the lease time are swept by whichever worker holds the sweep lock (`SET NX`,
   one sweeper at a time, any number of processes). A dead worker's calls resume within 60 s.
 - **Request status** = `P:req:<id>`, for every call on the queue path and the direct path:
   `waiting → in_progress(deployment) → done | failed | expired | cancelled`, with timestamps.
   Kept 30 min; results 5 min (settings). While the state store is down no status is written.
-  Every status write rides in a pipeline that is sent anyway (send, mark in progress, finish), so
+  Every status write rides in a pipeline that is sent anyway (send, finish), so
   it adds no store call; `request_status` per model is `full` (default), `final` or `off`.
   `in_progress` is read from the in-progress entry, not written to `P:req:<id>` (§3.17).
 - **Waiting for budget.** The worker holds the head call and stops reading that model's class
   instead of receiving and deferring every message (§3.17). A call that is sent back all the
-  same must not move toward the DLQ. The Valkey queue gets a `defer` operation (visible again after a
-  delay, receive count unchanged); on SQS the message is re-sent with a delay and the old one
-  deleted. Only failures and crashes count toward `max_receives`.
-- Missing Valkey queues are created at worker start, and by `llm-queue queues create` in the
+  same must not move toward the DLQ. The stream queue gets a `return` operation (visible again in its place, at once or after a
+  delay). Every message keeps two counters: a generation (raised on every receive, so an old
+  receipt stops working) and failures (raised only by crashes and failed handlers, compared
+  with `max_receives`). On SQS the message is re-sent with a delay and the old one deleted.
+- Missing queues are created at worker start, and by `llm-queue queues create` in the
   deploy pipeline; existing queues keep their attributes.
 - **Sizing** (state store, 10K calls / min): request status ≈ 300K hashes × ~300 B ≈ 90 MB at the
   30 min TTL; sticky map ≈ 100 B per live session; stream chunks are capped per request
@@ -132,14 +134,12 @@ flowchart LR
   APP[App call] --> ADM0["admission hook<br/>(admit / reject / tag)"]
   ADM0 --> W["waiting queue of the model<br/>(priority calls first)"]
   W --> RX[Worker receives]
-  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM and a<br/>concurrency slot (reserves applied)"}
-  PT --> SH{"account budget<br/>(when set)"}
-  SH -->|granted| IP["in-progress set +<br/>request status"]
-  IP --> CALL["client of the account + region<br/>(own credentials, deployment params)"]
+  RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM, the account budget,<br/>a concurrency slot and the in-progress entry<br/>(oldest waiter first, reserves applied)"}
+  PT -->|granted| CALL["client of the account + region<br/>(own credentials, deployment params)"]
   CALL --> RES[(result or stream chunks → caller)]
   PT -->|"no confirmed deployment"| FB{"model fallback rule"}
-  FB -->|allowed| PT2["fallback regions, then model fallback"] --> SH
-  FB -->|not allowed| BACK["deferred in the waiting queue until<br/>a token is free or its deadline passes"]
+  FB -->|allowed| PT2["fallback regions, then model fallback"] --> CALL
+  FB -->|not allowed| BACK["held by the worker as a waiter until<br/>budget is free or its deadline passes"]
 ```
 
 A call starts only when it holds a token from every budget that applies and a concurrency slot.
@@ -147,8 +147,9 @@ A call without quota waits in the queue until a token is free or its own deadlin
 (`timeout_secs`: a default per model, or passed per call), then `rate_limited`. **Every call
 goes through the queue**: there is no fast path that runs a call in the calling pod when budget
 is free. The direct
-path (canary route `direct`, sync calls, direct streaming) runs the same admission. The canary
-route name `sqs` becomes `queue`. No new cancel work; the existing `llmq.cancel` is unchanged.
+path (kill switch, `queue_pct`, queue-store failover, sync calls, direct streaming) runs the
+same admission, with the same waiter order. The canary route name `sqs` becomes `queue`.
+`llmq.cancel` works as before, and a call whose caller is gone is cancelled automatically (§3.18).
 
 ### 3.4 Balancing (per model, live switchable)
 
@@ -182,10 +183,10 @@ processes and cannot herd.
 - **A deployment added live takes its full share at once**: its adaptive limiter starts at its
   cap (`max_concurrency`, else the limiter maximum) instead of `limiter_initial`, and still cuts
   on throttles.
-- **Refusal** returns the shortest wait among the candidates; a deferred call comes back after
-  that long.
-- **Provider budget** (`shared_rpm` / `shared_tpm`, when set) keeps its own `RATE` call after
-  the pick; if it refuses, the tokens go back. Everything else is inside the one script.
+- **Refusal** returns the shortest wait among the candidates (never below a small floor, with
+  jitter); the worker retries the held call after that long.
+- **Account budget** (`shared_rpm` / `shared_tpm`, when set) is checked and taken inside
+  `PICK_TAKE` too: a deployment whose account is full is skipped like one without budget.
 - **"Left" for `headroom`** = the limit minus what was used in the current minute (the
   `seen_calls` / `seen_tokens` counters of the budget hash, the numbers the status view shows);
   a deployment's headroom is the smaller of its RPM share left and its TPM share left.
@@ -272,7 +273,7 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - **Quota of a deployment:** its override → the model's `rpm` / `tpm` → `defaults` → none (then only the
   adaptive limiter applies). Numbers are set by operators; the limiter still learns from 429s.
 - **Scopes:** the deployment budget is the account × region × model budget (one alias per model
-  id); the provider budget (`shared_rpm` / `shared_tpm`) stays as an optional cap across models.
+  id); the account budget (`shared_rpm` / `shared_tpm`) stays as an optional cap across the models of an account.
 - **Reserves** (per model, both settable, 0 turns one off). `priority_reserve` (default 0.2) is
   the share of RPM / TPM and of concurrency slots that only priority calls may use, so a bulk
   run cannot spend the whole minute before a chat call arrives. `normal_min_share` (default
@@ -324,7 +325,7 @@ flowchart LR
 
 | Step | Rule |
 |---|---|
-| Estimate (before the call) | Input: characters / 4 of every text in the request, **including tool definitions and tool results**; plus the effective `max_tokens` (the call's, else the model's inference default, else 1,000). `register_token_estimator` replaces it (a real tokenizer) |
+| Estimate (before the call) | Input: characters / 4 of every text in the request, **including tool definitions and tool results**; plus the output reservation (`output_reserve`, §3.17): by default the effective `max_tokens` (the call's, else the model's inference default, else 1,000). `register_token_estimator` replaces it (a real tokenizer) |
 | Take | RPM and TPM of the chosen deployment in one atomic step; then the account's `shared_rpm` / `shared_tpm` when set. `priority_reserve` and `normal_min_share` apply to both budgets |
 | Success | The response's usage replaces the estimate: the difference goes back to the budget (or is charged when the call used more) |
 | Provider throttled it (429) or refused it before running | Nothing was consumed: the request and the whole estimate go back |
@@ -386,7 +387,7 @@ flowchart LR
 - **Forgotten bump.** Equal version but a different content hash than the one published → the
   stored registry is kept and `registry_version_not_bumped` is logged and alerted, so a config
   change is never silently ignored.
-- **Live edits.** Every field of an existing model or account can be changed from the CLI or the
+- **Live edits.** Every field of an existing model or account, except the rows marked *deploy* and the protected fields of §3.18, can be changed from the CLI or the
   Python API (HTTP is read only). Adding or removing a whole model needs a new
   `registry_version` (a deploy), because workers start and stop queue readers for it.
   Each edit is audited and the CLI warns that it lasts until the next config version;
@@ -412,15 +413,15 @@ unknown name is refused at boot with the nearest valid name suggested.
   "registry_version": 1,
 
   "defaults": {
-    "timeout_secs": 90,
+    "timeout_secs": 120,
     "priority_reserve": 0.2,
     "normal_min_share": 0.1,
     "balance": "ordered",
     "store_down": "pause",
-    "request_status": true,
+    "request_status": "full",
     "queue_pct": 100,
     "worker_slots": 20,
-    "attempt_timeout_secs": 120,
+    "attempt_timeout_secs": 60,
     "retry_attempts": 3,
     "throttle_retry_attempts": 6,
     "inference": {"temperature": 0.2, "max_tokens": 2048},
@@ -449,7 +450,7 @@ unknown name is refused at boot with the nearest valid name suggested.
       "model_id": "openai.gpt-oss-120b-1:0",
       "rpm": 500,
       "tpm": 400000,
-      "timeout_secs": 90,
+      "timeout_secs": 120,
       "max_wait_secs": 30,
       "priority_reserve": 0.3,
       "balance": "headroom",
@@ -567,29 +568,37 @@ Everything is live-editable except the rows marked *deploy*.
 | `tpm_output_weight`, `tpm_count_cached`, `default_output_tokens` | 1, true, 1000 | D, A, M, R | Token accounting details (§3.7a) |
 | `shared_rpm`, `shared_tpm` | none | A | One budget across every model of the account |
 | `rate_window`, `rate_burst` | `smooth`, 10 % of rpm | D, A, M, R | `smooth` (default: starts spread evenly, small burst allowance) or `fixed` (calendar minute) |
-| `request_status` | `full` | M, R | Per-request status written: `full` (waiting, in progress, final), `final`, `off` |
+| `request_status` | `full` | D, M | Per-request status written: `full` (waiting and final; in progress is read from the in-progress entry), `final`, `off` |
 | `stream_flush_ms` | 30 | M, R | Queued streaming: chunks within this time are written together; the first chunk is never delayed; 0 = every chunk |
 | `max_concurrency`, `limiter_initial` | none, 20 | D, A, M, R | Hard cap and start value of calls in flight per deployment. The adaptive limiter stays on next to RPM / TPM as the safety net when the real quota is lower |
-| `priority_reserve` | 0.2 | D, M | Share of quota and slots only priority calls may use |
+| `priority_reserve` | 0.2 (chat), 0 (embedding) | D, M | Share of quota and slots only priority calls may use |
 | `normal_min_share` | 0.1 | D, M | Share priority calls cannot take |
-| `timeout_secs` | 90 | D, A, M + per call | Deadline of a call, queue wait included |
+| `timeout_secs` | 120 | D, A, M + per call | Deadline of a call, queue wait included |
 | `max_wait_secs` | none | D, M + per call | Longest wait for quota; then `rate_limited` with `retry_after_secs`. None = until the deadline |
-| `attempt_timeout_secs` | 180 | D, A, M, R | Limit of one provider attempt |
+| `attempt_timeout_secs` | 60 | D, A, M, R | Limit of one provider attempt; must be below `timeout_secs` when the model has more than one deployment (§3.18) |
 | `retry_attempts`, `throttle_retry_attempts`, `retry_base_secs`, `retry_multiplier`, `retry_spread`, `retry_max_secs`, `throttle_retry_max_secs` | as in 0.2 | D, A, M, R | Retry budget and backoff per deployment |
 | `breaker_threshold`, `breaker_cooldown_secs` | 5, 15 | D, A, M, R | Circuit breaker per deployment |
 | `balance`, `balance_opts` | `ordered` | D, M | Strategy (§3.4); `balance_opts.pick` for `headroom` |
 | `balance_priority` | the model's `balance` | M | Strategy for priority calls (§3.17) |
-| `output_reserve` | `max_tokens` | M, R | Output tokens reserved before a call: `max_tokens` or `observed` (§3.17) |
-| `hold_max_secs` | 5 | R | How long a process that is stopping keeps a held call before it defers it |
+| `output_reserve` | `max_tokens` | M | Output tokens reserved before a call: `max_tokens` or `observed` (§3.17) |
+| `hold_max_secs` | 5 | D, M | How long a process that is stopping keeps a held call before it returns it |
+| `max_attempts` | 4 | D, M | Provider attempts of one call across all deployments and models (§3.18) |
+| `retry_budget_pct` | 20 | D, M | Retries a model may make per minute, as a share of its first attempts; beyond it calls fail fast |
+| `stream_idle_secs` | 30 | D, M | A stream with no chunk for this long ends with an error event |
+| `max_waiting` | 50000 | D, M | Calls allowed to wait per model; above it a send gets `queue_full`; 0 = no limit |
+| `quota_share` | 1.0 | D, A, M, R | Share (0 to 1) of `rpm` / `tpm` this environment may use, when several environments call one account |
+| `sticky_move_after_secs` | 1 | D, M | A sticky session moves only when its deployment is unusable or would wait longer than this |
+| `tags` | none | R | Free labels of a deployment, visible to custom hooks |
+| `residency.allowed_regions` | none | top level, M (*deploy*) | Regions calls may ever reach; a deployment or profile outside the list is refused at boot (§3.18) |
+| `routing.blocked_regions`, `routing.blocked_accounts` | [] | top level | Live block of a region or account for every model; kept across registry publishes until cleared |
 | `weight` | 1 | R | Share for `weighted` |
 | `sticky` | off | D, M | `{"key": "session" \| "custom:<name>", "idle_ttl_secs": 1800}` |
 | `fallback` | none | D, M | Region fallback rule (§3.5) |
 | `model_fallback` | none | M | Model fallback rule (§3.5) |
 | `store_down` | `pause` | D, M | `pause`, `static_cap`, `fail_fast` (§3.11); `local_limit_cap` (10) is the cap |
 | `queue_pct` | 100 | D, M | Share of calls sent through the queue; the rest run direct under the same budgets (canary) |
-| `worker_slots` | 20 | D, M | Messages of this model one process works on at once |
+| `worker_slots` | 20 | D, M (*deploy*) | Messages of this model one process works on at once |
 | `queue` | derived | D, M (*deploy* for `name`) | `{"name", "visibility_secs", "max_receives", "retention_secs"}` |
-| `request_status` | true | D, M | Per-request status on or off |
 | `embed_batch_size` | 1 | M | Texts per embedding call |
 | `inference`, `inference_limits` | none | D, A, M, R | Default model parameters and their limits (below) |
 | `params` | none | R | Raw request fields merged for one deployment (guardrail, model fields) |
@@ -672,10 +681,10 @@ built-in default is used and the error is logged once.
 |---|---|---|
 | `register_balancer(name, fn)` | `fn(candidates: list[DeploymentView], ctx: CallContext) -> list[str]` | the model's `balance` |
 | `register_fallback_policy(name, fn)` | `fn(cause, tried, candidates, ctx) -> list[str] \| None` (None = wait) | §3.5 rule |
-| `register_token_estimator(model, fn)` | `fn(params) -> int` | characters / 4 + max tokens |
+| `register_token_estimator(name, fn)` | `fn(params) -> int` | characters / 4 + max tokens |
 | `register_sticky_key(name, fn)` | `fn(ctx) -> str \| None` | session id |
 | `register_admission(name, fn)` | `fn(ctx, model) -> Admit \| Reject(reason) \| Tag(labels)` | admit all |
-| `register_probe(model, fn)` | `fn(deployment, client) -> None` (raises on failure) | minimal real call |
+| `register_probe(name, fn)` | `fn(deployment, client) -> None` (raises on failure) | minimal real call |
 
 `DeploymentView`: name, account, region, group, weight, enabled, healthy, RPM / TPM left,
 concurrency in use / limit, breaker, paused, p95 latency, `tags` (free labels from config, e.g.
@@ -779,13 +788,12 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  S[call: model, ctx] --> C["confirmed deployments minus disabled /<br/>unhealthy / breaker open / paused / slow;<br/>sticky deployment preferred"]
-  C --> TRY{"PICK_TAKE by strategy,<br/>then shared budgets + slot"}
+  S[call: model, ctx] --> C["enabled confirmed deployments inside the call's filter;<br/>health, breaker and latency are checked<br/>inside PICK_TAKE; sticky deployment preferred"]
+  C --> TRY{"PICK_TAKE by strategy:<br/>budgets, account budget, slot, in-progress entry"}
   TRY -->|granted| RUN["call → result"]
-  TRY -->|"refused, others left"| TRY
   TRY -->|none left| FR{"fallback rule or hook:<br/>cause listed?<br/>after_secs passed?"}
   FR -->|yes| FB["fallback deployments<br/>(same account first, or any)"] --> TRY
-  FR -->|no| RQ["deferred in the waiting queue until a token is free<br/>or its deadline passes (no receive count)"]
+  FR -->|no| RQ["held as a waiter until budget is free<br/>or its deadline passes (no failure count)"]
   RQ -->|deadline passed| RL["rate_limited (retry_after_secs)"]
   FB -->|none left| CH{"model_fallback set, cause listed,<br/>after_secs passed?<br/>(never for embeddings)"}
   CH -->|yes| S2["next model: same flow"]
@@ -818,7 +826,7 @@ flowchart LR
 stateDiagram-v2
   [*] --> waiting: send
   waiting --> in_progress: slot granted on a deployment
-  in_progress --> waiting: deferred or released (no budget, worker died, retry later)
+  in_progress --> waiting: released (worker died, retry later)
   in_progress --> done
   in_progress --> failed
   waiting --> expired: deadline passed
@@ -873,7 +881,7 @@ report = await llmq.status(model="gpt120b", by="region")       # StatusReport
 state = await llmq.request_status(reply.meta.request_id)       # RequestStatus
 
 await llmq.registry.set("gpt120b", {"deployments.aws-main.overrides.ap-south-1.rpm": 400})
-await llmq.registry.disable("gpt120b", "aws-main/ap-south-2", reason="maintenance")
+await llmq.registry.disable("gpt120b", "aws-main/us-east-1", reason="maintenance")
 diff = await llmq.registry.diff()
 
 @register_balancer("cheapest_first")
@@ -980,6 +988,196 @@ region while it has budget, and other work spreads by headroom.
 | Message bodies above a size threshold compressed | Less queue-store memory, faster sends |
 | Dedicated worker pods scaled on queue depth | Workers do not share the app's CPU |
 
+### 3.18 Rules added by the second review
+
+Each rule closes a gap listed in §10 (R1 to R50).
+
+**Order across processes (R2, R3).** A refused call registers as a waiter in
+`P:{m:ALIAS}:wait:p` or `:wait:n` (sorted by its queue position, expiring after twice its
+wait). `PICK_TAKE` grants only the oldest live waiter of a class; the others get `not_head`.
+Normal calls are refused while a priority waiter exists, unless normal use is below
+`normal_min_share`. A received batch is admitted in order in one script call that stops at the
+first refusal. A call restricted by `allowed_regions` / `allowed_accounts` / `allow_fallback`
+that is refused steps aside (returned in place) so it cannot block unrestricted calls. A call
+larger than the burst allowance starts as soon as the clock is idle, which the waiter rule now
+guarantees; input above the class budget is `request_too_large`.
+
+**Ownership of a grant (R1, R5).** The lease member and the in-progress entry carry an owner
+token `request id : worker : attempt`. `PICK_TAKE` returns `duplicate` and takes nothing when
+another live owner exists, and returns the existing grant when the same owner asks again. A new
+script `PICK_UNDO` returns tokens, slot, rotation and entry of one token without counting as a
+success in the limiter. Finish and give-back delete only their own token. A held call keeps the
+visibility and claim heartbeats; every admission retry carries a "still mine and not cancelled"
+check.
+
+**Budgets (R4, R7 to R12).**
+
+| Rule | Text |
+|---|---|
+| Account budget | Inside `PICK_TAKE`; a deployment whose account is full is skipped |
+| Slots per class | Leases are counted per class: normal < ceil((1 − `priority_reserve`) × limit), priority < ceil((1 − `normal_min_share`) × limit), total < limit |
+| Slot or breaker refusal | Wait of 50 to 200 ms with jitter, growing; never 0 |
+| Refunds across a minute | A grant is stamped with its minute; minute counters and `fixed` counters are refunded only inside that minute; extra charges always apply |
+| `headroom` ranking | In `smooth` mode by clock debt of the call's class (the worse of RPM and TPM); the ranking is walked to the first candidate with budget |
+| Retry target | The deployment that just failed is the last choice, not excluded |
+| `output_reserve: observed` | The sample is kept under the model tag, written by the finish script and read by `PICK_TAKE`; the reservation is raised so that limiter limit × (`max_tokens` − reserved) stays within the burst allowance |
+
+**Rotation, groups, sticky, model fallback (R13, R14).** Rotation and weight state is kept per
+deployment (last pick, current weight), not per candidate list. Groups are tiers: fallback
+regions are used only when no confirmed candidate has budget in this call. A sticky session
+moves only when its deployment is unusable or would wait longer than `sticky_move_after_secs`;
+the sticky key is read and written inside the script. Model fallback is not transitive;
+`require_headroom` means the other model has at least `require_headroom_pct` (20) of RPM and
+TPM left and no waiters of its own, checked inside its `PICK_TAKE`; when another model serves a
+call, the status is written at admission.
+
+**Attempts and timeouts (R21, R22).** One call makes at most `max_attempts` (4) provider
+attempts across deployments and models, with backoff also when it moves. A model's retries are
+limited to `retry_budget_pct` (20 %) of its first attempts per minute. The order is: call
+deadline (`timeout_secs`, 120) > attempt (`attempt_timeout_secs`, 60) > provider read timeout >
+`stream_idle_secs` (30). Boot refuses `attempt_timeout_secs ≥ timeout_secs` on a model with more
+than one deployment. A retry that waits for budget keeps its place and its `enqueued_at`.
+
+**Health (R16, R26, R27).**
+
+- A request that gets a target error on two deployments is the cause: it fails as fatal and its
+  errors are not counted. A success on a deployment resets its error count. Only model, region
+  and access errors count.
+- The last usable deployment of a model is never auto-disabled; an alert is raised instead.
+- A credential error makes the account unusable in that process only: its deployments are
+  skipped, no budget is taken, `AssumeRole` is retried with backoff (5 to 60 s), and the call
+  moves to another account or fails with `credentials_unavailable`. Shared health changes only
+  when two or more processes report it. Alert `account_credentials_failed`.
+- A model with no enabled and healthy deployment fails at once with `model_unavailable` and
+  `retry_after_secs` (the next probe), with one alert. Disabling the last enabled deployment
+  needs `--force`.
+- `GET /llmq/health/live` reports the process only; `GET /llmq/health/ready` reports stores and
+  registry. Neither depends on provider health, so a provider outage never removes app pods.
+
+**Streaming (R19).** Chunks carry the attempt id and a sequence number. A worker that claims a
+streaming call whose chunk stream is not empty does not call the provider: it ends the stream
+with error `worker_lost` and the partial text. A stream that has sent chunks is never handed
+back at shutdown. Chunk streams are not trimmed; a stream above its size cap fails. The reader
+fails after `stream_idle_secs` and on a gap in the sequence.
+
+**Duplicate request ids (R23).** Results are read without deleting them (TTL only). The dedupe
+key is the request id plus the hashed user or session and a hash of the params; a mismatch is
+`request_id_conflict`. A resend after the result expired returns `result_expired` at once. The
+direct path takes the claim too. Ids must be generated by the server.
+
+**Caller gone (R24).** When the awaiting task is cancelled the call is cancelled. Each process
+renews `P:caller:<pod>` (30 s); the admission script drops waiting calls of a dead caller as
+`cancelled(caller_gone)` before taking budget. Shutdown order: readiness off → stop receiving →
+keep the result reader until the pod's own calls finish or the drain ends → cancel the rest.
+`terminationGracePeriodSeconds` must exceed drain (45) + flush (10) + `hold_max_secs`.
+
+**Registry (R17, R28, R29, R35).**
+
+- Publish and edit are one compare-and-set on (version, change counter); a conflict is re-read
+  and re-validated.
+- Rollback is a new, higher version with the old content: `llm-queue registry publish
+  --from-audit N`.
+- A stored document is read leniently: an unknown setting or hook gives a warning, a metric and
+  the default. A pod that cannot use the stored document runs on its own config without
+  publishing, and alerts.
+- The reload loop treats a missing or older stored registry as an event: it republishes by the
+  boot rule and alerts `registry_reset_live_edits_lost`. A publish logs every live edit it drops.
+- A pod that cannot reach a store at boot starts on the config registry under each model's
+  `store_down` mode and retries in the background.
+- Removing a model takes two steps: `enabled: false` (senders get `model_disabled`, or follow
+  `model_fallback`; waiting calls are still served), then removal when its queues are empty.
+  `llm-queue drain MODEL --wait` and `llm-queue registry gc` (orphan keys) support it. A queue
+  with messages that no model owns is flagged at boot.
+- `registry_live_edit` (infrastructure setting): `safe` (default), `all`, `off`. Under `safe`
+  these fields change only by deploy: `kind`, `base_url`, `role_arn`, every `*_ref`, `params`,
+  the `confirmed` / `fallback` lists, `residency`, and `debug_capture` in prod. `base_url` is
+  checked against the allowed hosts on every publish.
+- The audit stores path diffs, not whole documents, and every entry is also a log event
+  `llmq_registry_audit` with ARNs and references redacted. `llm-queue registry log` reads it.
+
+**Dead letters (R30).** The receive script returns the ids it dead-lettered; the worker writes
+the `dead_lettered` reply and status, counts `llmq_dlq_total` and raises an alert
+(`alerts.dlq_messages`, 1). Only crashes and failed handlers dead-letter a message. CLI:
+`llm-queue dlq list|show|redrive|purge --model`; `show` prints no body without `--unsafe`;
+redrive keeps the class and skips calls past their deadline.
+
+**Stores, time, status, alerts (R15, R25, R31, R32).**
+
+- Both stores run `noeviction`. Out of memory is its own error class: optional writes (status,
+  debug capture) are dropped first, one alert, and it is not treated as "store down". Memory
+  alarm at 75 %. `max_waiting` bounds each model's queue (`queue_full`). The dead-letter queue is
+  capped by length and age (`queue.dlq_retention_secs`, 86400).
+- Every script, in both stores, reads the store's clock. Ages come from the queue position and
+  the script's `now`; a skew of 2 s is allowed on deadlines and logged at boot.
+- A status write never replaces a final state, and every write sets a TTL of at least the
+  remaining deadline plus the status TTL. Status gains `wait_reason` (rpm, tpm, slot, account,
+  reserve, not_head), `tried` (deployment, error, ms), `fallback_cause`, `queue_wait_ms` and
+  `provider_ms`.
+- State alerts are gauges sent with every status sample (`llmq_deployment_disabled`,
+  `llmq_model_unavailable`); the store marker only de-duplicates the log line, which repeats
+  every 24 h while the state lasts.
+
+**No quota numbers (R40).** A deployment without `rpm` and `tpm` runs on the adaptive limiter
+alone: `exhausted` means no free slot, status shows `limit: null`, quota alerts are silent, and
+`headroom` or `require_headroom` on it is refused at boot.
+
+**Several environments on one account (R33).** `quota_share` multiplies `rpm` / `tpm`; dev, uat
+and prod on one AWS account set shares that add up to 1.
+
+**Residency (R36).** `residency.allowed_regions` (top level, or per model; deploy only) lists
+the regions calls may reach. A deployment outside it is refused at boot; an inference profile
+must declare `routes_to` and every region in it must be allowed.
+
+**Text at rest (R34, R37, R38).**
+
+| Where | Holds | Kept |
+|---|---|---|
+| Queue messages, `params_ref` | The request | Until served; at most the call's deadline |
+| Dead-letter queue | The request | 1 day |
+| Result | The response | 5 min |
+| Stream chunks | The response text | 5 min |
+| `debug_capture` | Truncated request and response | ≤ 60 min, with an alert while it is on |
+| Status, logs, audit, metrics | No text | — |
+
+A non-TLS store URL is refused outside local runs; both stores need encryption at rest;
+snapshots of the queue store are off or kept one day. User and session ids are hashed with a
+keyed hash everywhere outside the message itself (status, sticky keys, logs, `allow_users`);
+prod refuses the default salt. Assumed-role sessions are named `llmq-<env>-<pod>`. No password,
+key, external id or full role ARN appears in logs, status or audit. A rotated store password or
+API key is re-read from the secret on an auth error, without a restart.
+
+**Operations (R39).** `llm-queue block --region R [--account A] --reason TEXT` (and `unblock`)
+set `routing.blocked_regions` / `blocked_accounts`. Metrics added:
+`llmq_admission_refusals_total{reason}`, `llmq_wait_seconds{priority}`,
+`llmq_fallback_total{kind, cause}`, `llmq_provider_errors_total{kind}`, `llmq_dlq_messages`.
+Status shows the account budgets, registry version, live-edit count and held calls. One
+`llmq_call_finished` log event per call is the durable record for usage reports.
+
+**Infrastructure settings** (process level, from env or the secret; a change needs a restart)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `store_url` (or `store_host`, `store_port`, `store_password`, `store_ssl`) | required | State store |
+| `queue_store_url` | the state store | Queue store |
+| `queue_backend` | `stream` | `stream` or `sqs` |
+| `key_prefix`, `queue_prefix` | per environment | Names of keys and queues |
+| `cfg_reload_secs` | 30 | Registry reload interval |
+| `result_ttl_secs`, `status_ttl_secs` | 300, 1800 | How long results and request status are kept |
+| `audit_retention_days` | 90 | Audit stream |
+| `queue_failover_secs` | 5 | Queue-store errors before calls run direct |
+| `queue_wait_replicas` | off | Send waits for one replica; a wait that fails is a failed send |
+| `local_limit_cap` | 10 | Calls per process and model under `store_down: static_cap` (grows with the number of processes) |
+| `registry_live_edit` | `safe` | `safe`, `all`, `off` |
+| `debug_capture_from_config` | false | Non-prod only |
+| `id_hash_salt` | required in prod | Keyed hash of user and session ids |
+
+**Not included (R49).** A limit per user (one user flooding a model) is not part of 0.3: only
+the priority flag orders calls. `register_admission` can reject by user in the app.
+
+**Scope notes.** `PICK_TAKE` touches keys of several tags (model, account, request), so it is
+single-node by design; cluster mode stays unsupported. `worker_slots` and `local_limit_cap` are
+per process, so their totals grow with the number of pods; everything else is independent of it.
+
 ## 4. User stories
 
 | # | As | I want | So that |
@@ -987,7 +1185,7 @@ region while it has budget, and other work spreads by headroom.
 | U1 | platform owner | to add a second AWS account with its own regions and quotas | we raise our Bedrock quota in minutes |
 | U2 | platform owner | to set RPM / TPM per account × region × model | we never exceed what AWS gave each account |
 | U3 | model owner | to choose per model how load is spread | each model uses its quota the way that suits it |
-| U4 | model owner | to decide per model which lanes may use fallback regions and why | live chat survives a region outage while bulk work waits |
+| U4 | Operator | To decide per model whether and why calls may use fallback regions | A region outage or an exhausted quota does not stop the model |
 | U5 | chat user | my conversation to stay in one region | the prompt cache stays warm |
 | U6 | operator | one view of waiting / in progress / budget per model, account and region | I see where the bottleneck is |
 | U7 | developer | the status of one request id | I can answer "where is my request?" |
@@ -999,6 +1197,16 @@ region while it has budget, and other work spreads by headroom.
 | U13 | platform owner | the same behaviour with 2 or 20 worker processes | scaling needs no retuning |
 | U14 | developer | my own balancer, fallback rule or token estimator | the library fits our rules without a fork |
 | U15 | operator | a safe upgrade from 0.2 to 0.3 | no call is lost or run by a worker that does not understand it |
+| U16 | On-call operator | To block a region or account with one command and see why a request is slow | An incident is handled in minutes |
+| U17 | Developer adding a model | To add a model in a few lines and know it needs a version bump and a deploy | A new model goes live without reading the whole reference |
+| U18 | App developer | Documented error kinds (`rate_limited`, `request_too_large`, `no_deployment`, `model_unavailable`, `queue_unavailable`, `queue_full`, `request_id_conflict`) with `retry_after_secs` | The UI reacts correctly |
+| U19 | Agent developer | A multi-call turn and parallel sub-agents not to starve behind bulk work | A turn finishes in bounded time |
+| U20 | Usage owner | Tokens per model, account, region and tenant per day from a durable record | Usage can be reported |
+| U21 | Security reviewer | A list of what text is stored where and for how long, who can edit the registry, and proof that no call leaves the approved regions | The design can be signed off |
+| U22 | Bulk ingestion owner | To embed 1M texts without filling the queue store or slowing chat | Nightly indexing is safe |
+| U23 | Tester | Every scenario runnable locally on fakellm with one command and a numeric pass condition | A regression is caught before release |
+| U24 | Platform owner | A share of one account's quota per environment | dev and uat cannot spend prod's quota |
+| U25 | Operator | To rotate the store password and API keys without a restart | Rotation is routine |
 
 ## 5. Scenarios
 
@@ -1038,7 +1246,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B27 | Deployment fails after 200 streamed tokens | error event with the partial text; no second deployment starts |
 | B28 | One of four regions 5× slower; then only two regions | share of new calls drops to ~0 within 30 s and returns after recovery; with two regions nothing is excluded |
 | B29 | Real quota 200, configured 500 | 429 rate < 5 % within 60 s; traffic moves; one alert with the observed rate |
-| B30 | Worker killed with 50 calls in progress | all 50 finish elsewhere within 60 s; 0 lost |
+| B30 | Worker killed with 50 calls in progress | all 50 are restarted elsewhere within 60 s and finish; 0 lost; 0 lost |
 | B31 | A bulk run of 5,000 normal calls fills the quota; 50 priority calls arrive mid-minute; then constant priority load | priority calls start within 2 s (they use `priority_reserve`); under constant priority load normal calls still get `normal_min_share` |
 | B32 | Bulk embed 50K texts on titan and cohere, with the default (`rpm`) and with `rate_limits: "both"` | batch sizes as §3.7; RPM held per deployment (one request per batch); with `both`, TPM held too and corrected from usage; vectors in input order |
 | B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 failed priority calls, mixed versions safe, registry version never goes back |
@@ -1050,7 +1258,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B39 | Queue store down, state store up | calls run direct under the shared budgets; queued messages intact and served after it returns |
 | B40 | Config changed without a version bump | stored registry kept; `registry_version_not_bumped` logged and alerted once |
 | B41 | Upgrade 0.2.1 → 0.3.0 by §6.1 under load | 0 lost; no 0.3 worker receives a 0.2 message and the reverse |
-| B42 | A rate-deferred message 50 times | receive count unchanged; never in the DLQ; a failing handler still reaches the DLQ at `max_receives` |
+| B42 | A message returned 50 times (held call of a stopping process; SQS backend) | receive count unchanged; never in the DLQ; a failing handler still reaches the DLQ at `max_receives` |
 | B43 | 5,000 normal calls queued, then 100 priority calls | priority wait p95 ≤ 2 s; every normal call still finishes; first in, first out inside each class |
 | B44 | A region where the model does not exist is listed as confirmed | disabled after 3 errors with an alert naming the deployment and the AWS error; calls served by the other regions; 0 failed calls |
 | B45 | Inference defaults: a call without parameters; a call with its own `temperature`; a locked `top_p`; `max_tokens` over the limit; a model change | defaults applied; the call's value wins; the locked value is kept; the limit is enforced (`clamp` and `reject`); explicit values carried to the other model, defaults replaced by its own, unsupported ones dropped |
@@ -1067,53 +1275,107 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B56 | Backlog: 5,000 normal calls waiting on a model with rpm 500, 20 processes | store calls per second stay proportional to the processes, not to the waiting calls; receive counts unchanged; start order = send order; priority calls still start within 2 s |
 | B57 | `output_reserve=observed` on a TPM-bound model whose calls use ~20 % of `max_tokens`; then calls that suddenly use all of it | throughput at least 2× the `max_tokens` run; tokens per minute still ≤ the quota within the correction of one call; the first 50 calls reserve `max_tokens` |
 | B58 | `balance=headroom`, `balance_priority=ordered`, home region half used | priority calls all land on the first region while it has budget; normal calls spread by headroom |
+| B59 | A call running on worker A; the same request id delivered to worker B 100 times, B killed between grant and give-back 10 times | A's slot and in-progress entry never change; slots in use = provider calls in flight; RPM / TPM net change 0 |
+| B60 | 20 processes, steady small calls at 100 % of TPM, one 60K-token call at position 100 | start order = send order within each class; the large call starts before position 120 |
+| B61 | Head call restricted to an exhausted region, 100 unrestricted calls behind it, other regions idle | the unrestricted calls start within 1 s |
+| B62 | Two accounts; account 1 `shared_rpm` used up by another model | all calls land on account 2 within one wait; rotation and limiter counters do not move for refused picks; account starts ≤ `shared_rpm` in every window |
+| B63 | A call held 150 s with `visibility_secs=60`; a held call cancelled | failures count stays 0 and one provider call; no provider call and status `cancelled` within one retry |
+| B64 | No rpm, `max_concurrency=20`, constant priority load plus normal backlog | normal in flight ≥ 2, total reaches 20 |
+| B65 | Normal backlog, priority demand at 40 % of the quota | priority wait p95 < 2 s; normal still gets ≥ 10 % |
+| B66 | `max_concurrency=5`, 10 s calls, 20 processes | admission calls per process ≤ 20 / s |
+| B67 | Take at second 59, refund at second 61, both window modes | minute counters ≥ 0; the new minute's fixed counter unchanged |
+| B68 | 5 requests with a tool config the model rejects, on 3 deployments, mixed with normal traffic | 5 fatal errors after ≤ 2 attempts each; 0 deployments disabled; other calls unaffected |
+| B69 | Publish v8 with a setting and hook unknown to an older 0.3 pod and restart that pod; two concurrent `registry set`; flush the state store under load; roll back with `--from-audit` | the old pod boots and serves; both edits applied or one refused, never lost; registry back within one reload with one alert; v9 equals v7 within 30 s |
+| B70 | Worker killed after 200 streamed tokens; SIGTERM with a drain shorter than the stream | one error event with the partial text within `stream_idle_secs`; no chunk of a second attempt; one provider call |
+| B71 | Worker holding 50 embedding calls (timeout 900 s) killed | within 60 s its in-progress count is 0 and tokens in flight are right; all 50 finish |
+| B72 | 50 % 5xx on every deployment of a model and of its fallback model, 10K calls / min | no call makes more than 4 attempts; retries ≤ 20 % of first attempts per minute; the fallback model's own traffic keeps its share |
+| B73 | One of two regions accepts connections and never answers | every call that lands there succeeds on the other region; 0 `deadline_exceeded`; the breaker opens on the hung one |
+| B74 | Same request id: from two pods 100 ms apart; after the first read; at 6 min; with other params; on the direct path | one provider call each time; same result, `result_expired`, or `request_id_conflict`, within 1 s |
+| B75 | 100 awaiting tasks cancelled; a pod with 200 waiting calls killed; rolling restart of 4 pods under priority load | waiting calls dropped before taking budget; 0 failed priority calls |
+| B76 | 1M embedding texts next to live chat; each store filled to its memory limit | sends above `max_waiting` get `queue_full`; chat priority p95 ≤ 2 s; waiting calls still drain; one alert; no "store down" |
+| B77 | Fake STS denies one account for 10 min; one pod of 20 has broken credentials | calls served by the other account, 0 failures; the account returns within 60 s of recovery; the bad pod disables nothing |
+| B78 | Every deployment of a model disabled; state store down; provider outage | `model_unavailable` within 1 s and one alert; `/health/ready` 503 only for the store case; `/health/live` always 200 |
+| B79 | A model disabled, drained and removed under load with 500 waiting | 0 stranded messages; RPM never above the quota; queues empty before removal |
+| B80 | A handler that crashes its worker 10 times on one call | the caller gets `dead_lettered` within one visibility period; one alert; other calls' failure counts ≤ 2 |
+| B81 | Pod clocks ± 5 s and one at + 90 s | budgets within 1 % of the no-skew run; 0 extra receives; no call expires more than 2 s early |
+| B82 | 4 models without rpm / tpm, 2,000 calls / min against a provider quota of 500 | 429 rate < 5 % after 60 s; status shows `limit: null`; no quota alert |
+| B83 | Two prefixes with `quota_share` 0.7 and 0.3 on one provider key | combined starts ≤ the quota in every window; 429 rate < 1 % |
+| B84 | A model restricted to two India regions, with a region outage, a model fallback and a cross-region profile | 0 calls outside the list; the profile is refused at boot |
+| B85 | A live edit of each protected field under `registry_live_edit=safe` | refused and audited as refused |
+| B86 | Both stores scanned 10 min after a run; forced store, STS and API-key auth failures | 0 keys holding message text outside the dead-letter queue; no secret in any log line, status body or audit entry |
+| B87 | `llm-queue block --region` under load, then a registry publish | 0 new calls there within one reload; the block survives the publish |
+| B88 | `llmq.cancel` on a waiting call and on a call in progress | waiting: gone within 1 s, no budget taken; in progress: attempt stopped within 1 s, slot freed, unused output refunded |
+| B89 | `queue_pct=30` over 10,000 calls; `kill_switch=true` live; `allow_users=[u1]` | 30 % ± 3 % queued; 0 new sends within one reload and direct calls never above RPM; u1 always queued |
+| B90 | Store password and API key rotated mid-run | 0 failed calls; new credentials used within 60 s without a restart |
+| B91 | 20 models, 10 regions × 3 accounts | `PICK_TAKE` p99 ≤ 2 ms server time; status ≤ 500 KB and ≤ 200 ms |
+| B92 | 30 min idle, then 0 → 3,000 calls in 60 s across 3 regions | 0 auth or connect errors; first-call overhead ≤ 500 ms; priority p95 wait ≤ 2 s |
+
+**Pass conditions made exact (second review)**
+
+| Scenario | Exact pass condition |
+|---|---|
+| B03 | `percent` shares 50 / 30 / 20 ± 5 %; `max` and `spread` against a table of expected shares |
+| B06 | First fallback start between `after_secs` and `after_secs` + 1 s; none before; a model without a rule: 0 calls outside confirmed |
+| B07 | Breaker open within `breaker_threshold` failures; ≤ 5 calls see a retry; 0 failed calls; 0 calls on the bad region for `breaker_cooldown_secs` |
+| B13, B15 | Counts equal the calls sent; shares within ± 5 % |
+| B17 | Mix: 60 % chat (30 % of it priority, 20 % with tools), 40 % embeddings, inputs of 500 to 20,000 tokens; 0 failed calls |
+| B20 | Refusals ≤ calls − 5 |
+| B21 | Store commands per idle process per minute ≤ the 0.2.1 number recorded in A0 |
+| B23 | With `queue_wait_replicas` on, losses are not higher than with it off; a wait that fails is a failed send |
+| B28 | ≤ 2 % of new calls on the slow region after 30 s; back to ≥ 20 % within 60 s of recovery |
+| B34 | Ceiling ≥ 10K calls / min; state store ≤ 500 MB; queue path adds ≤ 20 ms at p95 |
+| B50 | `seen_tokens` per minute within ± 2 % of the provider's usage |
+| B54 | ≥ 80 % of the new deployment's RPM used in the first full minute after the reload |
+| B57 | Tokens per minute ≤ the quota plus one burst allowance |
 
 ## 6. Work plan by release
 
 | Release | Step | Content | Gate |
 |---|---|---|---|
-| **0.3.0** | A0 | Test prerequisites: fakellm quotas per key × region × model, latency / error injection, fake STS, Redis + second Valkey in compose | harness self-test |
-| | A1 | Registry schema (one document: defaults, routing, accounts, models), all setting names and levels, inference parameters and limits, validation, resolve; alias or model id in calls, queue name from the alias; the five old `LLMQ_*` model configs, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
-| | A2 | Registry store: version + hash rule, live edits, audit, CLI `registry`, registry file / own secret | B11, B40 |
-| | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22, B58; strategy per class (`balance_priority`) |
-| | A4 | Deployment and provider budgets on RPM and TPM, token refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`; `priority_reserve` and `normal_min_share`, `max_wait_secs`, `defer` on both backends | R01-R12 still pass; B05, B31, B42, B49-B51; `output_reserve` (B57) |
-| | A5 | Region fallback and model fallback rules and hook, per-deployment params, inference defaults merged per provider (locked names, limits, model change), tool calls in the token estimate | B06, B07, B38, B45, B47, B48 |
-| | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43; held head call instead of a defer loop (B56) |
-| | A7 | Pod-count logic removed; `store_down` modes; once-locks | B16, B22 |
-| | A8 | Upgrade guide and the app's config moved to the registry | B41 |
-| **0.3.1** | A9 | Accounts: assume role, API-key accounts, client pool | B08, B09 |
-| | A10 | Sticky sessions; latency-aware exclusion; health, auto-disable and probe; quota-drop alert | B10, B28, B29, B37 |
-| **0.3.2** | A11 | In-progress set, per-request status, sweeper | B13, B30; extra Valkey cost per call measured; in-progress entry written inside `PICK_TAKE`, status read from it |
-| | A12 | Status reader, Python API, CLI views, HTTP router, alerts, both metric sinks, `debug_capture` | B14, B36 |
-| | A13 | Embedding batching, optional token limiting for embeddings, token estimator hook and token metrics | B15, B32 |
-| **0.3.3** | A14 | Streaming, queued and direct | B25-B27 |
-| every release | A15 | Load and deploy scenarios, live suite, docs, samples, CHANGELOG | B17, B33-B35; all green on both engines |
+| **0.3.0** | A0 | Test prerequisites: fakellm with account identity, RPM and TPM quotas per account × region × model, usage-missing mode, latency / error injection, fake STS; Redis next to Valkey in compose; baseline store-command counts recorded from 0.2.1 | harness self-test |
+| | A1 | Registry schema (one document), every setting name and level, inference parameters and limits, validation, resolve. Pure and additive: nothing removed yet | unit; B12 |
+| | A2 | Registry store: compare-and-set publish, version + hash rule, live edits with protected fields, audit as diffs plus log event, rollback publish, lenient read, reset detection, CLI `registry` | B11, B40, B69, B85 |
+| | A3 | Deployments replace targets: key schema 3, client pool per account and region, API-key accounts, AWS accounts on the pod's own credentials, provider calls take a deployment | B05, B09 |
+| | A4 | Lanes replaced by the priority flag: envelope version 2, context, result reader, metric labels, LangChain adapters (alias or model id, `priority`, inference defaults); the existing scenario harness and samples ported | R01-R12 pass on the ported harness |
+| | A5 | Queues: stream backend default, queue pair per model, generation and failure counters, `return`, queues created at start, two stores, store clock in every script, `max_waiting`, dead-letter notice and `dlq` commands | B23, B24, B39, B42, B43, B76, B80, B81 |
+| | A6 | `PICK_TAKE` and `PICK_UNDO`: strategies and `balance_priority`, RPM / TPM and account budgets, slot per class, in-progress entry with owner token, waiter order, sweeper, custom balancer hook | B01-B04, B18-B21, B31, B58-B62, B64-B67, B71, B91 |
+| | A7 | Token accounting: refund rules, usage from headers, `tpm_output_weight`, estimate metric, `request_too_large`, `output_reserve`, `max_wait_secs`, expired calls answered as `rate_limited`, no-quota mode, `quota_share` | B46, B49-B51, B57, B82, B83 |
+| | A8 | Worker loop: held head call per model and class, batch admitted in order, retries (last choice, `max_attempts`, retry budget), timeout rule | B53, B56, B63, B72, B73 |
+| | A9 | Region and model fallback rules and hook, per-deployment params, inference defaults per provider, tool calls in the estimate, `allowed_regions` / `allowed_accounts`, residency guard, blocked regions | B06, B07, B38, B45, B47, B52, B84, B87 |
+| | A10 | Pod-count logic removed; `store_down` modes; once-locks; duplicate request ids; caller-gone cancel; shutdown order; kill switch and `queue_pct` | B16, B22 (shares), B33, B48, B74, B75, B88, B89 |
+| | A11 | The app's config moved to the registry; deployment notes (§6.1); text-at-rest and secrets checks | B41, B86, B90 |
+| **0.3.1** | A12 | Assume-role accounts, credential failure rule | B08, B77 |
+| | A13 | Sticky sessions; latency-aware exclusion; health, auto-disable with its safeguards, probe; quota-drop alert; new deployment at full share | B10, B22 (one probe), B28, B29, B37, B44, B54, B68, B78 |
+| **0.3.2** | A14 | Request status, status reader, Python API, CLI views, HTTP router, health routes, alerts as gauges, both metric sinks, model drain and removal, `debug_capture` | B13, B14, B22 (one alert), B30, B36, B55, B79 |
+| | A15 | Embeddings: batch size per model, optional token limiting, token estimator hook and token metrics | B15, B32 |
+| **0.3.3** | A16 | Streaming, queued and direct, with the redelivery rule | B25-B27, B70 |
+| every release | A17 | Load and deploy scenarios, live suite, docs, samples, CHANGELOG | B17, B34, B35, B92; all green on both engines |
+
+Step numbers changed on 2026-11-12 (second review): clients now come before the code that needs
+them, the queues before the admission script, and the in-progress entry is built with its sweeper.
 
 The first setup used for seeds and scenario numbers: `gpt120b` (`openai.gpt-oss-120b-1:0`, chain
 to `gpt20b`), `gpt20b` (`openai.gpt-oss-20b-1:0`), `embed-titan` (`amazon.titan-embed-text-v2:0`),
 `embed-cohere` (`cohere.embed-english-v3`) on `aws-main`, with placeholder quotas until real
 numbers arrive. Load is designed for 10K calls / min with a mix of chat and bulk work; B34 finds the ceiling.
 
-### 6.1 Upgrade from 0.2.x to 0.3.0
+### 6.1 Moving to 0.3.0
 
-0.3.0 is a clean break: a 0.2 worker cannot run a 0.3 message and the reverse, and state keys
-change (schema 3, new deployment names). "Mixed versions are safe" holds between 0.3.x releases
-only. The upgrade therefore never lets the two versions share queues or state. Two paths:
+0.3.0 does not keep compatibility with 0.2: messages (version 2 only), keys (schema 3), setting
+names and deployment names all change, and no mixed 0.2 / 0.3 operation is supported.
 
-**New prefix and drain** (uat / prod):
+1. Turn the queue off (`LLM_QUEUE_ENABLED=false`; calls run direct). It is off in uat and prod
+   today.
+2. Wait until the 0.2 queues are empty, then delete the 0.2 queues and keys.
+3. Deploy 0.3.0 with its registry; queues are created at start.
+4. Turn the queue on.
 
-1. Deploy 0.3.0 with a **new key prefix and queue prefix** (e.g. `llmq:<env>:v3`,
-   `...-v3-`), so its queues and state are separate. New queues are created at start.
-2. Old pods finish what is on the old queues during the rollout (drain); new pods send and work
-   only on the new ones.
-3. When the old queues and their DLQs are empty (`llm-queue queues list` with the old prefix),
-   delete the old keys and queues.
+Going back means redeploying 0.2.1 with its own settings after turning the queue off; nothing
+is carried over in either direction. "Mixed versions are safe" holds between 0.3.x releases:
+the registry carries `min_lib_version`, senders use a new message field only when every worker
+satisfies it, and a worker returns a message it does not understand instead of dropping it.
 
-**Stop the world** (dev, or any env where the queue is off): set `LLM_QUEUE_ENABLED=false` (calls
-run direct), wait until the queues are empty, upgrade, turn it on again. With the queue already
-off (uat / prod today) there is nothing to drain.
-
-## 7. Decisions (2026-11-11)
+## 7. Decisions (2026-11-11; E76 onward on 2026-11-12)
 
 | # | Topic | Decision |
 |---|---|---|
@@ -1147,7 +1409,7 @@ off (uat / prod today) there is nothing to drain.
 | E28 | Deployment params | Per deployment: guardrail config, extra model fields |
 | E29 | Request status | Every call; cost measured before it ships on by default |
 | E30 | Status surfaces | Python API, per-request lookup, read-only FastAPI router with the app's auth, CLI views |
-| E31 | Metrics and alerts | Labels model + account + region + lane; EMF and Prometheus; alerts as in §3.12 |
+| E31 | Metrics and alerts | Labels model + account + region (+ priority on wait-time metrics); EMF and Prometheus; alerts as in §3.12 |
 | E32 | Cost | Token metrics only |
 | E33 | Privacy | No text in status or logs; optional per-model `debug_capture` |
 | E34 | Streaming | Queued and direct; a mid-stream failure is an error event with the partial text |
@@ -1157,7 +1419,7 @@ off (uat / prod today) there is nothing to drain.
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
 | E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
-| E41 | Tests | fakellm scenarios B01-B58; a small `live` suite off by default; balancing bench gated |
+| E41 | Tests | fakellm scenarios B01-B92; a small `live` suite off by default; balancing bench gated |
 | E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
@@ -1190,21 +1452,41 @@ off (uat / prod today) there is nothing to drain.
 | E74 | New deployment | Takes its full share at once (limiter starts at its cap) |
 | E75 | Health | `llmq.health()` and `GET /llmq/health` |
 | E76 | Budget keys | One hash per deployment under the model tag (`P:{m:ALIAS}:rate:DEPLOYMENT`); `P:{m:ALIAS}:rot`, `P:{a:ACCOUNT}:rate` |
-| E77 | Priority on the stream backend | A priority stream and a normal stream under one queue name; one receive call reads priority first |
+| E77 | Priority on both backends | Replaced by E92: a queue pair per model |
 | E78 | "Left" for `headroom` | Limit minus used in the current minute; the smaller of the RPM and TPM shares |
 | E79 | Reserves | A cap per class: normal ≤ 80 %, priority ≤ 90 % of each budget by default; `priority_reserve: 0` for models without priority traffic |
-| E80 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added; workers accept v1 and v2 during the upgrade rule of §6.1 |
+| E80 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `allowed_accounts`, `max_wait_secs`, `tenant_id` added; 0.3 workers accept version 2 only |
 | E81 | Expired calls | Status `expired`; the caller gets `rate_limited` with `retry_after_secs` |
 | E82 | One admission call | The concurrency slot is taken inside `PICK_TAKE`; overhead target ≤ 20 ms p95 with no backlog (B34) |
-| E83 | No fast path | Every call goes through the queue, also when budget is free; the direct path stays only for the kill switch, `queue_pct` and queue-store failover |
+| E83 | No fast path | Every call goes through the queue, also when budget is free; the direct path stays for the kill switch, `queue_pct`, queue-store failover, sync calls and direct streaming |
 | E84 | Request status | Full by default, written inside pipelines that are sent anyway; `request_status: full \| final \| off` per model |
 | E85 | Stream chunks | First chunk at once, then batched for `stream_flush_ms` (30) |
 | E86 | Usable check | Health, breaker and latency are read inside `PICK_TAKE` on every call; no cache in the pod |
-| E87 | Waiting for budget | The worker holds the head call per model and class and stops reading; no receive-and-defer loop; strict first in, first out |
+| E87 | Waiting for budget | The worker holds the head call per model and class and stops reading; no receive-and-defer loop; order across processes is kept in the store (E93) |
 | E88 | Admission round trip | Claim + `PICK_TAKE` (budget, slot, in-progress entry) in one round trip; no status write at admission; 4 worker store calls per request |
 | E89 | Output reservation | `output_reserve`: `max_tokens` (default) or `observed` (p90 of recent output), per model |
 | E90 | Strategy per class | `balance_priority` for priority calls; chat models use `ordered` to stay in the home region |
 | E91 | Later optimisations | Embedding multi-text messages, client warm-up, replica status reads, compression, worker pods: after the first benchmark |
+| E92 | Priority storage | Two queues per model on both backends: `<name>` and `<name>-priority` |
+| E93 | Order | Kept in the store: waiters per model and class, oldest first; normal calls wait while a priority call waits, keeping `normal_min_share` |
+| E94 | Grant ownership | Owner token on lease and in-progress entry; `PICK_TAKE` is repeat-safe; `PICK_UNDO` |
+| E95 | Account budget | Checked and taken inside `PICK_TAKE` |
+| E96 | Caller gone | Calls are cancelled automatically when the awaiting task is cancelled or the calling pod is dead |
+| E97 | Timeouts | Call 120 s, attempt 60 s for chat; attempt must be below the call timeout; `stream_idle_secs` 30 |
+| E98 | Attempts | `max_attempts` 4 per call; retry budget 20 % per model and minute |
+| E99 | Health safeguards | Request-caused errors do not count; the last usable deployment is never auto-disabled; credential errors are per process; `model_unavailable` at once |
+| E100 | Registry safety | Compare-and-set, rollback by a new version, lenient read, protected fields under `registry_live_edit=safe`, audit as diffs plus log |
+| E101 | No compatibility with 0.2 | Clean cut: queues emptied, 0.3 deployed, nothing carried over; version 2 messages only |
+| E102 | Duplicate request ids | Results read without delete; key includes user and params; `request_id_conflict`, `result_expired` |
+| E103 | Stream redelivery | A redelivered stream ends with `worker_lost` and the partial text; never restarted in the same stream |
+| E104 | Stores | Both `noeviction`; out of memory is its own error; `max_waiting` 50,000; the store's clock everywhere |
+| E105 | Shared quota | `quota_share` per environment |
+| E106 | Residency | `residency.allowed_regions`, deploy only; profiles declare `routes_to` |
+| E107 | Text at rest | TTL per key, TLS and encryption required, dead letters kept 1 day, keyed id hashing |
+| E108 | Operations | `block`, `drain`, `dlq`, `registry log`; `/health/live` and `/health/ready`; `wait_reason` and `tried` in the status |
+| E109 | No quota numbers | Limiter only; `exhausted` = no slot; `headroom` refused |
+| E110 | Work plan | Reordered into A0-A17 (§6) |
+| E111 | Per-user limits | Not in 0.3; `register_admission` can reject by user |
 | E55 | Inference parameters | Optional defaults per model (and per level): `temperature`, `top_p`, `max_tokens`, `stop`, `top_k`, `seed`, penalties, `extra`; embedding `dimensions`, `normalize`, `input_type`, `truncate`. The call wins unless the name is locked; `inference_limits` cap `max_tokens` |
 | E56 | Settings shape | Every setting optional, the same names at four levels, flat `rpm` / `tpm`, unknown names refused; full reference in §3.9 |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
@@ -1278,3 +1560,62 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 | S16 | A call could wait its whole timeout for quota | Optional `max_wait_secs` per model and per call |
 | S17 | Model parameters (temperature, max tokens, ...) had to be repeated by every caller and could not be changed live | `inference` defaults and `inference_limits` at every level |
 | S18 | Token accounting was only one line in the plan; the code refunds nothing on a failed attempt and misses Cohere usage | §3.7a with T1-T8 |
+
+## 10. Second review: gaps found and fixed (2026-11-12)
+
+Five reviewers read the plan, the walkthrough and the 0.2.1 code from five angles: consistency,
+admission and budgets, failures and lifecycle, feasibility against the code, scenarios and
+configuration. Every row is fixed in the section named.
+
+| # | Gap | Fix | Where |
+|---|---|---|---|
+| R1 | Slot and in-progress entry were keyed by request id: a duplicate delivery could remove the running call's slot | Owner token; `PICK_TAKE` repeat-safe; `PICK_UNDO` | §3.18, B59 |
+| R2 | First in, first out held only inside one process; a large call could wait until it expired; priority had no precedence once calls were held | Waiters kept in the store, oldest first; normal waits while priority waits | §3.18, B60, B65 |
+| R3 | A held call restricted to one region blocked unrestricted calls behind it | A restricted call that is refused steps aside | §3.18, B61 |
+| R4 | The account budget was checked after the pick: the same full account was picked again and again | Checked inside `PICK_TAKE` | §3.4, B62 |
+| R5 | A held call had no rule for visibility, claim or cancel | Heartbeats kept; "still mine and not cancelled" check on every retry | §3.18, B63 |
+| R6 | Priority and normal streams shared bookkeeping; ids could collide | Two queues per model | §3.2, E92 |
+| R7 | The priority shares were not defined for concurrency slots | Leases counted per class | §3.18, B64 |
+| R8 | A slot refusal returned wait 0: busy loop | Floor of 50 to 200 ms with jitter | §3.18, B66 |
+| R9 | `output_reserve: observed` had no writer and a wrong overshoot bound | Sample in the store, read by the script; bound stated | §3.18, B57 |
+| R10 | A refund landing in the next minute corrupted the counters | Grants stamped with their minute | §3.18, B67 |
+| R11 | `headroom` ranked by minute counters while admission used the smooth clock | Ranked by clock debt; ranking walked to the first with budget | §3.18 |
+| R12 | A retry excluded the failed deployment even when the others were full | Failed deployment is the last choice | §3.18 |
+| R13 | Rotation state per candidate list; fallback regions mixed with confirmed; sticky sessions flapped | State per deployment; groups are tiers; `sticky_move_after_secs` | §3.18 |
+| R14 | Model fallback: status looked under the wrong model, queue jumping, bounce | Status written at admission; `require_headroom_pct`; not transitive | §3.18 |
+| R15 | Pod clocks decided ages and visibility | The store's clock everywhere | §3.18, B81 |
+| R16 | Requests the model rejects could auto-disable every deployment | Request-caused errors not counted; last usable never disabled | §3.18, B68 |
+| R17 | The registry could not be rolled back; an unknown name stopped older pods | Rollback by a new version; lenient read | §3.18, B69 |
+| R18 | Moving from 0.2 could strand messages; mixed versions unclear | No compatibility with 0.2: clean cut | §6.1, E101 |
+| R19 | A redelivered streaming call restarted in the same stream | Ends with `worker_lost` and the partial text | §3.18, B70 |
+| R20 | A dead worker's in-progress entries stayed until the call deadline | Lease expiry renewed on the heartbeat; swept within 60 s | §3.2, B71 |
+| R21 | No limit on attempts per call; retry storms in a brownout | `max_attempts`, `retry_budget_pct` | §3.18, B72 |
+| R22 | Attempt timeout (180 s) above the call deadline (90 s): a hung region was never retried | 120 s / 60 s and a boot check | §3.18, B73 |
+| R23 | Duplicate request ids: results deleted on read, expired results, another user's result | Read without delete; key includes user and params | §3.18, B74 |
+| R24 | Caller shutdown and death were undefined; dead callers' calls spent quota | Automatic cancel; shutdown order; grace period | §3.18, B75 |
+| R25 | No memory design for the stores; no limit on waiting calls | `noeviction` on both; `max_waiting`; out of memory handled apart | §3.18, B76 |
+| R26 | A credential failure failed calls; one bad pod could disable an account | Per process; calls move to another account | §3.18, B77 |
+| R27 | No usable deployment: calls waited to the deadline; the health route could remove every pod | `model_unavailable`; `/health/live` and `/health/ready` | §3.18, B78 |
+| R28 | Registry edits could overwrite each other; a store flush lost the registry | Compare-and-set; reset detection | §3.18, B69 |
+| R29 | Removing or renaming a model stranded messages | Two-step removal, `drain`, `registry gc` | §3.18, B79 |
+| R30 | The caller of a dead-lettered call was not told | `dead_lettered` reply, metric, alert, `dlq` commands | §3.18, B80 |
+| R31 | A late status write could replace a final state | Final states are never replaced; TTL rule | §3.18 |
+| R32 | Alerts were sent at most once | State alerts are gauges | §3.18 |
+| R33 | Each environment believed it owned the whole account quota | `quota_share` | §3.18, B83 |
+| R34 | Prompts and responses at rest were not covered by the privacy rules | Table of text at rest with a TTL per key; TLS and encryption | §3.18, B86 |
+| R35 | Anyone reaching the store could change `base_url`, a role or guardrail params live | `registry_live_edit=safe` | §3.18, B85 |
+| R36 | No hard guard on the regions a model may reach | `residency.allowed_regions`; `routes_to` on profiles | §3.18, B84 |
+| R37 | Id hashing was not specified | Keyed hash everywhere outside the message | §3.18 |
+| R38 | The audit was not durable and held role ARNs | Diffs plus a redacted log event | §3.18 |
+| R39 | No way to block a region, read the audit, replay dead letters or see why a call waited | `block`, `registry log`, `dlq`, `wait_reason`, new metrics | §3.18, B87 |
+| R40 | Behaviour without quota numbers was undefined | Limiter only; rules stated | §3.18, B82 |
+| R41 | Embedding models lost 20 % of their quota to an unused reserve | `priority_reserve` 0 for embeddings | §3.9 |
+| R42 | Rotating the store password or an API key needed a restart | Re-read on an auth error | §3.18, B90 |
+| R43 | About 40 rules had no test; several pass conditions were vague | B59-B92; exact pass conditions | §5 |
+| R44 | Settings defined twice or missing from the reference | One row each; infrastructure table | §3.9, §3.18 |
+| R45 | Stale text: lanes, the defer loop, a separate slot step, "provider" budget, "proposed" markers | Corrected in both documents | §3.2-§3.4, §3.14 |
+| R46 | The work plan could not be built in its order | Reordered into A0-A17 | §6 |
+| R47 | Wrong technical claims: trimming chunk streams, "0 lost" with replica waits, store-call count | Streams fail instead of trimming; B23 reworded; receive pipelined | §3.18, §5 |
+| R48 | Missing user stories | U16-U25 | §4 |
+| R49 | One user could flood a model | Not in 0.3; admission hook | §3.18, E111 |
+| R50 | `worker_slots` was listed as live-editable | Marked deploy | §3.9 |

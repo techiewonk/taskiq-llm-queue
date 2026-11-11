@@ -4,9 +4,8 @@ This page explains the 0.3 design one step at a time, with the data that exists 
 It is the companion of [ACCOUNT_ROUTING_PLAN.md](ACCOUNT_ROUTING_PLAN.md): the plan holds the
 rules and decisions, this page shows them working on one example.
 
-Status: **design, nothing built**. Key names and fields marked *(proposed)* are not fixed in the
-plan yet; they are settled in steps A1 and A4 and were decided on 2026-11-12 (§14). Every
-other name comes from the plan or from the 0.2.1 code.
+Status: **design, nothing built**. Key names follow plan decisions E76 to E94; the rules added
+by the second review (2026-11-12) are in plan §3.18 and summarised in §14 here.
 
 Contents: 1 the parts · 2 words · 3 example config · 4 every key in the stores · 5 start-up ·
 6 one request, step by step · 7 RPM and TPM in depth · 8 when something goes wrong ·
@@ -62,7 +61,7 @@ One document, `LLMQ_REGISTRY`, read from the secret or env. This walkthrough use
 ```json
 {
   "registry_version": 7,
-  "defaults": {"timeout_secs": 90, "priority_reserve": 0.2, "normal_min_share": 0.1,
+  "defaults": {"timeout_secs": 120, "priority_reserve": 0.2, "normal_min_share": 0.1,
                "balance": "ordered", "store_down": "pause", "worker_slots": 20,
                "inference": {"temperature": 0.2, "max_tokens": 2048}},
   "routing": {"kill_switch": false},
@@ -108,7 +107,7 @@ After resolving, the library holds this table in memory (rebuilt on every regist
 | embed-titan | aws-main/ap-south-1 | confirmed | 2000 | not used | — | ordered | model |
 | embed-titan | aws-main/ap-south-2 | confirmed | 2000 | not used | — | ordered | model |
 
-`llm-queue registry get gpt120b --effective` prints this table with the level of every value.
+`llm-queue settings get --model gpt120b` prints this table with the level of every value.
 
 ## 4. Every key in the stores
 
@@ -117,15 +116,16 @@ tag `{m:ALIAS}` so one script can read and change them together.
 
 ### 4.1 Queue store (per model queue)
 
-Queue name: `<prefix>llm-<alias>`, for example `ra-prod-llm-gpt120b`.
+Each model has two queues: `<prefix>llm-<alias>` for normal calls and `<prefix>llm-<alias>-priority`
+for priority calls, for example `ra-prod-llm-gpt120b` and `ra-prod-llm-gpt120b-priority`. Workers
+read the priority queue first. Each queue has the keys below.
 
 | Key | Type | Holds | Sample |
 |---|---|---|---|
-| `{P:q:NAME}:s` | Stream | Waiting messages, normal calls | `1731400000123-0 → {mid, body, attrs, sent}` |
-| `{P:q:NAME}:sp` *(proposed)* | Stream | Waiting messages, priority calls (served first) | same shape |
+| `{P:q:NAME}:s` | Stream | Waiting messages | `1731400000123-0 → {mid, body, attrs, sent}` |
 | `{P:q:NAME}:vis` | Sorted set | Messages a worker has received and not finished; score = when it becomes visible again | `1731400000123-0 → 1731400060.1` |
-| `{P:q:NAME}:rc` | Hash | Receive count per message | `1731400000123-0 → 1` |
-| `{P:q:NAME}:delay` | Sorted set | Deferred messages; score = when to put them back | `<message> → 1731400002.4` |
+| `{P:q:NAME}:rc` | Hash | Per message: generation (every receive) and failures (crashes only; compared with `max_receives`) | `1731400000123-0 → gen 1, fails 0` |
+| `{P:q:NAME}:delay` | Sorted set | Delayed sends; score = when to add them | `<message> → 1731400002.4` |
 | `{P:q:NAME}:dlq` | Stream | Dead letters (failed `max_receives` times) | |
 | `{P:q:NAME}:cfg` | Hash | Queue attributes | `visibility_secs=60, max_receives=10, retention_secs=345600` |
 
@@ -136,19 +136,21 @@ Queue name: `<prefix>llm-<alias>`, for example `ra-prod-llm-gpt120b`.
 | `P:{reg}:doc` | String (JSON) | The registry document | none | publish at boot, live edits |
 | `P:{reg}:version` | Hash | `version=7, hash=ab12…, changes=3` | none | publish, live edits |
 | `P:audit` | Stream | Every publish and edit: who, when, before, after | 90 days | publish, live edits |
-| `P:{m:ALIAS}:rate:DEPLOYMENT` *(proposed)* | Hash | RPM / TPM budget of one deployment (§7) | 2 min idle | `PICK_TAKE`, token correction |
-| `P:{a:ACCOUNT}:rate` *(proposed)* | Hash | Account-wide `shared_rpm` / `shared_tpm`, when set | 2 min idle | `RATE` |
-| `P:{m:ALIAS}:rot` *(proposed)* | Hash | Rotation state for `round_robin` / `weighted` | none | `PICK_TAKE` |
+| `P:{m:ALIAS}:rate:DEPLOYMENT` | Hash | RPM / TPM budget of one deployment (§7) | 2 min idle | `PICK_TAKE`, token correction |
+| `P:{a:ACCOUNT}:rate` | Hash | Account-wide `shared_rpm` / `shared_tpm`, when set | 2 min idle | `PICK_TAKE` |
+| `P:{m:ALIAS}:wait:p`, `:wait:n` | Sorted set | Waiters per class: held calls ordered by queue position; only the oldest is granted | twice the wait | `PICK_TAKE` |
+| `P:caller:POD` | String | Liveness of a calling pod; waiting calls of a dead pod are dropped | 30 s | every process |
+| `P:{m:ALIAS}:rot` | Hash | Rotation state for `round_robin` / `weighted` | none | `PICK_TAKE` |
 | `P:{m:ALIAS}:ac:DEPLOYMENT` | Hash | Adaptive concurrency limit: `limit=24, ok_count=…, paused_until=0` | none | limiter scripts |
 | `P:{m:ALIAS}:lease:DEPLOYMENT` | Sorted set | Slots in use: request id → lease expiry | none | limiter scripts |
 | `P:{m:ALIAS}:cb:DEPLOYMENT` | Hash | Circuit breaker: `state=closed, failures=0` | none | breaker script |
 | `P:{m:ALIAS}:health` | Hash | Per deployment: error count, `disabled_until`, next probe, p95 latency | none | health script, prober |
-| `P:{m:ALIAS}:inprog` | Sorted set | Calls in progress: request id → deadline | none | worker |
-| `P:{m:ALIAS}:inprog:ID` *(proposed)* | Hash | `deployment, priority, attempt, started` of one call in progress | deadline | worker |
-| `P:{m:ALIAS}:sticky:SESSION` *(proposed)* | String | Deployment a session sticks to (only when sticky is on) | 30 min idle | worker |
+| `P:{m:ALIAS}:inprog` | Sorted set | Calls in progress: owner token → lease expiry (renewed on the heartbeat) | none | `PICK_TAKE` (add), finish or sweeper (remove) |
+| `P:{m:ALIAS}:inprog:ID` | Hash | `owner, deployment, priority, attempt, started` of one call in progress | lease | `PICK_TAKE` (add), finish or sweeper (remove) |
+| `P:{m:ALIAS}:sticky:SESSION` | String | Deployment a session sticks to (only when sticky is on) | 30 min idle | worker |
 | `P:req:ID` | Hash | Request status (§6, §11) | 30 min | caller, worker |
 | `P:{r:ID}:job` | Hash | Claim of the message: `state, worker, heartbeat, failures` (stops two workers running one call) | deadline | claim scripts |
-| `P:{r:ID}:res` | String (JSON) | The result | 5 min | worker |
+| `P:{r:ID}:res` | String (JSON) | The result (read without deleting, so a duplicate request id gets it too) | 5 min | worker |
 | `P:req:ID:chunks` | Stream | Stream chunks of a streaming call | 5 min | worker |
 
 ## 5. Start-up, step by step
@@ -176,7 +178,7 @@ Version rule in step 4:
 | version 6 | version 7 | Config is ignored (an old pod during a rolling deploy) |
 
 Provider clients are built on first use: one per (account, region), with the account's
-credentials (pod identity, or an assumed role refreshed every hour).
+credentials (pod identity, or an assumed role with 1 h sessions refreshed 5 min early).
 
 ## 6. One request, step by step
 
@@ -209,7 +211,8 @@ reply = await llmq.converse("gpt120b", params, priority=True,
 | Admission hook | none registered | a hook may reject or tag the call |
 | Same `request_id` seen before | no | yes would return the first run's result instead of running again |
 
-The direct path skips steps 4 and 5 only: it takes budgets and a slot exactly like a worker.
+The direct path skips the queue send of step 4 and step 5 only: it writes the status and takes
+budgets and a slot exactly like a worker, in the same waiter order.
 
 ### Step 3. Estimate tokens (caller)
 
@@ -229,20 +232,20 @@ State store, `P:req:req-7f3a`:
 
 ```json
 {"state": "waiting", "model": "gpt120b", "priority": 1, "op": "converse",
- "est_tokens": 7096, "enqueued_at": 1731400000.10, "deadline_at": 1731400090.10,
+ "est_tokens": 7096, "enqueued_at": 1731400000.10, "deadline_at": 1731400120.10,
  "session": "5c1e…(hashed)", "attempts": 0}
 ```
 
-Queue store, appended to the priority stream of `ra-prod-llm-gpt120b`. The message body is the
-envelope (0.2.1 fields; `lane` is removed and the fields marked ← are new, *proposed*):
+Queue store, sent to the priority queue `ra-prod-llm-gpt120b-priority`. The message body is the
+envelope (0.2.1 fields; `lane` is removed and the fields marked ← are new):
 
 ```text
 {"v": 2, "request_id": "req-7f3a", "session_id": "s-91", "op": "converse",
  "model": "gpt120b", "priority": true,                     ←
- "allow_fallback": "any", "allowed_regions": null,         ←
- "max_wait_secs": 30,                                      ←
+ "allow_fallback": "all", "allowed_regions": null, "allowed_accounts": null,         ←
+ "max_wait_secs": 30, "tenant_id": null,                    ←
  "params": {"messages": [...], "inferenceConfig": {"maxTokens": 4096, "temperature": 0.2}},
- "est_tokens": 7096, "enqueued_at": 1731400000.10, "deadline_at": 1731400090.10,
+ "est_tokens": 7096, "enqueued_at": 1731400000.10, "deadline_at": 1731400120.10,
  "reply_to": "pod-a"}
 ```
 
@@ -251,7 +254,7 @@ Nothing has been taken from RPM or TPM yet: **a waiting call costs no budget**.
 
 ### Step 5. A worker receives the message (worker → queue store)
 
-Any pod's worker reads the queue; priority messages are read before normal ones.
+Any pod's worker reads the model's two queues, the priority queue first.
 
 | Key | Change |
 |---|---|
@@ -297,18 +300,18 @@ RPM budget, 7,096 from its TPM budget and one concurrency slot in the same step 
 nothing) and returns:
 
 ```json
-{"granted": true, "deployment": "aws-main/ap-south-1", "slot": "req-7f3a"}
+{"granted": true, "deployment": "aws-main/ap-south-1", "owner": "req-7f3a:pod-b-3:1"}
 ```
 
 Other strategies with the same data: `ordered` → ap-south-1 (first in config);
 `round_robin` → the next one in the shared rotation; `weighted` → by `weight`.
 
-### Step 7. The concurrency slot and the account budget
+### Step 7. The concurrency slot and the account budget (both inside `PICK_TAKE`)
 
 | Check | Key | Here |
 |---|---|---|
 | Concurrency slot (adaptive limiter), taken inside `PICK_TAKE` | `P:{m:gpt120b}:ac:aws-main/ap-south-1`, `…:lease:…` | limit 24, 11 in use → slot granted, `lease: req-7f3a → now + 90 s`. A deployment with no free slot counts as full in step 6 |
-| Account-wide cap (`shared_rpm` / `shared_tpm`), a second call only when set | `P:{a:aws-main}:rate` | not set, skipped. When set and full, the tokens and the slot of step 6 go back and the call waits |
+| Account-wide cap (`shared_rpm` / `shared_tpm`), checked inside `PICK_TAKE` when set | `P:{a:aws-main}:rate` | not set, skipped. When set and full, the deployments of that account are skipped like any deployment without budget |
 
 The limiter is the safety net: it learns the real concurrency the provider accepts and shrinks
 on throttles, whatever the configured RPM says.
@@ -316,7 +319,7 @@ on throttles, whatever the configured RPM says.
 ### Step 8. Mark in progress (written by `PICK_TAKE` in step 6, no extra call)
 
 ```
-P:{m:gpt120b}:inprog                 req-7f3a → 1731400090.10          (deadline)
+P:{m:gpt120b}:inprog                 req-7f3a → 1731400120.10          (deadline)
 P:{m:gpt120b}:inprog:req-7f3a        {deployment: aws-main/ap-south-1, priority: 1,
                                       attempt: 1, started: 1731400000.31}
 ```
@@ -400,8 +403,8 @@ sequenceDiagram
 `P:{m:gpt120b}:rate:aws-main/ap-south-1` (the same fields the 0.2.1 `RATE` script uses):
 
 ```
-rpm_tat      1731400018.12     # smooth mode: the time up to which RPM is already spent
-tpm_tat      1731400020.40     # same for TPM
+rpm_tat      1731400003.12     # smooth mode: the time up to which RPM is already spent
+tpm_tat      1731400004.40     # same for TPM
 seen_win     28856666          # the current minute (for the status view)
 seen_calls   150               # requests started in this minute
 seen_tokens  136000            # tokens charged in this minute
@@ -486,7 +489,7 @@ Both confirmed deployments are full when `req-7f3a` arrives.
 
 | Time since send | What happens | Data |
 |---|---|---|
-| 0.2 s | `PICK_TAKE` refuses, wait 0.8 s. The worker **holds** this call and stops reading priority calls of `gpt120b`; the calls behind it stay in the queue untouched | status stays `waiting`; no queue change, receive count unchanged |
+| 0.2 s | `PICK_TAKE` refuses, wait 0.8 s, and registers the call as a waiter. The worker **holds** it and stops reading the priority queue of `gpt120b`; the calls behind it stay in the queue untouched | `P:{m:gpt120b}:wait:p: req-7f3a`; status stays `waiting`, `wait_reason=tpm`; failure count unchanged |
 | 1.0 s | The same worker tries the admission again, refused again | one store call, nothing else |
 | 2.0 s | `fallback.after_secs` (2) passed and the cause `exhausted` is listed → fallback regions are offered too: `us-west-2` | `PICK_TAKE` candidates now include `aws-main/us-west-2` |
 | 2.0 s | Granted on `us-west-2` | reply `meta.fallback = "region"` |
@@ -522,21 +525,26 @@ A model without `fallback` and `model_fallback` simply waits for budget until it
 
 | Step | Data |
 |---|---|
-| Nobody extends the visibility; after 60 s the message is visible again | `{P:q:…}:vis` entry lapses, `rc → 2` |
+| Nobody extends the visibility or the lease; within 60 s the message is visible again | `{P:q:…}:vis` entry lapses, generation 2, failures 1 |
 | The sweeper returns the dead call's slot and removes it from in progress | `lease`, `inprog` entries removed |
 | Another worker runs it | status back to `in_progress` with the new worker |
-| The same message fails 10 times (`max_receives`) | moved to the dead-letter stream, status `failed` |
+| The same message fails 10 times (`max_receives`) | moved to the dead-letter queue; the caller gets `dead_lettered`, status `failed`, one alert |
 
 ### 8.5 The other cases
 
 | Case | What happens |
 |---|---|
-| Same `request_id` sent twice | One provider call; both callers get the same result (within the 5 min result TTL) |
-| `llmq.cancel(id)` | Waiting: removed, status `cancelled`. In progress: the worker stops the attempt, budgets follow the "timeout" rule |
+| Same `request_id` sent twice | One provider call; both callers get the same result (within the 5 min result TTL). Other params or another user with that id: `request_id_conflict`; after the TTL: `result_expired` |
+| `llmq.cancel(id)`, or the caller is gone (task cancelled, calling pod dead) | Waiting: dropped before any budget is taken, status `cancelled`. In progress: the worker stops the attempt, budgets follow the "timeout" rule |
 | Call with `allowed_regions=["ap-south-1"]` | Only deployments in those regions are offered, also for fallback. None left → `no_deployment` at once |
 | State store down | Per model `store_down`: `pause` (default: no call starts without the shared budget; a call waits up to its deadline, then `queue_unavailable`), `static_cap` (a fixed small concurrency per process; quotas may be exceeded), `fail_fast` (`queue_unavailable` at once) |
 | Queue store down, state store up | After a short run of send / receive errors, calls run on the direct path under the same budgets and limiter; queued messages wait in the store; back to the queue when a probe succeeds |
-| Access denied / model not in that region | Counts toward auto-disable (§9); the call moves to another deployment |
+| Access denied / model not in that region | Counts toward auto-disable (§9); the call moves to another deployment. A request that fails this way on two deployments is itself the cause: it fails and is not counted |
+| A region hangs | The attempt is cut after 60 s (`attempt_timeout_secs`) and retried on another region inside the 120 s deadline |
+| Provider brownout | At most 4 attempts per call (`max_attempts`); a model's retries are capped at 20 % of its first attempts per minute |
+| Credentials of one account fail | That account is skipped in that pod only; calls move to another account or fail with `credentials_unavailable` |
+| No deployment of the model is enabled and healthy | `model_unavailable` at once, with `retry_after_secs` |
+| More than `max_waiting` (50,000) calls wait on a model | New sends get `queue_full` |
 
 ## 9. Health of one deployment
 
@@ -551,7 +559,7 @@ A model without `fallback` and `model_fallback` simply waits for budget until it
 | State | Enters when | Leaves when |
 |---|---|---|
 | Usable | enabled, healthy, breaker closed, not paused, not slow | — |
-| Auto-disabled | 3 target errors (access denied, model not in region) in 5 min | A probe call succeeds. First probe after 15 min; each failure doubles the wait, up to 2 h |
+| Auto-disabled | 3 target errors (access denied, model not in region) in 5 min with no success in between; never the last usable deployment | A probe call succeeds. First probe after 15 min; each failure doubles the wait, up to 2 h |
 | Slow (skipped) | p95 above `slow_ratio` × the model's median and above `slow_min_secs`, with ≥ 3 usable deployments | p95 recovers. The last usable deployment is never skipped |
 | Breaker open | Repeated failures | The breaker's own timer and trial call |
 | Disabled by an operator | `llm-queue registry disable gpt120b aws-main/us-east-1` | `… enable …` |
@@ -635,12 +643,12 @@ Setting `rate_limits: "both"` and a `tpm` on the model turns token limiting on f
 
 ## 14. Decisions on the open details
 
-Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E91).
+Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76 to E91; the second review added E92 to E111).
 
 | # | Point | Decision |
 |---|---|---|
 | 1 | Key names | One budget hash per deployment, `P:{m:ALIAS}:rate:DEPLOYMENT`, and the others as listed in §4 |
-| 2 | Priority inside one queue on the stream backend | A second stream `:sp` under the same queue name, read first |
+| 2 | Priority | Two queues per model, `<name>` and `<name>-priority`, on both backends |
 | 3 | Envelope version 2 | `lane` removed; `priority`, `allow_fallback`, `allowed_regions`, `max_wait_secs` added |
 | 4 | "Left" for `headroom` | Limit minus what was used in the current minute |
 | 5 | Reserves | A cap per class: normal ≤ 80 %, priority ≤ 90 %; `priority_reserve: 0` on models without priority traffic |
@@ -658,6 +666,13 @@ Decided on 2026-11-12, choosing the option with the fewest store calls (plan E76
 Store calls of one queued request: caller 1 (status and send, in parallel); worker 4 (receive,
 admit, finish, acknowledge). Target: the queue path adds at most
 20 ms at p95 with no backlog (measured in B34).
+
+**Second review (2026-11-12, plan §10 and §3.18).** Five reviewers found 50 gaps; the ones that
+change this walkthrough: order is kept in the store (waiters, oldest first, priority before
+normal); every grant has an owner token; the account budget is checked inside `PICK_TAKE`;
+timeouts are 120 s per call and 60 s per attempt; a call makes at most 4 attempts; calls of a
+caller that is gone are cancelled; results are read without deleting them; 0.3 keeps no
+compatibility with 0.2.
 
 Still needed from the owner: real RPM / TPM per region for the first four models, and which
 regions are confirmed or fallback. This page uses sample numbers only.
