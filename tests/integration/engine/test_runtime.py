@@ -8,6 +8,7 @@ request ids, the waiting limit and an unusable model. No real LLM is called.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -20,6 +21,7 @@ from aiohttp.test_utils import TestServer
 
 from taskiq_llm_queue.clients import ClientPool, Providers
 from taskiq_llm_queue.engine.errors import CallFailed
+from taskiq_llm_queue.engine.queue import QueueSettings
 from taskiq_llm_queue.engine.runtime import Engine, EngineSettings
 from taskiq_llm_queue.registry.store import RegistryStore
 
@@ -326,3 +328,139 @@ async def test_fallback_policy_hook(make: Make) -> None:
     with pytest.raises(CallFailed) as info:
         await engine.call("big", CHAT)
     assert info.value.kind == "model_unavailable"
+
+
+# ---------------------------------------------------------------- A10: operations
+
+
+async def test_kill_switch_runs_direct_with_budgets(make: Make) -> None:
+    engine, fake = await make(
+        {
+            "big": {
+                "rpm": 2,
+                "priority_reserve": 0,
+                "max_wait_secs": 1,
+                "deployments": {"aws-a": {"confirmed": ["r1"]}},
+            }
+        }
+    )
+    await engine.registry.edit(
+        lambda d: (
+            d["routing"].update(kill_switch=True)
+            if "routing" in d
+            else d.update(routing={"kill_switch": True})
+        ),
+        actor="t",
+    )
+    minute = engine.clock.now() // 60
+    results = await asyncio.gather(
+        *[engine.call("big", CHAT, timeout_secs=3) for _ in range(4)], return_exceptions=True
+    )
+    ok = [r for r in results if not isinstance(r, BaseException)]
+    if engine.clock.now() // 60 == minute:
+        assert len(ok) == 2
+    depth = await engine.queues.depth(engine._queue_name(engine.registry.current, "big", False))
+    assert depth == (0, 0, 0)  # nothing went through the queue
+    assert _stats(fake, f"{GPT}@r1")["calls"] == len(ok)
+
+
+async def test_cancel_waiting_and_running(make: Make) -> None:
+    engine, _ = await make(
+        {"big": {"rpm": 1, "priority_reserve": 0, "deployments": {"aws-a": {"confirmed": ["r1"]}}}},
+        {"defaults": {"latency_ms": {"p50": 3000, "p95": 3000}}},
+    )
+    running = asyncio.create_task(engine.call("big", CHAT, request_id="run", timeout_secs=9))
+    await asyncio.sleep(0.5)
+    waiting = asyncio.create_task(engine.call("big", CHAT, request_id="wait", timeout_secs=9))
+    await asyncio.sleep(0.5)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await engine.cancel("run")
+    await engine.cancel("wait")
+    for task in (running, waiting):
+        with pytest.raises(CallFailed) as info:
+            await task
+        assert info.value.kind == "cancelled"
+    assert loop.time() - started < 2.5  # the running attempt was stopped, not waited out
+
+
+async def test_cancelling_the_awaiting_task_cancels_the_call(make: Make) -> None:
+    engine, _ = await make(scenario={"defaults": {"latency_ms": {"p50": 3000, "p95": 3000}}})
+    task = asyncio.create_task(engine.call("big", CHAT, request_id="gone"))
+    await asyncio.sleep(0.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await engine.state.exists(engine.keys.request("gone", "cancel"))
+
+
+async def test_caller_gone_is_dropped(make: Make, store: redis.asyncio.Redis) -> None:
+    from taskiq_llm_queue.engine.envelope import Envelope
+
+    engine, fake = await make()
+    secs, _ = await store.time()
+    await store.set(engine.keys.epoch, str(secs - 100))  # the store has been up for a while
+    env = Envelope(
+        request_id="ghost-call",
+        op="converse",
+        model="big",
+        params=CHAT,
+        caller="ghost",
+        timeout_secs=5,
+    )
+    await engine.requests.register(
+        "ghost-call",
+        caller="ghost",
+        user_hash="u",
+        params_hash="p",
+        model="big",
+        priority=False,
+        app_id=False,
+    )
+    await engine.requests.confirm("ghost-call", keep_secs=5)
+    await engine.queues.send(
+        engine._queue_name(engine.registry.current, "big", False), env.dumps(), QueueSettings()
+    )
+    for _ in range(50):
+        status = await engine.requests.status("ghost-call")
+        if status.get("state") == "cancelled":
+            break
+        await asyncio.sleep(0.1)
+    assert status["state"] == "cancelled"
+    assert _stats(fake, f"{GPT}@r1") == {}  # never reached the provider
+
+
+async def test_store_down_modes(make: Make) -> None:
+    from taskiq_llm_queue.engine.envelope import Envelope
+
+    engine, fake = await make(
+        {"small": {"store_down": "static_cap"}, "big": {"store_down": "fail_fast"}}
+    )
+    view = engine.registry.current
+    env = Envelope(
+        request_id="x", op="converse", model="small", params=CHAT, caller="c", timeout_secs=5
+    )
+    reply = await engine._store_down(view, "small", env, ConnectionError("down"))
+    assert reply.ok
+    assert _stats(fake, f"{SMALL}@r1")["ok"] == 1
+    fast = Envelope(
+        request_id="y", op="converse", model="big", params=CHAT, caller="c", timeout_secs=5
+    )
+    with pytest.raises(CallFailed) as info:
+        await engine._store_down(view, "big", fast, ConnectionError("down"))
+    assert info.value.kind == "queue_unavailable"
+
+
+async def test_store_reset_reregisters_running_calls(
+    make: Make, store: redis.asyncio.Redis
+) -> None:
+    engine, _ = await make(scenario={"defaults": {"latency_ms": {"p50": 2000, "p95": 2000}}})
+    task = asyncio.create_task(engine.call("big", CHAT, request_id="long"))
+    await asyncio.sleep(0.6)
+    keys = [k async for k in store.scan_iter(match=f"{engine.keys.prefix}:*", count=500)]
+    await store.delete(*keys)  # the store lost everything (flush / failover)
+    await engine._check_epoch()
+    assert await store.exists(engine.keys.model("big", "inprog:long"))
+    assert await store.exists(engine.keys.epoch)
+    with contextlib.suppress(CallFailed):  # the call's own records were lost with the store
+        await task

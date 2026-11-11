@@ -155,6 +155,12 @@ class ClientPool:
         self._openai[account.name] = client
         return client
 
+    def forget(self, route: Route) -> None:
+        """Drop an account's cached clients so the next call reads its credentials again."""
+        for key in [k for k in self._bedrock if k[0] == route.account.name]:
+            del self._bedrock[key]
+        self._openai.pop(route.account.name, None)
+
     async def aclose(self) -> None:
         """Close every client; safe to call more than once."""
         async with self._lock:

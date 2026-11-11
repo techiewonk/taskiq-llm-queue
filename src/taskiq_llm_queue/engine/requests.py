@@ -19,6 +19,21 @@ if TYPE_CHECKING:
 
 FINAL_STATES = ("done", "failed", "expired", "cancelled")
 
+# KEYS: callers, epoch. ARGV: caller key prefix, caller ttl secs. Reply: 1 when any caller of
+# the call is alive, or the store came back less than a TTL ago (keys not renewed yet).
+CALLERS_ALIVE = """
+local t = redis.call('TIME')
+local now = tonumber(t[1])
+local epoch = tonumber(redis.call('GET', KEYS[2]) or '')
+if not epoch or now - epoch < tonumber(ARGV[2]) then return 1 end
+local callers = redis.call('SMEMBERS', KEYS[1])
+if #callers == 0 then return 1 end
+for _, caller in ipairs(callers) do
+  if redis.call('EXISTS', ARGV[1] .. caller) == 1 then return 1 end
+end
+return 0
+"""
+
 # KEYS: job, callers, status, result. ARGV: user hash, params hash, caller, unconfirmed ttl,
 # status ttl, model, priority, takeover grace secs.
 # Reply: new | attached | takeover | done | expired | conflict.
@@ -166,6 +181,7 @@ class RequestStore:
         self._put = client.register_script(RESULT_PUT)
         self._take = client.register_script(RESULT_TAKE)
         self._status = client.register_script(STATUS_SET)
+        self._alive = client.register_script(CALLERS_ALIVE)
 
     def _req(self, request_id: str) -> tuple[str, str, str, str]:
         k = self.keys
@@ -252,6 +268,13 @@ class RequestStore:
         """The status hash of a request (empty when unknown or expired)."""
         raw = await self._client.hgetall(self.keys.status(request_id))
         return {_text(k): _text(v) for k, v in (raw or {}).items()}
+
+    async def callers_alive(self, request_id: str, *, prefix: str, caller_ttl: int) -> bool:
+        """False only when every caller of the call is gone (and the store is not new)."""
+        reply = await self._alive(
+            [self._req(request_id)[1], f"{prefix}:epoch"], [f"{prefix}:caller:", caller_ttl]
+        )
+        return bool(reply)
 
     async def callers(self, request_id: str) -> Sequence[str]:
         """Callers waiting on a request id."""

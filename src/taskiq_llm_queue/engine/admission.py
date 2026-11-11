@@ -116,6 +116,7 @@ class Admission:
         self._undo = client.register_script(lua.UNDO)
         self._renew = client.register_script(lua.RENEW)
         self._sweep = client.register_script(lua.SWEEP)
+        self._reregister = client.register_script(lua.REREGISTER)
 
     async def _call(self, script: Any, body: dict[str, Any]) -> Any:
         return await script([], [self.keys.prefix, orjson.dumps(body)])
@@ -201,6 +202,13 @@ class Admission:
             "items": [{"alias": a, "owner": o, "request_id": r} for a, o, r in items],
         }
         return int(await self._call(self._renew, body))
+
+    async def reregister(self, items: Sequence[dict[str, Any]]) -> int:
+        """After a store reset, put back the slots and entries of running calls."""
+        if not items:
+            return 0
+        body = {"lease_ms": self.lease_ms, "items": list(items)}
+        return int(await self._call(self._reregister, body))
 
     async def sweep(self, alias: str) -> int:
         """Remove in-progress entries of owners that stopped renewing."""

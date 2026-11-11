@@ -94,6 +94,12 @@ STEPS: dict[str, Step] = {
         tests=("tests/unit/engine", "tests/integration/engine/test_runtime.py"),
         needs_stack=True,
     ),
+    "a10": Step(
+        "Operations: direct path, store_down, cancel, caller gone, shutdown, store reset",
+        sources=("src/taskiq_llm_queue/engine", "src/taskiq_llm_queue/clients"),
+        tests=("tests/integration/engine",),
+        needs_stack=True,
+    ),
 }
 
 

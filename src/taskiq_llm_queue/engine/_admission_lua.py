@@ -34,9 +34,14 @@ local function avail(key, f, L, bf, mode)
 end
 
 -- Room for cost c behind R reserved units: returns wait ms (0 = fits) and the new state.
+local reset_minute = num(redis.call('GET', P .. ':reset_minute'), -1)
 local function room(key, f, L, c, R, bf, mode)
   local burst = math.max(1, math.floor(L * bf))
   if mode == 'fixed' then
+    -- After a store reset, a fixed window holds until the next minute (plan T10).
+    if reset_minute == minute and hnum(key, f .. '_win', -1) ~= minute then
+      return (minute + 1) * 60000 - now, nil
+    end
     local _, n = avail(key, f, L, bf, mode)
     if n + R + c <= L or (n == 0 and R == 0 and c > L) then return 0, n + c end
     return (minute + 1) * 60000 - now, nil
@@ -545,6 +550,28 @@ for _, item in ipairs(req.items) do
   end
 end
 return renewed
+"""
+)
+
+# req: {lease_ms, items: [{alias, owner, request_id, dep, cls, cost_r, cost_t}]}. After a
+# store reset, put back the slots and entries of calls still running (plan T10).
+REREGISTER = (
+    _COMMON
+    + r"""
+local done = 0
+for _, item in ipairs(req.items) do
+  local until_ = now + num(req.lease_ms, 60000)
+  redis.call('ZADD', mk(item.alias, 'lease:' .. item.dep .. ':' .. item.cls), until_, item.owner)
+  redis.call('ZADD', mk(item.alias, 'inprog'), until_, item.owner)
+  local entry_key = mk(item.alias, 'inprog:' .. item.request_id)
+  local worker = string.match(item.owner, '^.*|([^|]*)|[^|]*$') or ''
+  redis.call('HSET', entry_key, 'owner', item.owner, 'worker', worker, 'dep', item.dep,
+    'cls', item.cls, 'minute', minute, 'cost_r', item.cost_r, 'cost_t', item.cost_t,
+    'started', now, 'request', item.request_id, 'served', item.alias)
+  redis.call('PEXPIRE', entry_key, num(req.lease_ms, 60000) * 2)
+  done = done + 1
+end
+return done
 """
 )
 
