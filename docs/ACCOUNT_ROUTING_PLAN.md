@@ -1572,6 +1572,8 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 Two releases (decided 2026-11-12): 0.3.0 is everything the app needs to run on one AWS account;
 0.3.1 adds the second account, sticky sessions, latency exclusion and streaming to the caller.
 Each gate sits on the first step where it can pass.
+The new engine is built next to the 0.2 code and replaces it in one cut (E144); the 0.2
+modules are deleted in that step, not kept for compatibility.
 
 The first setup used for seeds and scenario numbers: `gpt120b` (`openai.gpt-oss-120b-1:0`, chain
 to `gpt20b`), `gpt20b` (`openai.gpt-oss-20b-1:0`), `embed-titan` (`amazon.titan-embed-text-v2:0`),
@@ -1741,6 +1743,7 @@ satisfies it, and a worker returns a message it does not understand instead of d
 | E141 | Live tests | About 20 real calls, run by hand before a release; never in the normal test run |
 | E142 | Timeout cap | `timeout_max_secs` per model, default 900 |
 | E143 | Verification results | `max_tokens` is reserved up front by Bedrock: `observed` refused for `bedrock` models; `tpm_count_cached` false; embeddings on RPM only confirmed (§12) |
+| E144 | Build order | The new engine is built next to the 0.2 code (registry, client pool and providers, admission, worker loop), each step green on its own; `LLMQueue` then switches over in one cut and every 0.2 module it no longer uses (targets, lanes, `LiveConfigStore`, model settings, fallback chains, routing config, `PodRegistry`, the 0.2 providers and core) is deleted in the same step. No compatibility layer is kept |
 
 ## 8. Needed from the owner
 

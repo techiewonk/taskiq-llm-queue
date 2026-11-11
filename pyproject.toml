@@ -128,7 +128,7 @@ ignore_missing_imports = true
 # Test helpers are imported by bare name (pytest puts their folder on sys.path); the helper
 # files themselves are still type-checked as part of `files`.
 [[tool.mypy.overrides]]
-module = ["fakellm_testkit", "providers_fake"]
+module = ["fakellm_testkit", "providers_fake", "clients_testkit"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -51,6 +51,11 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/registry",),
         needs_stack=True,
     ),
+    "a3": Step(
+        "Clients per account and region; providers on routes; attempt timers",
+        sources=("src/taskiq_llm_queue/clients",),
+        tests=("tests/unit/clients",),
+    ),
 }
 
 
