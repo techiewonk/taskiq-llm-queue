@@ -40,9 +40,9 @@ loop ([ARCHITECTURE §4b, §5, §5a](ARCHITECTURE.md)).
 | **Account** | Where calls are billed and quota lives; has its own credentials and provider kind | `aws-main` (pod identity), `aws-dr` (assume role), `vllm-dc1` (API key) |
 | **Region group** | Per model and account: `confirmed` (normal serving) and `fallback` (used only under the model's fallback rule) | confirmed `ap-south-1`, `ap-south-2`; fallback `ap-southeast-2` |
 | **Deployment** | One model served from one account + region, or from an inference profile. Replaces `Target` | `gpt120b @ aws-main/ap-south-1` |
-| **Model policy** | Per model: balancing strategy, fallback rule, stickiness, Valkey-down mode, tenant share | `balance=headroom`, `fallback.lanes=[rt]` |
+| **Model policy** | Per model: balancing strategy, fallback rule, stickiness, Valkey-down mode, tenant share | `balance=headroom`, `fallback.after_secs=2` |
 | **Quota scope** | A budget key: per deployment (= account × region × model, because a model id has exactly one alias), per provider, per tenant | `gpt120b @ aws-main/ap-south-1`: rpm 500 |
-| **Registry** | Catalog + accounts + model deployments and policies; lives in Valkey, published from config | §3.8 |
+| **Registry** | The one config document for models: accounts, and per model its provider, model id, deployments, quota and policy; lives in Valkey, published from config | §3.8 |
 
 A deployment is named `account/region` (or `account/name` for a profile, e.g. `aws-main/apac`).
 It takes the place of today's target, so the limiter, breaker, lease and metric keys keep their
@@ -54,7 +54,7 @@ still narrow the model's rule (`fallback="same_model"` keeps it off the model ch
 (`openai.gpt-oss-120b-1:0`); the library resolves the id to its alias. Two aliases with the same
 model id are refused at boot, so models never overlap. Keys, queues and metrics use the alias.
 An alias has one provider and one model id: the same model on a vLLM / OpenAI-compatible
-account is its own alias, reached through the fallback chain.
+account is its own alias, reached through `model_fallback`.
 
 ```mermaid
 flowchart LR
@@ -62,7 +62,7 @@ flowchart LR
     A1["account aws-main (pod identity)"]
     A2["account aws-dr (assume role)"]
     A3["account vllm-dc1 (API key)"]
-    M["model gpt120b<br/>balance: headroom · fallback: rt · sticky: session"]
+    M["model gpt120b<br/>balance: headroom · fallback regions · sticky: session"]
   end
   M --> D1["aws-main/ap-south-1 (confirmed)<br/>rpm 500 · tpm 400K"]
   M --> D2["aws-dr/ap-southeast-1 (confirmed)<br/>rpm 200"]
@@ -87,12 +87,15 @@ flowchart LR
 - A failover of an async replica can lose the last moment of sends / acks. Claims make a
   re-delivery safe; a lost send shows as a caller timeout. `queue_wait_replicas` (send waits for
   `WAIT 1 <ms>`) trades send latency for fewer losses; off by default, measured in B23.
-- **Waiting** = the model's lane queues (strict priority rt > bg > bulk; three lanes only). Each
-  model has its own queues, named from its alias by default (`<prefix>llm-<alias>-rt`,
-  `<prefix>llm-<alias>`, `<prefix>llm-<alias>-bulk`; `queues` in `ModelConfig` overrides a name).
-  Two models sharing one queue is refused at boot.
+- **Waiting** = one queue per model, named from its alias by default (`<prefix>llm-<alias>`;
+  `queue` in the model's entry overrides the name). There are **no lanes**. Two models sharing
+  one queue is refused at boot.
+- **Priority flag.** A call may pass `priority=True` (live chat); the queue serves priority
+  calls before the others, first in first out within each class. It is still one queue: on
+  Valkey it holds a priority stream and a normal stream under one name; on SQS a second queue
+  `<name>-priority` plays that part. Nothing else differs between the two classes.
 - **In progress** = per model a zset `P:{m:ALIAS}:inprog` (request id → deadline) and a small hash
-  per request (deployment, lane, attempt, started). Written when a slot is granted, removed at the
+  per request (deployment, priority, attempt, started). Written when a slot is granted, removed at the
   end. Entries past their deadline are swept by whichever worker holds the sweep lock (`SET NX`,
   one sweeper at a time, any number of processes). A dead worker's calls resume within 60 s.
 - **Request status** = `P:req:<id>`, for every call on the queue path and the direct path:
@@ -114,7 +117,7 @@ flowchart LR
 ```mermaid
 flowchart LR
   APP[App call] --> ADM0["admission hook<br/>(admit / reject / tag, tenant)"]
-  ADM0 --> W["waiting queue of the model<br/>rt / bg / bulk"]
+  ADM0 --> W["waiting queue of the model<br/>(priority calls first)"]
   W --> RX[Worker receives]
   RX --> PT{"PICK_TAKE (one Lua):<br/>pick a confirmed deployment by the model's<br/>strategy + take RPM / TPM + tenant share"}
   PT --> SH{"provider budget<br/>(when set)"}
@@ -124,11 +127,12 @@ flowchart LR
   CALL --> RES[(result or stream chunks → caller)]
   PT -->|"no confirmed deployment"| FB{"model fallback rule"}
   FB -->|allowed| PT2["fallback deployments, then model chain"] --> SH
-  FB -->|not allowed| BACK["bg / bulk: deferred in the waiting queue<br/>rt: wait ≤ 30 s, then rate_limited"]
+  FB -->|not allowed| BACK["deferred in the waiting queue until<br/>a token is free or its deadline passes"]
 ```
 
 A call starts only when it holds a token from every budget that applies and a concurrency slot.
-rt waits at most `rt_capacity_wait_secs` (30 s) for quota, never past its deadline. The direct
+A call without quota waits in the queue until a token is free or its own deadline passes
+(`timeout_secs`: a default per model, or passed per call), then `rate_limited`. The direct
 path (canary route `direct`, sync calls, direct streaming) runs the same admission. The canary
 route name `sqs` becomes `queue`. No new cancel work; the existing `llmq.cancel` is unchanged.
 
@@ -153,8 +157,8 @@ processes and cannot herd.
   `spread` (scripts do not draw their own).
 - **Usable** = enabled by the operator, not disabled by health, breaker not open, not paused, not
   slow.
-- **Refusal** returns the shortest wait among the candidates; a deferred bg / bulk call comes
-  back after that long.
+- **Refusal** returns the shortest wait among the candidates; a deferred call comes back after
+  that long.
 - **Provider budget** (`shared_rpm` / `shared_tpm`, when set) keeps its own `RATE` call after
   the pick; if it refuses, the tokens go back. Everything else is inside the one script.
 - **No quota.** A deployment without a quota always has budget. `headroom` needs a quota on
@@ -172,17 +176,34 @@ processes and cannot herd.
 ### 3.5 Fallback, chain, health
 
 ```json
-{"fallback": {"lanes": ["rt"], "on": ["exhausted", "broken"], "after_secs": 2,
-              "regions": "account", "chain": ["gpt20b"]}}
+{"fallback": {"on": ["exhausted", "broken"], "after_secs": 2, "regions": "account"},
+ "model_fallback": {"on": ["exhausted", "broken"], "after_secs": 5,
+                    "models": ["gpt120b-vllm", {"model": "gpt20b", "require_headroom": true}]}}
 ```
 
 | Field | Meaning |
 |---|---|
-| `lanes` | Lanes that may use fallback deployments; the others wait in the queue for the next window |
+| (no rule) | A model without `fallback` never leaves its confirmed deployments; its calls wait for the next window |
 | `on` | Causes: `exhausted` (no budget or slot), `broken` (breaker open, region outage), `error` (target errors) |
 | `after_secs` | How long a call tries confirmed deployments before it spills |
 | `regions` | `account`: the same account's fallback regions first; `any`: any account's |
-| `chain` | Other models tried after every deployment of this one. Any model may be named (opt-in per model). The request must be valid for the chained model: its deployment `params` adapt it (guardrail, model fields); nothing else is converted. Embeddings never change model, only account or region |
+
+Both settings are **optional** and independent. `fallback` moves a call to the model's fallback
+regions; `model_fallback` moves it to another model. They take the same fields:
+
+| `model_fallback` field | Meaning |
+|---|---|
+| `on` | The same causes as above; a call changes model only for a listed cause |
+| `after_secs` | How long the call has tried this model's deployments (confirmed, then fallback regions when allowed) before it changes model |
+| `models` | Other models in order: an alias, or `{"model": alias, "require_headroom": true}` to use it only while it has spare quota. Each is tried with its own deployments and balancing, on its own budget |
+
+Without `model_fallback` a call never changes model. Checks at boot: every listed model exists; a
+model does not list itself; two models that list each other must both use `require_headroom`
+(so an overload cannot bounce between them); an embedding model cannot have `model_fallback`
+(vectors of another model are not compatible); a chat model can only list chat models. The
+request must be valid for the other model: its deployment `params` adapt it (guardrail, model
+fields); nothing else is converted. A call may still pass `fallback="same_model"` to stay on
+its model.
 
 `register_fallback_policy(name, fn)` replaces the rule with code.
 
@@ -211,7 +232,7 @@ publish never re-enables a broken deployment and health never shows up as a regi
 
 - **One provider per alias.** Every account of a model must be of the kind that serves the
   model's provider (validation). vLLM capacity for a Bedrock model is a second alias with its
-  own model id, named in the first one's `fallback.chain`.
+  own model id, named in the first one's `model_fallback.models`.
 - One client per (account, region), built on first use and closed at `stop()`.
 - A deployment may carry `params` merged into the request when it is picked: `guardrailConfig`
   (guardrails are per account and region), `additionalModelRequestFields`.
@@ -225,7 +246,7 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - **Tenant share.** A call may carry `tenant`; `tenant_share` caps one tenant's part of a model's
   budget per window, checked inside `PICK_TAKE` (counters under `{m:ALIAS}`, expiring with the
   window). A refused call is **deferred** (§3.2), so another tenant's messages behind it are
-  served and it never moves toward the DLQ. Without a tenant: FIFO per lane.
+  served and it never moves toward the DLQ. Without a tenant: first in, first out (priority calls first).
 - **Embedding batches:** the library splits texts into model-sized batches (titan 1 text per
   call, cohere up to 96); each batch costs 1 RPM and its tokens and is balanced like any call.
 - **Tokens:** estimated before the call (`register_token_estimator` replaces characters / 4),
@@ -237,7 +258,7 @@ publish never re-enables a broken deployment and health never shows up as a regi
 
 | Key | Holds |
 |---|---|
-| `P:{reg}:doc` | The registry JSON (catalog, accounts, models) |
+| `P:{reg}:doc` | The registry JSON (accounts, models) |
 | `P:{reg}:version` | The published `registry_version`, its content hash, a change counter; processes reload on change or every `cfg_reload_secs` |
 | `P:audit` | Every publish and live edit: who, when, before, after |
 
@@ -251,7 +272,9 @@ publish never re-enables a broken deployment and health never shows up as a regi
 - **Forgotten bump.** Equal version but a different content hash than the one published → the
   stored registry is kept and `registry_version_not_bumped` is logged and alerted, so a config
   change is never silently ignored.
-- **Live edits.** Every field can be changed from the CLI or the Python API (HTTP is read only).
+- **Live edits.** Every field of an existing model or account can be changed from the CLI or the
+  Python API (HTTP is read only). Adding or removing a whole model needs a new
+  `registry_version` (a deploy), because workers start and stop queue readers for it.
   Each edit is audited and the CLI warns that it lasts until the next config version;
   `llm-queue registry diff` shows what is live but not in config.
 - **Validation** runs before any publish or edit and reports all errors at once (§3.9). A bad
@@ -259,20 +282,12 @@ publish never re-enables a broken deployment and health never shows up as a regi
 
 ### 3.9 Config schema
 
-Two documents, linked by model alias:
-
-- **`QueueConfig.models`** (`LLMQ_MODELS`, as today without `targets`): provider, model id, queues.
-- **Registry** (`LLMQ_REGISTRY`): catalog, accounts, deployments, quotas, policy.
+One document, `LLMQ_REGISTRY` (secret, env, file or its own secret). `QueueConfig` keeps only
+infrastructure: the two stores, key prefix, TTLs and global defaults. `LLMQ_MODELS` is gone.
 
 ```json
 {
-  "registry_version": 3,
-  "catalog": {
-    "amazon.titan-embed-text-v2:0": ["ap-south-1", "ap-south-2", "ap-southeast-2", "ap-northeast-1"],
-    "cohere.embed-english-v3": ["ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
-      "eu-central-1", "eu-west-1", "eu-west-2", "eu-west-3", "ca-central-1", "us-east-1",
-      "us-west-2", "sa-east-1"]
-  },
+  "registry_version": 1,
   "accounts": {
     "aws-main": {"kind": "aws"},
     "aws-dr": {"kind": "aws", "role_arn": "arn:aws:iam::222222222222:role/llmq-bedrock",
@@ -281,52 +296,66 @@ Two documents, linked by model alias:
                  "api_key_ref": "LLMQ_VLLM_API_KEY"}
   },
   "models": {
-    "embed-titan": {
-      "quota": {"rpm": 2000, "tpm": 300000},
+    "gpt120b": {
+      "provider": "bedrock",
+      "model_id": "openai.gpt-oss-120b-1:0",
+      "quota": {"rpm": 500, "tpm": 400000},
+      "timeout_secs": 90,
       "balance": "headroom",
       "balance_opts": {"pick": "percent"},
-      "fallback": {"lanes": ["rt", "bg", "bulk"], "on": ["exhausted", "broken"], "after_secs": 1},
-      "deployments": {
-        "aws-main": {
-          "confirmed": ["ap-south-1", "ap-south-2"],
-          "fallback": ["ap-southeast-2", "ap-northeast-1"],
-          "overrides": {"ap-south-2": {"rpm": 1000, "tpm": 150000}}
-        }
-      }
-    },
-    "embed-cohere": {
-      "quota": {"rpm": 2000},
-      "balance": "weighted",
-      "deployments": {
-        "aws-main": {
-          "confirmed": ["ap-south-1", "ap-southeast-1"],
-          "fallback": ["eu-central-1", "us-east-1"],
-          "overrides": {"ap-south-1": {"weight": 3}}
-        },
-        "aws-dr": {"confirmed": ["ap-southeast-2"]}
-      }
-    },
-    "gpt120b": {
-      "quota": {"rpm": 500, "tpm": 400000},
-      "balance": "headroom",
       "sticky": {"key": "session", "idle_ttl_secs": 1800},
       "valkey_down": "static_cap",
       "tenant_share": 0.5,
-      "fallback": {"lanes": ["rt"], "on": ["exhausted", "broken"], "after_secs": 2,
-                   "chain": ["gpt120b-vllm", "gpt20b"]},
+      "fallback": {"on": ["exhausted", "broken"], "after_secs": 2},
+      "model_fallback": {"on": ["exhausted", "broken"], "after_secs": 5,
+                         "models": ["gpt120b-vllm", "gpt20b"]},
       "deployments": {
         "aws-main": {
-          "confirmed": ["ap-south-1"],
-          "fallback": [{"name": "apac", "region": "ap-south-1",
+          "confirmed": ["ap-south-1", "us-east-1"],
+          "fallback": ["us-west-2",
+                       {"name": "apac", "region": "ap-south-1",
                         "profile_id": "apac.openai.gpt-oss-120b-1:0", "rpm": 300}],
           "overrides": {"ap-south-1": {"params": {"guardrailConfig": {
             "guardrailIdentifier": "gr-abc", "guardrailVersion": "1"}}}}
+        },
+        "aws-dr": {"confirmed": ["ap-southeast-1"], "overrides": {"ap-southeast-1": {"rpm": 200}}}
+      }
+    },
+    "gpt20b": {
+      "provider": "bedrock",
+      "model_id": "openai.gpt-oss-20b-1:0",
+      "quota": {"rpm": 1000, "tpm": 800000},
+      "timeout_secs": 90,
+      "balance": "round_robin",
+      "fallback": {"on": ["exhausted", "broken"], "after_secs": 2},
+      "deployments": {
+        "aws-main": {
+          "confirmed": ["ap-south-1", "us-east-1"],
+          "fallback": ["us-west-2"],
+          "overrides": {"us-east-1": {"rpm": 600}}
         }
       }
     },
     "gpt120b-vllm": {
+      "provider": "openai",
+      "model_id": "gpt-oss-120b",
       "quota": {"rpm": 120},
       "deployments": {"vllm-dc1": {"confirmed": ["dc1"]}}
+    },
+    "embed-titan": {
+      "provider": "bedrock",
+      "model_id": "amazon.titan-embed-text-v2:0",
+      "quota": {"rpm": 2000, "tpm": 300000},
+      "timeout_secs": 60,
+      "balance": "weighted",
+      "fallback": {"on": ["exhausted", "broken"], "after_secs": 1},
+      "deployments": {
+        "aws-main": {
+          "confirmed": ["ap-south-1", "ap-south-2"],
+          "fallback": ["ap-southeast-2", "ap-northeast-1"],
+          "overrides": {"ap-south-1": {"weight": 3}, "ap-south-2": {"rpm": 1000, "tpm": 150000}}
+        }
+      }
     }
   }
 }
@@ -335,10 +364,10 @@ Two documents, linked by model alias:
 | Rule | Detail |
 |---|---|
 | Region entry | A string (in-region model id) or an object for an inference profile (`name`, `region` to call, `profile_id`, optional quota); a profile is its own deployment with its own quota |
-| Any catalog region may be used | Confirmed and fallback are set explicitly per model and account |
-| Validation (all errors at once) | Every registry model has a `ModelConfig` and the reverse; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; an AWS region is in `catalog[model_id]` (profiles and non-AWS endpoints exempt); confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `weight` only with `weighted`; `headroom` needs a quota on every confirmed deployment; `kind=openai` needs `base_url`; hook names are registered; chain models exist; queue names (existing rule) |
-| Defaults | `balance=ordered`, no `sticky`, `valkey_down=pause`, `fallback={"lanes": ["rt"], "on": ["exhausted", "broken"], "after_secs": 2}` |
-| Compatibility | Clean break in 0.3.0: `Target`, `targets`, `skip_targets` and `alias@target` are removed; `gpt120b@primary` becomes `gpt120b@aws-main/ap-south-1` in keys and metrics, so learned limiter state starts fresh. Upgrade steps: §6.1 |
+| Regions | `confirmed` and `fallback` are the only place a region is named (no catalog). A region where the model is not available is found on the first calls: auto-disable and alert (§3.5) |
+| Validation (all errors at once) | Alias format; one alias per model id; no queue shared by two models; account exists and its kind serves the model's provider; confirmed ∩ fallback empty; at least one confirmed deployment per model; override keys are listed regions; `weight` only with `weighted`; `headroom` needs a quota on every confirmed deployment; `kind=openai` needs `base_url`; hook names are registered; `model_fallback` checks (§3.5); queue names (existing rule) |
+| Defaults | `balance=ordered`, no `sticky`, no `fallback` (stay on confirmed), no `model_fallback` (never change model), `valkey_down=pause`, `timeout_secs` from the global default, queue `<prefix>llm-<alias>` |
+| Compatibility | Clean break in 0.3.0: `LLMQ_MODELS`, `Target`, `targets`, `skip_targets`, `alias@target`, `Lane` and every per-lane setting are removed; `gpt120b@primary` becomes `gpt120b@aws-main/ap-south-1` in keys and metrics, so learned limiter state starts fresh. Upgrade steps: §6.1 |
 
 ### 3.10 Configurable and customisable everywhere
 
@@ -352,9 +381,9 @@ flowchart LR
 
 | Setting family | Global | Account / provider | Model | Deployment |
 |---|---|---|---|---|
-| rpm, tpm, rate_window, rate_burst, rt_rate_share | ✅ | ✅ (shared budget) | ✅ (`quota`) | ✅ (`overrides`) |
-| max_concurrency, limiter_initial, bg_share, lane_max_concurrency | ✅ | ✅ | ✅ | ✅ |
-| timeouts, retries, backoff, breaker, rt_capacity_wait_secs | ✅ | ✅ | ✅ | ✅ |
+| rpm, tpm, rate_window, rate_burst | ✅ | ✅ (shared budget) | ✅ (`quota`) | ✅ (`overrides`) |
+| max_concurrency, limiter_initial | ✅ | ✅ | ✅ | ✅ |
+| timeout_secs (also per call), attempt timeout, retries, backoff, breaker | ✅ | ✅ | ✅ | ✅ |
 | auto-disable (N, window), probe (cool-down, cap), slow_ratio / slow_min_secs / slow_min_samples, alert thresholds | ✅ | ✅ | ✅ | ✅ |
 | balance, balance_opts, fallback, sticky, valkey_down, tenant_share, debug_capture | ✅ (default) | — | ✅ | — |
 | weight, params | — | — | — | ✅ |
@@ -367,7 +396,7 @@ built-in default is used and the error is logged once.
 | Hook | Signature (sketch) | Default |
 |---|---|---|
 | `register_balancer(name, fn)` | `fn(candidates: list[DeploymentView], ctx: CallContext) -> list[str]` | the model's `balance` |
-| `register_fallback_policy(name, fn)` | `fn(cause, lane, tried, candidates, ctx) -> list[str] \| None` (None = wait or fail) | §3.5 rule |
+| `register_fallback_policy(name, fn)` | `fn(cause, tried, candidates, ctx) -> list[str] \| None` (None = wait) | §3.5 rule |
 | `register_token_estimator(model, fn)` | `fn(params) -> int` | characters / 4 + max tokens |
 | `register_sticky_key(name, fn)` | `fn(ctx) -> str \| None` | session id |
 | `register_admission(name, fn)` | `fn(ctx, model) -> Admit \| Reject(reason) \| Tag(labels)` | admit all |
@@ -397,17 +426,18 @@ sweep, alert) is taken with a short Valkey lock, so it is correct for any number
 
 | Surface | Gives |
 |---|---|
-| `await llmq.status(model=, account=, region=, by=)` | Per model × deployment: waiting per lane, in progress, started this minute, RPM / TPM used and left, concurrency limit, breaker, paused, enabled, healthy, p95 latency |
-| `await llmq.request_status(request_id)` | State, deployment, lane, attempts, timings, error kind |
+| `await llmq.status(model=, account=, region=, by=)` | Per model × deployment: waiting (priority and normal), in progress, started this minute, RPM / TPM used and left, concurrency limit, breaker, paused, enabled, healthy, p95 latency |
+| `await llmq.request_status(request_id)` | State, deployment, priority, attempts, timings, error kind |
 | HTTP (extra `[http]`) | Read-only FastAPI router the app mounts with its own auth dependency: `/status`, `/requests/{id}`, `/registry` (secret references and role ARNs redacted) |
 | CLI | `llm-queue status --by account\|region\|model --watch`, `llm-queue request ID`, `llm-queue registry get\|set\|enable\|disable\|import\|diff` |
 
-- **Metrics** carry model + account + region + lane, to CloudWatch EMF or Prometheus (config).
+- **Metrics** carry model + account + region (+ `priority` on wait-time metrics), to CloudWatch EMF or
+  Prometheus (config).
 - **Alerts** (a log event and a metric, raised once per state change through a Valkey marker, so
   many processes do not repeat them): deployment auto-disabled / recovered; fallback spill rate
   high; quota near or at its limit for Y minutes; oldest waiting message too old; configured
   quota above observed; `registry_version_not_bumped`.
-- **Privacy.** Status and logs hold ids, model, deployment, lane, tokens, timings and error kind;
+- **Privacy.** Status and logs hold ids, model, deployment, tokens, timings and error kind;
   user and session ids are hashed. No prompt or response text, except with a per-model
   `debug_capture`: truncated text for at most 60 min. In prod it is turned on by an audited live
   edit only and is off again at the next registry publish; non-prod environments
@@ -433,8 +463,8 @@ sequenceDiagram
   participant P as Process (LLMQueue.start)
   participant V as State store
   participant Q as Queue store
-  SM->>P: LLMQ_MODELS, LLMQ_REGISTRY, LLMQ_QUEUE_REDIS_URL
-  P->>P: validate registry against QueueConfig (all errors at once; boot fails on any)
+  SM->>P: LLMQ_REGISTRY, LLMQ_QUEUE_REDIS_URL
+  P->>P: validate the registry (all errors at once; boot fails on any)
   P->>V: publish if registry_version is higher (old one to audit); else load the stored one
   P->>Q: ensure queues (create the missing ones)
   P->>P: resolve deployments and effective settings; hooks by name; lazy client pool
@@ -443,21 +473,21 @@ sequenceDiagram
   end
 ```
 
-**F2. One call, happy path (rt chat, queued).**
+**F2. One call, happy path (priority chat call, queued).**
 
 ```mermaid
 sequenceDiagram
   participant App
   participant C as LLMQueue (caller)
-  participant WQ as waiting queue (gpt120b, rt)
+  participant WQ as waiting queue (gpt120b)
   participant W as Worker
   participant V as State store
   participant B as Bedrock (aws-main / ap-south-1)
-  App->>C: converse("gpt120b", params, session_id=s, tenant=t)
+  App->>C: converse("gpt120b", params, priority=True, session_id=s, tenant=t)
   C->>C: admission hook
   C->>V: request status = waiting
-  C->>WQ: send envelope (request id, lane, deadline)
-  W->>WQ: receive (rt before bg before bulk)
+  C->>WQ: send envelope (request id, priority, deadline)
+  W->>WQ: receive (priority calls first)
   W->>V: claim; sticky lookup (session s)
   W->>V: PICK_TAKE → aws-main/ap-south-1 + RPM / TPM token
   W->>V: shared budgets, concurrency slot
@@ -474,15 +504,15 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-  S[call: model, lane, ctx] --> C["confirmed deployments minus disabled /<br/>unhealthy / breaker open / paused / slow;<br/>sticky deployment preferred"]
+  S[call: model, ctx] --> C["confirmed deployments minus disabled /<br/>unhealthy / breaker open / paused / slow;<br/>sticky deployment preferred"]
   C --> TRY{"PICK_TAKE by strategy,<br/>then shared budgets + slot"}
   TRY -->|granted| RUN["call → result"]
   TRY -->|"refused, others left"| TRY
-  TRY -->|none left| FR{"fallback rule or hook:<br/>lane allowed? cause listed?<br/>after_secs passed?"}
+  TRY -->|none left| FR{"fallback rule or hook:<br/>cause listed?<br/>after_secs passed?"}
   FR -->|yes| FB["fallback deployments<br/>(same account first, or any)"] --> TRY
-  FR -->|"no, bg / bulk"| RQ["deferred in the waiting queue<br/>until the next token (no receive count)"]
-  FR -->|"no, rt"| WAIT["wait ≤ rt_capacity_wait_secs,<br/>then rate_limited (retry_after_secs)"]
-  FB -->|none left| CH{"model chain?<br/>(never for embeddings)"}
+  FR -->|no| RQ["deferred in the waiting queue until a token is free<br/>or its deadline passes (no receive count)"]
+  RQ -->|deadline passed| RL["rate_limited (retry_after_secs)"]
+  FB -->|none left| CH{"model_fallback set, cause listed,<br/>after_secs passed?<br/>(never for embeddings)"}
   CH -->|yes| S2["next model: same flow"]
   CH -->|no| RQ
   RUN -->|"AccessDenied / not in region, 3 in 5 min"| DIS["health: disabled + alert;<br/>probe after 15 min"]
@@ -494,7 +524,7 @@ flowchart TD
 ```mermaid
 flowchart LR
   subgraph Stores
-    Q["queue depth per model × lane"]
+    Q["queue depth per model"]
     I["in-progress set per model"]
     R["budgets per deployment"]
     L["limiter / breaker / health / latency"]
@@ -552,15 +582,15 @@ sequenceDiagram
 ```python
 from taskiq_llm_queue import LLMQueue, register_balancer, DeploymentView, CallContext
 
-llmq = LLMQueue.from_env()          # QueueConfig + LLMQ_REGISTRY
+llmq = LLMQueue.from_env()          # infrastructure settings + LLMQ_REGISTRY
 # a model is named by its alias or its full model id: "gpt120b" == "openai.gpt-oss-120b-1:0"
 await llmq.start()                  # publish / load the registry, ensure queues, start workers
 
-reply = await llmq.converse("gpt120b", params, lane="rt", session_id=sid, tenant="desk-a")
+reply = await llmq.converse("gpt120b", params, priority=True, session_id=sid, tenant="desk-a")
 reply.meta.deployment               # "aws-main/ap-south-1"
 reply.meta.fallback                 # None | "region" | "model"
-vectors = await llmq.embed("embed-titan", texts, lane="bulk")   # batched by the library
-async for chunk in llmq.converse_stream("gpt120b", params, lane="rt"):
+vectors = await llmq.embed("embed-titan", texts, timeout_secs=900)   # batched by the library
+async for chunk in llmq.converse_stream("gpt120b", params, priority=True):
     ...
 
 report = await llmq.status(model="gpt120b", by="region")       # StatusReport
@@ -585,14 +615,14 @@ instead of `resolve_fallback`.
 
 | Module | Public symbols | Key functions (sketch) |
 |---|---|---|
-| `registry/schema.py` | `Registry`, `Account`, `ModelEntry`, `AccountDeployments`, `ProfileRef`, `Quota`, `RegionOverride`, `FallbackRule`, `StickyRule` | `Registry.validate(config) -> list[str]` |
-| `registry/resolve.py` | `Deployment` (frozen dataclass), `ResolvedRegistry` | `resolve(registry, config)`; `deployments(alias, group=None)`; `effective(alias, deployment, name, lane) -> (value, level)` |
+| `registry/schema.py` | `Registry`, `Account`, `ModelEntry`, `AccountDeployments`, `ProfileRef`, `Quota`, `RegionOverride`, `FallbackRule`, `StickyRule` | `Registry.problems() -> list[str]`; `Registry.alias_of(model) -> str` (alias or model id) |
+| `registry/resolve.py` | `Deployment` (frozen dataclass), `ResolvedRegistry` | `resolve(registry, defaults)`; `deployments(alias, group=None)`; `effective(alias, deployment, name) -> (value, level)` |
 | `registry/store.py` | `RegistryStore` | `publish(registry, actor)` (version + hash rule), `load()`, `set()`, `enable()`, `disable()`, `diff()`, `run()` reload loop |
 | `reliability/_lua.py` | — | new scripts `PICK_TAKE`, `DEPLOY_HEALTH`, `LATENCY`, `ONCE` (lock / marker) |
-| `broker/valkey_queue.py` | — | new `defer` operation (visible after a delay, receive count unchanged) |
+| `broker/valkey_queue.py` | — | new `defer` operation (visible after a delay, receive count unchanged); priority and normal streams under one queue name |
 | `routing/balance.py` | `Balancer` (Protocol), `register_balancer` | `pick_take(alias, strategy, candidates, preferred, costs, tenant) -> Grant \| Wait` |
-| `routing/plan.py` | `CallPlan`, `plan_call` | `plan_call(alias, lane, ctx, resolved, sticky) -> CallPlan`; `CallPlan.next(cause)` |
-| `routing/fallback_rule.py` | `register_fallback_policy` | `allowed(rule, cause, lane, waited_secs) -> bool` |
+| `routing/plan.py` | `CallPlan`, `plan_call` | `plan_call(alias, ctx, resolved, sticky) -> CallPlan`; `CallPlan.next(cause)` |
+| `routing/fallback_rule.py` | `register_fallback_policy` | `allowed(rule, cause, waited_secs) -> bool` |
 | `routing/sticky.py` | `StickyStore`, `register_sticky_key` | `get(alias, key)`, `put(alias, key, deployment, ttl)` |
 | `routing/health.py` | `DeploymentHealth`, `DeploymentProber`, `register_probe` | `record_error()`, `record_latency()`, `unusable(alias)`, prober `run()` loop |
 | `routing/view.py` | `DeploymentView`, `CallContext` | `view(alias) -> list[DeploymentView]` (custom hooks and status) |
@@ -608,7 +638,9 @@ instead of `resolve_fallback`.
 | `cli.py` | — | `registry ...`, `status --by --watch`, `request ID` |
 
 Removed: `Target`, `ModelConfig.targets`, `FallbackConfig.skip_targets`, `resolve_fallback`,
-`PodRegistry`, `local_cap`, `FailoverState.live_pods`. Key schema goes from 2 to 3.
+`PodRegistry`, `local_cap`, `FailoverState.live_pods`, `Lane` and the per-lane settings
+(`rt_rate_share`, `bg_share`, `lane_max_concurrency`, per-lane timeouts), `QueueConfig.models` /
+`LLMQ_MODELS`. Key schema goes from 2 to 3.
 
 ## 4. User stories
 
@@ -639,23 +671,23 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 
 | # | Scenario | Gate |
 |---|---|---|
-| B01 | Round robin over 3 confirmed regions, 900 bg calls | each region 300 ± 5 %; 0 lost, 0 duplicates |
+| B01 | Round robin over 3 confirmed regions, 900 calls | each region 300 ± 5 %; 0 lost, 0 duplicates |
 | B02 | Weighted 60 / 30 / 10 | shares within ± 5 % |
 | B03 | Headroom, RPM 500 / 300 / 200, each `pick` | shares as the pick defines; no region over its RPM in any window |
 | B04 | Custom balancer; a hook that raises | order followed; the raising hook falls back to `ordered` and logs once |
 | B05 | Two accounts on one model; a call by alias and a call by model id; two aliases with one model id | each account ≤ its RPM; both calls land on the same model and budget; the overlapping config is refused at boot |
-| B06 | Confirmed exhausted, rule `lanes=[rt]` | rt served from fallback within `after_secs`; bg waits, never touches fallback |
+| B06 | Confirmed exhausted: a model with `on=[exhausted]` and a model with no fallback rule | the first is served from fallback within `after_secs`; the second waits for the next window and never touches another region |
 | B07 | Region outage (5xx on one region) | breaker opens; traffic moves to other confirmed regions; fallback only if the rule has `broken` |
 | B08 | Assume-role account, credentials expire mid-run | refreshed before expiry; 0 auth failures |
 | B09 | A Bedrock model chained to its vLLM alias (API-key account) | spills to the vLLM alias under the fallback rule; the key never in Valkey or logs |
 | B10 | Sticky session over 20 turns | one deployment unless it is exhausted or unusable; then moves and sticks again |
 | B11 | Live registry edits: add a region, change a quota, switch strategy, disable a deployment | applied everywhere within `cfg_reload_secs`; in-flight calls finish; audit entry |
-| B12 | Invalid registry (unknown account, region not in the catalog, unknown hook, headroom without quota) | refused with all errors listed; a bad stored value keeps the last good |
+| B12 | Invalid registry (unknown account, two aliases for one model id, shared queue, unknown hook, headroom without quota, chain to a missing model) | refused with all errors listed; a bad stored value keeps the last good |
 | B13 | Per-request status under a worker kill | `in_progress → waiting → done`; counts match the call log |
 | B14 | Python API, HTTP and CLI status | the same numbers within one sample interval; no secret reference in HTTP output |
 | B15 | Embeddings across accounts | balanced across deployments; never another model |
 | B16 | State store down, one model per `valkey_down` mode | `pause`: 0 calls start, all served after it returns; `static_cap`: ≤ cap in flight per process; `fail_fast`: `queue_unavailable` within 100 ms |
-| B17 | 10K mixed calls, 3 accounts × 3 regions | no budget exceeded; throughput ≥ 0.9 × the sum of quotas; rt wait p95 ≤ 2 s |
+| B17 | 10K mixed calls, 3 accounts × 3 regions | no budget exceeded; throughput ≥ 0.9 × the sum of quotas; priority-call wait p95 ≤ 2 s |
 | B18 | Steady 17 / s, RPM 600 / 300 / 100, every strategy | shares within ± 5 % of the strategy's target; 0 overruns |
 | B19 | Burst of 2,000 in 10 s | refusals per call ≤ 0.05; Valkey calls per request no higher than in 0.2.1 |
 | B20 | One deployment with 5 tokens left | ≤ 5 calls land there; no extra refusals |
@@ -664,14 +696,14 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B23 | Queue store primary killed mid-run, `queue_wait_replicas` off and on | lost sends and duplicates counted and recorded; 0 lost with it on; send p95 recorded for both |
 | B24 | Full suite on Redis 7.2 and on Valkey 8 | the same pass set on both |
 | B25 | Queued streaming, 200 concurrent | first chunk p95 ≤ queue wait + provider first token + 50 ms; chunks in order, none lost; connections ≤ the pool size |
-| B26 | Direct streaming under a full budget | waits ≤ 30 s for a token, then `rate_limited`; never over RPM |
+| B26 | Direct streaming under a full budget | waits for a token until its deadline, then `rate_limited`; never over RPM |
 | B27 | Deployment fails after 200 streamed tokens | error event with the partial text; no second deployment starts |
 | B28 | One of four regions 5× slower; then only two regions | share of new calls drops to ~0 within 30 s and returns after recovery; with two regions nothing is excluded |
 | B29 | Real quota 200, configured 500 | 429 rate < 5 % within 60 s; traffic moves; one alert with the observed rate |
 | B30 | Worker killed with 50 calls in progress | all 50 finish elsewhere within 60 s; 0 lost |
 | B31 | Tenant X sends 5,000 bulk calls, then tenant Y 100 | X ≤ `tenant_share`; Y finishes in its normal time; no message of X reaches the DLQ |
 | B32 | Bulk embed 50K texts on titan and cohere | batch sizes as §3.7; RPM and TPM held; vectors in input order |
-| B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 rt errors, mixed versions safe, registry version never goes back |
+| B33 | Rolling deploy of 4 workers (0.3.x → 0.3.y) under 10K / min | 0 lost, 0 failed priority calls, mixed versions safe, registry version never goes back |
 | B34 | Ramp from 10K / min until something saturates | the ceiling, the bottleneck and the state-store memory recorded here |
 | B35 | Live suite (`-m live`, dev account), off by default | each model × deployment answers once; a failure names the deployment and the AWS error |
 | B36 | `debug_capture` on for one model (live edit; config in non-prod only) | truncated text kept ≤ 60 min, then gone; off after a registry publish; refused from config in prod; other models and all logs hold none |
@@ -681,18 +713,20 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 | B40 | Config changed without a version bump | stored registry kept; `registry_version_not_bumped` logged and alerted once |
 | B41 | Upgrade 0.2.1 → 0.3.0 by §6.1 under load | 0 lost; no 0.3 worker receives a 0.2 message and the reverse |
 | B42 | A rate-deferred message 50 times | receive count unchanged; never in the DLQ; a failing handler still reaches the DLQ at `max_receives` |
+| B43 | 5,000 normal calls queued, then 100 priority calls | priority wait p95 ≤ 2 s; every normal call still finishes; first in, first out inside each class |
+| B44 | A region where the model does not exist is listed as confirmed | disabled after 3 errors with an alert naming the deployment and the AWS error; calls served by the other regions; 0 failed calls |
 
 ## 6. Work plan by release
 
 | Release | Step | Content | Gate |
 |---|---|---|---|
 | **0.3.0** | A0 | Test prerequisites: fakellm quotas per key × region × model, latency / error injection, fake STS, Redis + second Valkey in compose | harness self-test |
-| | A1 | Registry schema, validation, resolve, override levels; alias or model id in calls, queue names from the alias; `targets` removed; key schema 3 | unit; B12, B05 |
+| | A1 | Registry schema (one document: accounts, models with provider and model id), validation, resolve, override levels; alias or model id in calls, queue name from the alias; `LLMQ_MODELS`, `targets` and lanes removed from config; key schema 3 | unit; B12, B05 |
 | | A2 | Registry store: version + hash rule, live edits, audit, CLI `registry`, registry file / own secret | B11, B40 |
 | | A3 | `PICK_TAKE`, strategies, `balance_opts`, custom balancer hook | B01-B04, B18-B22 |
 | | A4 | Quota scopes, tenant share, `defer` on both backends | R01-R12 still pass; B05, B31, B42 |
 | | A5 | Fallback rule and hook, model chain, per-deployment params | B06, B07, B38 |
-| | A6 | Valkey default backend, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39 |
+| | A6 | Valkey default backend, one queue per model with the priority flag, queues created at start, two stores, Redis + Valkey CI, `queue_wait_replicas`, route `sqs` → `queue` | B23, B24, B39, B43 |
 | | A7 | Pod-count logic removed; `valkey_down` modes; once-locks | B16, B22 |
 | | A8 | Upgrade guide and the app's config moved to the registry | B41 |
 | **0.3.1** | A9 | Accounts: assume role, API-key accounts, client pool | B08, B09 |
@@ -706,7 +740,7 @@ role; a Redis image and a second Valkey in `docker/compose.yaml`.
 The first setup used for seeds and scenario numbers: `gpt120b` (`openai.gpt-oss-120b-1:0`, chain
 to `gpt20b`), `gpt20b` (`openai.gpt-oss-20b-1:0`), `embed-titan` (`amazon.titan-embed-text-v2:0`),
 `embed-cohere` (`cohere.embed-english-v3`) on `aws-main`, with placeholder quotas until real
-numbers arrive. Load is designed for 10K calls / min with a balanced lane mix; B34 finds the ceiling.
+numbers arrive. Load is designed for 10K calls / min with a mix of chat and bulk work; B34 finds the ceiling.
 
 ### 6.1 Upgrade from 0.2.x to 0.3.0
 
@@ -735,17 +769,17 @@ off (uat / prod today) there is nothing to drain.
 | E2 | Balancing | Per model, live switchable: `ordered`, `round_robin`, `weighted`, `headroom`, `custom` |
 | E3 | Balancing state | Choose-and-take in one Valkey Lua for every strategy; no extra calls; `round_robin` is one shared rotation |
 | E4 | Headroom pick | `balance_opts.pick` = `percent` (default) / `max` / `spread`, a setting at every level |
-| E5 | Fallback regions | A rule per model: lanes, causes, `after_secs`, region scope, model chain |
-| E6 | Model chain | Any model may be named, opt-in per model; embeddings never change model |
-| E7 | Queues | Per model a waiting queue (three lanes) and an in-progress set; quota per account × region × model |
+| E5 | Fallback regions | Optional `fallback` per model: causes, `after_secs`, region scope. Without it a model stays on its confirmed deployments |
+| E6 | Model fallback | Optional `model_fallback` per model with the same fields as the region fallback (`on`, `after_secs`) plus `models`; checked at boot; embeddings never change model |
+| E7 | Queues | Per model one waiting queue and one in-progress set; quota per account × region × model |
 | E8 | Queue backend | Valkey / Redis Streams by default; SQS optional; both run the same suites |
 | E9 | Stores | Queue store and state store separate; ElastiCache Multi-AZ; `noeviction` on the queue store |
 | E10 | Engines | Redis ≥ 7.2 and Valkey ≥ 8, both in CI |
 | E11 | Failover loss | Accepted (idempotent claims, caller deadlines); optional `queue_wait_replicas`, measured |
 | E12 | Registry | In Valkey; `registry_version` rule: higher replaces, equal keeps live edits, lower ignored |
 | E13 | Live edits | Every field, audited, CLI warns they last until the next config version; `registry diff` |
-| E14 | Config documents | Split: `QueueConfig.models` (provider, model id, optional queue names) and the registry, linked by alias |
-| E15 | Catalog and regions | Any catalog region may be used; confirmed / fallback explicit per model and account |
+| E14 | Config documents | One document, `LLMQ_REGISTRY`: accounts and models (provider, model id, deployments, quota, policy). `LLMQ_MODELS` removed |
+| E15 | Regions | No catalog: `confirmed` and `fallback` per model and account are the only region lists; a wrong region is caught by auto-disable and alert |
 | E16 | Quotas | One default per model, overrides per region; set by operators, limiter learns from 429s |
 | E17 | Inference profiles | Their own deployment with their own quota |
 | E18 | Compatibility | Clean break in 0.3.0; no `targets`, no pinning |
@@ -765,14 +799,14 @@ off (uat / prod today) there is nothing to drain.
 | E32 | Cost | Token metrics only |
 | E33 | Privacy | No text in status or logs; optional per-model `debug_capture` |
 | E34 | Streaming | Queued and direct; a mid-stream failure is an error event with the partial text |
-| E35 | rt wait | ≤ 30 s for quota, a setting at every level |
+| E35 | Waiting for quota | Every call waits in the queue until a token is free or its deadline passes, then `rate_limited` |
 | E36 | Worker crash | In-progress calls resume within 60 s |
-| E37 | Fairness and priority | Optional `tenant` with `tenant_share`; three lanes only |
+| E37 | Fairness and priority | Optional `tenant` with `tenant_share`; no lanes; one optional `priority=True` flag per call inside the same queue |
 | E38 | Cancel and retention | No new cancel work; results 5 min, request status 30 min |
 | E39 | Embedding batches | The library batches to the model's size and balances the batches |
-| E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero rt errors |
-| E41 | Tests | fakellm scenarios B01-B42; a small `live` suite off by default; balancing bench gated |
-| E42 | Load | Design for 10K / min, balanced lanes; find and record the ceiling |
+| E40 | Rolling deploys | No lost calls, mixed 0.3.x versions safe, registry never goes back, zero failed priority calls |
+| E41 | Tests | fakellm scenarios B01-B44; a small `live` suite off by default; balancing bench gated |
+| E42 | Load | Design for 10K / min, a mix of chat and bulk work; find and record the ceiling |
 | E43 | Releases | 0.3.0 to 0.3.3 as in §6 |
 | E45 | Alias and model id | One owner-defined alias per model; calls accept the alias or the full model id; two aliases with one model id are refused at boot |
 | E46 | Queues per model | Named from the alias by default, overridable; one queue set per model, no sharing |
@@ -781,6 +815,9 @@ off (uat / prod today) there is nothing to drain.
 | E49 | Debug capture | ≤ 60 min; prod: audited live edit only; non-prod may enable it from config |
 | E50 | Upgrade 0.2 → 0.3 | Both paths documented: new prefix and drain (uat / prod), stop the world (dev) |
 | E51 | Repo flow | Library branch `feat/accounts-routing`, one local commit per finished step (pushed by the owner) |
+| E52 | Lanes | Removed: no rt / bg / bulk, no per-lane settings |
+| E53 | Timeouts | One default per model (settable at every level), and per call |
+| E54 | Models in the registry | Adding or removing a whole model needs a new `registry_version` (a deploy); everything else is live |
 | E44 | App | Valkey queues now on 0.2.1: local and dev first, dedicated queue store per env, `LLMQ_QUEUE_BACKEND` switch kept, queues created by the pipeline and at start |
 
 ## 8. Needed from the owner
@@ -788,9 +825,9 @@ off (uat / prod today) there is nothing to drain.
 | # | Item |
 |---|---|
 | Q1 | RPM / TPM per region for the four first models |
-| Q2 | Region list of `openai.gpt-oss-120b-1:0` and `openai.gpt-oss-20b-1:0`, and which regions are confirmed and which fallback for each of the four models |
+| Q2 | For each of the four first models: which regions are confirmed and which fallback |
 | Q3 | Account ids and role ARNs when a second AWS account is added (0.3.1) |
-| Q4 | Compliance sign-off that request text may be processed in every catalog region used as confirmed or fallback (the cohere list includes EU, US, Canada and Brazil) |
+| Q4 | Compliance sign-off that request text may be processed in every region listed as confirmed or fallback (the cohere list includes EU, US, Canada and Brazil) |
 
 ## 9. Review: gaps found and fixed (2026-11-11)
 
@@ -800,7 +837,7 @@ named. The owner confirmed them on 2026-11-11; G4 was decided differently from t
 | # | Gap | Fix | Where |
 |---|---|---|---|
 | G1 | **Tenant share did not give fairness.** The lane queue is FIFO, so tenant X's 5,000 messages sit in front of tenant Y's; refusing X's calls would also bump their receive count toward the DLQ | A refused call is *deferred*: visible again after a delay with the receive count unchanged, so Y's messages are served and X's never reach the DLQ | §3.2, §3.7, B31, B42 |
-| G2 | The same DLQ risk for every rate-limited bg / bulk call that waits several windows | `defer` on both backends; only failures and crashes count toward `max_receives` | §3.2, B42 |
+| G2 | The same DLQ risk for every rate-limited call that waits several windows | `defer` on both backends; only failures and crashes count toward `max_receives` | §3.2, B42 |
 | G3 | **0.2 → 0.3 upgrade was unsafe.** "Mixed versions safe" cannot hold across the clean break: a 0.2 worker cannot run a 0.3 message | Upgrade on a new key and queue prefix, drain the old queues; mixed-version safety promised between 0.3.x only | §6.1, B41, U15 |
 | G4 | **One model could not mix Bedrock and vLLM** (B09): provider and model id are single per alias in `QueueConfig` | Kept single: vLLM capacity is its own alias reached through the chain; one alias per model id, so the extra shared budget scope is dropped and the pick is fully atomic | §3.1, §3.6, B09 |
 | G5 | Auto-disable was a registry edit, so the next registry publish would re-enable a broken deployment | Health state kept apart from the registry | §3.5, B37 |
