@@ -1,7 +1,8 @@
 """Run the checks of one work step (plan §6) or of everything: lint, format, types, tests.
 
 Every test run of the 0.3 work goes through this script, so a step is "done" only when
-`python scripts/check.py <step>` passes. No step calls a real LLM: stack tests use fakellm.
+`python scripts/check.py <step>` passes. No step calls a real LLM: stack tests and samples
+use fakellm (`python scripts/samples.py --live` runs the samples on real Bedrock).
 
     python scripts/check.py a1          # one step
     python scripts/check.py a1 a2       # several
@@ -156,6 +157,13 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_stream.py",),
         needs_stack=True,
     ),
+    "samples": Step(
+        "Usage samples (samples/*.py) run as app code against fakellm",
+        sources=("samples", "scripts/samples.py"),
+        tests=(),
+        needs_stack=True,
+        extra=(("scripts/samples.py",),),
+    ),
 }
 
 
@@ -192,11 +200,10 @@ def run_step(name: str, step: Step) -> bool:
         _run("ruff check", [PY, "-m", "ruff", "check", *paths]),
         _run("ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
         _run("mypy", [PY, "-m", "mypy", "--no-incremental", *paths]),
-        _run(
-            "pytest",
-            [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs", *step.tests],
-        ),
     ]
+    if step.tests:
+        pytest = [PY, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs", *step.tests]
+        results.append(_run("pytest", pytest))
     results += [_run(" ".join(cmd), [PY, *cmd]) for cmd in step.extra]
     return all(results)
 

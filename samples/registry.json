@@ -1,0 +1,32 @@
+{
+  "registry_version": 1,
+  "defaults": {"timeout_secs": 120, "attempt_timeout_secs": 60, "throttle_retry_attempts": 6},
+  "residency": {"allowed_regions": ["us-east-1"]},
+  "accounts": {"aws-main": {"kind": "aws"}},
+  "models": {
+    "gpt120b": {
+      "type": "chat", "provider": "bedrock", "model_id": "openai.gpt-oss-120b-1:0",
+      "rpm": 60, "tpm": 100000, "balance_priority": "ordered",
+      "inference": {"max_tokens": 512},
+      "model_fallback": {"on": ["exhausted", "broken"], "after_secs": 5,
+                         "models": [{"model": "gpt20b", "require_headroom": true}]},
+      "deployments": {"aws-main": {"confirmed": ["us-east-1"]}}
+    },
+    "gpt20b": {
+      "type": "chat", "provider": "bedrock", "model_id": "openai.gpt-oss-20b-1:0",
+      "rpm": 60, "tpm": 100000,
+      "inference": {"max_tokens": 512},
+      "deployments": {"aws-main": {"confirmed": ["us-east-1"]}}
+    },
+    "titan": {
+      "type": "embedding", "provider": "bedrock", "model_id": "amazon.titan-embed-text-v2:0",
+      "rpm": 120, "embed_batch_size": 1,
+      "deployments": {"aws-main": {"confirmed": ["us-east-1"]}}
+    },
+    "cohere": {
+      "type": "embedding", "provider": "bedrock", "model_id": "cohere.embed-english-v3",
+      "rpm": 120, "embed_batch_size": 96,
+      "deployments": {"aws-main": {"confirmed": ["us-east-1"]}}
+    }
+  }
+}

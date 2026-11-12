@@ -867,34 +867,42 @@ sequenceDiagram
 
 ### 3.15 Client API
 
+As built (0.3.0). Every line below is exercised by a runnable sample in `samples/`
+(`python scripts/samples.py`, or `--live` for real Bedrock); see `samples/README.md`.
+
 ```python
-from taskiq_llm_queue import LLMQueue, register_balancer, DeploymentView, CallContext
+from taskiq_llm_queue import LLMQueue, request_context, CallFailed, register_balancer
 
 llmq = LLMQueue.from_env()          # infrastructure settings + LLMQ_REGISTRY
 # a model is named by its alias or its full model id: "gpt120b" == "openai.gpt-oss-120b-1:0"
 await llmq.start()                  # publish / load the registry, ensure queues, start workers
 
-reply = await llmq.converse("gpt120b", params, priority=True, session_id=sid,
-                            max_wait_secs=30, tenant_id="research-desk")
+with request_context(priority=True, session_id=sid, user_id=uid, tenant_id="research-desk"):
+    reply = await llmq.converse("gpt120b", params, max_wait_secs=30)       # 01_converse
 reply.meta.deployment               # "aws-main/ap-south-1"
 reply.meta.fallback                 # None | "region" | "model"
-vectors = await llmq.embed("embed-titan", texts, timeout_secs=900)   # batched by the library
-async for chunk in llmq.converse_stream("gpt120b", params, priority=True):
+async for event in llmq.converse_stream("gpt120b", params):                # 02_stream
     ...
+vectors = (await llmq.embed("cohere", texts, input_type="search_document")).vectors  # 03_embed
+reply = llmq.converse_sync("gpt20b", params)                               # 04_sync
+try:                                                                       # 05_errors_and_fallback
+    await llmq.converse("gpt20b", params, max_wait_secs=3)
+except CallFailed as exc:
+    exc.kind, exc.retry_after_secs
+llmq.register_job("index", fn); await llmq.send_job("index", payload)     # 06_jobs
 
-report = await llmq.status(model="gpt120b", by="region")       # StatusReport
-state = await llmq.request_status(reply.meta.request_id)       # RequestStatus
+report = await llmq.status("gpt120b")                    # dict: waiting, deployments, ... (07)
+state = await llmq.request_status(reply.request_id)      # dict: state, deployment, ...
+await llmq.registry.set({"rpm": 400}, model="gpt120b", actor="ops")       # live, audited
+await llmq.registry.set_enabled("gpt120b", "aws-main/us-east-1", False, actor="ops")
+await llmq.registry.diff_with_config()                   # live edits vs the deployed document
+await llmq.registry.log(count=20)                        # audit
 
-await llmq.registry.set("gpt120b", {"deployments.aws-main.overrides.ap-south-1.rpm": 400})
-await llmq.registry.disable("gpt120b", "aws-main/us-east-1", reason="maintenance")
-diff = await llmq.registry.diff()
+register_balancer("cheapest_first", lambda cands, ctx: [  # registry: balance: custom:cheapest_first
+    d.key for d in sorted(cands, key=lambda d: d.tags.get("cost", 1))
+])
 
-@register_balancer("cheapest_first")
-def cheapest_first(cands: list[DeploymentView], ctx: CallContext) -> list[str]:
-    return [d.name for d in sorted(cands, key=lambda d: (d.tags.get("cost", 1), -d.rpm_left))]
-
-from taskiq_llm_queue.http import status_router                # extra [http]
-app.include_router(status_router(llmq, dependencies=[Depends(require_admin)]), prefix="/llmq")
+app.include_router(llmq.http_router(dependencies=[Depends(require_admin)]), prefix="/llmq")  # [http]
 ```
 
 ### 3.16 Code structure

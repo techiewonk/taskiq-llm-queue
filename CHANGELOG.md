@@ -36,6 +36,17 @@ A clean break from 0.2 (plan E101): nothing is carried over. Empty the 0.2 queue
 - Streaming to the caller: `LLMQueue.converse_stream` / `chat_stream` yield provider events
   through a chunk stream in the state store (`stream_flush_ms`, `stream_max_bytes`,
   `stream_idle_secs`); a cut mid-stream raises `CallFailed` with `partial_text`.
+- Runnable usage samples (`samples/`, with where to use each) and `scripts/samples.py` to run
+  them on fakellm or, with `--live`, on real Bedrock; `check.py samples` runs the fakellm pass.
+- `LLMQueue.close_sync()` for processes that only make sync calls.
+
+### Fixed (found by the samples on real Bedrock)
+
+- `require_headroom` model fallback never fired with the default `smooth` rate window:
+  headroom was measured against the minute's limit, so it never exceeded `rate_burst` (10%).
+  It is now measured against the bucket.
+- LangChain chat adapters with only `model_alias` now look the model id up from the started
+  queue, as documented; before, they needed `llmq=` or `model_id=`.
 
 ### Removed
 

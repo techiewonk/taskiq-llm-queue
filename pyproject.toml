@@ -109,11 +109,12 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D"]
+"samples/*" = ["D103"]  # samples read top to bottom; the module docstring says it all
 
 [tool.mypy]
 strict = true
 python_version = "3.11"
-files = ["src", "tests", "tools", "scripts"]
+files = ["src", "tests", "tools", "scripts", "samples"]
 # Test folders have no __init__.py (several conftest.py files): map modules from paths.
 explicit_package_bases = true
 mypy_path = ["src", "tools/fakellm"]

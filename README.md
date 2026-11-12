@@ -99,6 +99,9 @@ await llmq.send_job("ingest", {"rows": rows})
 await llmq.stop()
 ```
 
+Runnable samples of each of these (streaming, sync calls, jobs, fallback, status, LangChain)
+are in [samples/](samples/README.md), with where to use each one.
+
 LangChain: `QueuedChatBedrockConverse(model_alias="gpt120b")`,
 `QueuedBedrockEmbeddings`, `QueuedChatOpenAI`, `QueuedOpenAIEmbeddings` from
 `taskiq_llm_queue.langchain` (they find the started queue on their own).
@@ -129,6 +132,8 @@ auth. Readiness never depends on the stores or the providers.
 python scripts/stack.py up        # Valkey, Redis, fakellm (fake Bedrock and OpenAI)
 python scripts/check.py --list    # every step's checks
 python scripts/check.py all       # lint, format, types and tests of every step
+python scripts/samples.py         # the usage samples on fakellm; --live for real Bedrock
 ```
 
-No test calls a real LLM.
+No test calls a real LLM. `scripts/samples.py --live` is the only thing that does, and only
+when asked.

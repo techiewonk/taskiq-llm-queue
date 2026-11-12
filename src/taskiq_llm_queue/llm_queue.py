@@ -174,8 +174,7 @@ class LLMQueue:
         await self.jobs.stop()
         await self.engine.stop()
         await self.engine.providers.aclose()
-        if self._sync is not None:
-            self._sync.close()
+        self.close_sync()
         await self.engine.state.aclose()
 
     # ---------------------------------------------------------------- calls
@@ -281,6 +280,12 @@ class LLMQueue:
             return EmbedResult(vectors, Meta(served_model=model))
 
         return self._sync_runner().run(run)
+
+    def close_sync(self) -> None:
+        """Stop the private engine of the sync calls (sync-only processes; `stop()` does too)."""
+        if self._sync is not None:
+            self._sync.close()
+            self._sync = None
 
     # ---------------------------------------------------------------- jobs and admin
 
