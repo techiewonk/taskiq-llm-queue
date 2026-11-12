@@ -205,10 +205,7 @@ async def test_openai_key_and_errors(setup: Any) -> None:
         providers.pool.openai(missing)
 
 
-async def test_assume_role_is_not_built_yet(setup: Any) -> None:
+async def test_unknown_provider_is_refused(setup: Any) -> None:
     _, providers = await setup()
-    account = Account(name="dr", kind="aws", role_arn="arn:aws:iam::1:role/x")
-    with pytest.raises(ConfigError, match="A15"):
-        await providers.pool.bedrock(Route(account, "ap-south-1", MODEL, "dr/ap-south-1"))
     with pytest.raises(ConfigError, match="no provider"):
         providers.get("azure")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 import threading
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future
@@ -116,6 +117,8 @@ class LLMQueue:
             pool_kwargs: dict[str, Any] = {
                 "bedrock_endpoint_url": settings.bedrock_endpoint_url,
                 "denied_hosts": (),
+                "sts_endpoint_url": settings.sts_endpoint_url,
+                "session_name": f"llmq-{settings.environment}-{worker_id or socket.gethostname()}",
             }
             if credentials is not None:
                 pool_kwargs["credentials"] = credentials

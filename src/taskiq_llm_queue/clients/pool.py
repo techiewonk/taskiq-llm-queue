@@ -14,7 +14,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from taskiq_llm_queue.errors import ConfigError
+from taskiq_llm_queue.errors import ConfigError, LLMQueueError
 from taskiq_llm_queue.providers.hosts import check_url
 
 if TYPE_CHECKING:
@@ -61,6 +61,13 @@ def _pod_chain(account: Account) -> Mapping[str, Any] | None:
     return None
 
 
+class CredentialsUnavailable(LLMQueueError):
+    """An account's credentials could not be obtained (STS refused or unreachable)."""
+
+
+ROLE_SESSION_SECS = 3600  # the role-chaining maximum (plan §3.6)
+
+
 class ClientPool:
     """Clients per (account, region) for Bedrock and per account for OpenAI-compatible servers.
 
@@ -79,8 +86,13 @@ class ClientPool:
         read_timeout_secs: float = DEFAULT_READ_TIMEOUT_SECS,
         connect_timeout_secs: float = DEFAULT_CONNECT_TIMEOUT_SECS,
         max_pool_connections: int = DEFAULT_MAX_POOL_CONNECTIONS,
+        sts_endpoint_url: str | None = None,
+        session_name: str = "llmq",
     ) -> None:
-        """Keep settings only; no SDK import and no client until the first call."""
+        """Keep settings only; no SDK import and no client until the first call.
+
+        `session_name` names assumed-role sessions (`llmq-<env>-<pod>` in CloudTrail).
+        """
         check_url(bedrock_endpoint_url, denied_hosts)
         self._endpoint = bedrock_endpoint_url
         self._credentials = credentials
@@ -91,6 +103,9 @@ class ClientPool:
         self._connect = connect_timeout_secs
         self._pool_size = max_pool_connections
         self._bedrock: dict[tuple[str, str], BedrockRuntimeClient] = {}
+        self._sts_endpoint = sts_endpoint_url
+        self._session_name = session_name
+        self._roles: dict[str, AioSession] = {}
         self._openai: dict[str, AsyncOpenAI] = {}
         self._stack = AsyncExitStack()
         self._lock = asyncio.Lock()
@@ -103,15 +118,16 @@ class ClientPool:
         async with self._lock:
             if (client := self._bedrock.get(key)) is not None:
                 return client
-            if route.account.role_arn:
-                raise ConfigError(
-                    f"account {route.account.name}: assume-role accounts arrive in step A15"
-                )
             from aiobotocore.config import AioConfig
             from aiobotocore.session import get_session
 
             if self._session is None:
                 self._session = get_session()
+            session = self._session
+            extra = dict(self._credentials(route.account) or {})
+            if route.account.role_arn:
+                session = await self._role_session(route)
+                extra = {}
             config = AioConfig(
                 read_timeout=self._read,
                 connect_timeout=self._connect,
@@ -119,16 +135,66 @@ class ClientPool:
                 # One attempt per call: throttles reach the library, not botocore's retries.
                 retries={"total_max_attempts": 1, "mode": "standard"},
             )
-            context = self._session.create_client(
+            context = session.create_client(
                 "bedrock-runtime",
                 region_name=route.region,
                 endpoint_url=self._endpoint,
                 config=config,
-                **dict(self._credentials(route.account) or {}),
+                **extra,
             )
             client = await self._stack.enter_async_context(context)
             self._bedrock[key] = client
             return client
+
+    async def _role_session(self, route: Route) -> AioSession:
+        """A session whose credentials come from STS AssumeRole and refresh before expiry."""
+        account = route.account
+        if account.name in self._roles:
+            return self._roles[account.name]
+        from aiobotocore.credentials import AioRefreshableCredentials
+        from aiobotocore.session import AioSession, get_session
+
+        base = self._session or get_session()
+        base_kwargs = dict(self._credentials(account) or {})
+        external_id = self._secrets(account.external_id_ref) if account.external_id_ref else None
+        if account.external_id_ref and not external_id:
+            raise CredentialsUnavailable(
+                f"account {account.name}: secret {account.external_id_ref} is not set"
+            )
+
+        async def assume() -> dict[str, Any]:
+            request: dict[str, Any] = {
+                "RoleArn": account.role_arn,
+                "RoleSessionName": self._session_name[:64],
+                "DurationSeconds": ROLE_SESSION_SECS,
+            }
+            if external_id:
+                request["ExternalId"] = external_id
+            try:
+                async with base.create_client(
+                    "sts", region_name=route.region, endpoint_url=self._sts_endpoint, **base_kwargs
+                ) as sts:
+                    reply = await sts.assume_role(**request)
+            except Exception as exc:
+                raise CredentialsUnavailable(
+                    f"account {account.name}: AssumeRole failed: {exc}"
+                ) from exc
+            creds = reply["Credentials"]
+            return {
+                "access_key": creds["AccessKeyId"],
+                "secret_key": creds["SecretAccessKey"],
+                "token": creds["SessionToken"],
+                "expiry_time": creds["Expiration"].isoformat(),
+            }
+
+        credentials = AioRefreshableCredentials.create_from_metadata(
+            metadata=await assume(), refresh_using=assume, method="sts-assume-role"
+        )
+        session = AioSession()
+        # aiobotocore has no public setter for refreshable credentials.
+        session._credentials = credentials  # type: ignore[attr-defined]
+        self._roles[account.name] = session
+        return session
 
     def openai(self, route: Route) -> AsyncOpenAI:
         """The OpenAI-compatible client of the route's account (its `base_url` and key)."""
@@ -159,6 +225,7 @@ class ClientPool:
         """Drop an account's cached clients so the next call reads its credentials again."""
         for key in [k for k in self._bedrock if k[0] == route.account.name]:
             del self._bedrock[key]
+        self._roles.pop(route.account.name, None)
         self._openai.pop(route.account.name, None)
 
     async def aclose(self) -> None:

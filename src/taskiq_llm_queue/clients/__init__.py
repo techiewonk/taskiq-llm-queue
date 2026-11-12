@@ -6,7 +6,12 @@ operation on a `Route` with the attempt timers. Chat always uses the streaming A
 
 from __future__ import annotations
 
-from taskiq_llm_queue.clients.pool import ClientPool, Route, route_for
+from taskiq_llm_queue.clients.pool import (
+    ClientPool,
+    CredentialsUnavailable,
+    Route,
+    route_for,
+)
 from taskiq_llm_queue.clients.providers import (
     BedrockProvider,
     OpenAIProvider,
@@ -23,6 +28,7 @@ __all__ = [
     "AttemptTimeout",
     "BedrockProvider",
     "ClientPool",
+    "CredentialsUnavailable",
     "OpenAIProvider",
     "Provider",
     "Providers",

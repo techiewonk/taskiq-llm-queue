@@ -57,6 +57,7 @@ class InfraSettings:
     metrics_sink: str = "emf"
     mode: str = "both"
     bedrock_endpoint_url: str | None = None
+    sts_endpoint_url: str | None = None
     id_hash_salt: str | None = None
     environment: str = "dev"
     extra: Mapping[str, str] = field(default_factory=dict)
@@ -140,6 +141,7 @@ class InfraSettings:
             metrics_sink=str(get("METRICS_SINK", "emf")),
             mode=mode,
             bedrock_endpoint_url=get("BEDROCK_ENDPOINT_URL"),
+            sts_endpoint_url=get("STS_ENDPOINT_URL"),
             id_hash_salt=salt,
             environment=environment,
         )

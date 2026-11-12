@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from typing import Any
 
 import pytest
 import redis.asyncio
 from engine_testkit import CHAT, GPT, SMALL, Make, stats
 
+from taskiq_llm_queue.clients import CredentialsUnavailable
 from taskiq_llm_queue.engine.errors import CallFailed
 from taskiq_llm_queue.engine.queue import QueueSettings
 
@@ -430,6 +432,21 @@ async def test_credential_failure_is_per_process(make: Make) -> None:
         await engine.call("small", CHAT)
     assert info.value.kind == "credentials_unavailable"
     assert "aws-a" in engine._bad_accounts
+
+
+async def test_assume_role_failure_is_a_credential_failure(make: Make) -> None:
+    """A15: STS refusing AssumeRole counts like a bad key: per process, never shared health."""
+    engine, _ = await make({"small": {"max_attempts": 3}})
+
+    async def refuse(route: Any) -> Any:
+        raise CredentialsUnavailable(f"account {route.account.name}: AssumeRole failed: denied")
+
+    engine.providers.pool.bedrock = refuse
+    with pytest.raises(CallFailed) as info:
+        await engine.call("small", CHAT)
+    assert info.value.kind == "credentials_unavailable"
+    assert "aws-a" in engine._bad_accounts
+    assert not await engine.health.snapshot("small")
 
 
 # ---------------------------------------------------------------- A16: slow deployments

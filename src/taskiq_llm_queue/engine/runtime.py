@@ -24,7 +24,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from taskiq_llm_queue._logging import get_logger
-from taskiq_llm_queue.clients.pool import route_for
+from taskiq_llm_queue.clients.pool import CredentialsUnavailable, route_for
 from taskiq_llm_queue.clients.providers import Providers
 from taskiq_llm_queue.clients.timing import AttemptTimeout, Timing
 from taskiq_llm_queue.engine import hooks, inference, tokens
@@ -1378,7 +1378,7 @@ class Engine:
             )
             if is_target_error(exc, info):
                 return await self._target_error(view, alias, held, dep_key, exc)
-            if _auth_error(info.code):
+            if isinstance(exc, CredentialsUnavailable) or _auth_error(info.code):
                 self.providers.pool.forget(route)
                 _, backoff = self._bad_accounts.get(deployment.account, (0.0, 2.5))
                 backoff = min(backoff * 2, 60.0)

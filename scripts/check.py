@@ -129,6 +129,16 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_front.py",),
         needs_stack=True,
     ),
+    "a15": Step(
+        "Assume-role accounts: STS AssumeRole per account, refresh, credential failures",
+        sources=("src/taskiq_llm_queue/clients", "src/taskiq_llm_queue/engine"),
+        tests=(
+            "tests/unit/clients/test_assume_role.py",
+            "tests/integration/engine/test_runtime.py::test_assume_role_failure_is_a_credential_failure",
+            "tests/integration/engine/test_runtime.py::test_credential_failure_is_per_process",
+        ),
+        needs_stack=True,
+    ),
     "a16": Step(
         "Latency-aware exclusion: slow deployments become last choices",
         sources=("src/taskiq_llm_queue/engine",),
@@ -166,7 +176,7 @@ def run_step(name: str, step: Step) -> bool:
     if step.needs_stack and (why := stack_up()):
         print(f"  FAIL  stack: {why}")
         return False
-    paths = [*step.sources, *step.tests]
+    paths = list(dict.fromkeys([*step.sources, *(t.split("::")[0] for t in step.tests)]))
     results = [
         _run("ruff check", [PY, "-m", "ruff", "check", *paths]),
         _run("ruff format --check", [PY, "-m", "ruff", "format", "--check", *paths]),
