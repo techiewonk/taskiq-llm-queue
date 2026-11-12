@@ -463,13 +463,14 @@ async def test_slow_deployment_becomes_last_choice(make: Make) -> None:
         },
         {
             "models": {
-                f"{GPT}@r1": {"latency_ms": {"p50": 600, "p95": 600}},
+                f"{GPT}@r1": {"latency_ms": {"p50": 1500, "p95": 1500}},
                 f"{GPT}@r2": {"latency_ms": {"p50": 20, "p95": 20}},
                 f"{GPT}@r3": {"latency_ms": {"p50": 20, "p95": 20}},
             }
         },
     )
     for region in ("r1", "r2", "r3"):
+        # 1.5 s against ~20 ms: a client's first-call start-up cannot hide the gap.
         for _ in range(2):  # samples for every deployment
             await engine.call("big", CHAT, allowed_regions=[region])
     served = [(await engine.call("big", CHAT)).meta.deployment for _ in range(4)]
