@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import socket
 import threading
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -208,6 +208,20 @@ class LLMQueue:
     ) -> Reply:
         """One OpenAI-compatible chat completion."""
         return await self.call(model, request, priority=priority, **kw)
+
+    async def converse_stream(
+        self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream a chat call's events as they arrive (plan §3.13).
+
+        Bedrock models yield ConverseStream events, OpenAI-compatible ones chat completion
+        chunks. A failure after events were yielded raises `CallFailed` with `partial_text`.
+        """
+        kwargs = self._call_kwargs(priority, **kw)
+        async for event in self.engine.stream(model, request, **kwargs):
+            yield event
+
+    chat_stream = converse_stream
 
     async def embed(
         self,

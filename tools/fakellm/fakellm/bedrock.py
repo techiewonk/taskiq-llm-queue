@@ -194,7 +194,15 @@ async def converse_stream(request: web.Request) -> web.StreamResponse:
         )
     else:
         chunk_chars = 32  # 8 tokens of 4 characters
-        for i in range(0, len(out_text), chunk_chars):
+        cut = outcome.behaviour.cut_after_chunks
+        for n, i in enumerate(range(0, len(out_text), chunk_chars)):
+            if cut is not None and n >= cut:
+                await response.write(
+                    eventstream.exception("modelStreamErrorException", "the stream was cut")
+                )
+                engine.settle(key, outcome, input_tokens)
+                await response.write_eof()
+                return response
             piece = out_text[i : i + chunk_chars]
             chunk: dict[str, Any] = {"contentBlockIndex": 0, "delta": {"text": piece}}
             await response.write(eventstream.event("contentBlockDelta", chunk))

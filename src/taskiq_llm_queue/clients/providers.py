@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -41,15 +41,24 @@ class Result:
     usage: Usage
 
 
+Sink = Callable[[Any], Awaitable[None]]
+"""Receives each streamed event of an attempt (streaming to the caller, plan §3.13)."""
+
+
 class Provider(Protocol):
     """One provider kind: runs an operation on a route and classifies its failures."""
 
     name: str
 
     async def call(
-        self, op: str, params: Mapping[str, Any], route: Route, timing: Timing
+        self,
+        op: str,
+        params: Mapping[str, Any],
+        route: Route,
+        timing: Timing,
+        sink: Sink | None = None,
     ) -> Result:
-        """Run one attempt."""
+        """Run one attempt; chat operations pass each streamed event to `sink`."""
         ...
 
     def classify(self, exc: BaseException) -> ErrorInfo:
@@ -140,11 +149,20 @@ class BedrockProvider:
             yield event
 
     async def call(
-        self, op: str, params: Mapping[str, Any], route: Route, timing: Timing
+        self,
+        op: str,
+        params: Mapping[str, Any],
+        route: Route,
+        timing: Timing,
+        sink: Sink | None = None,
     ) -> Result:
         """Run one `converse` or `invoke_model` attempt."""
         if op == "converse":
-            events = [event async for event in self.stream(params, route, timing)]
+            events = []
+            async for event in self.stream(params, route, timing):
+                events.append(event)
+                if sink is not None:
+                    await sink(event)
             body = _converse_body(events)
             return Result(body, _bedrock_usage(body.get("usage")))
         if op == "invoke_model":
@@ -264,11 +282,21 @@ class OpenAIProvider:
             yield chunk
 
     async def call(
-        self, op: str, params: Mapping[str, Any], route: Route, timing: Timing
+        self,
+        op: str,
+        params: Mapping[str, Any],
+        route: Route,
+        timing: Timing,
+        sink: Sink | None = None,
     ) -> Result:
         """Run one `chat` or `embeddings` attempt."""
         if op == "chat":
-            body = _chat_body([chunk async for chunk in self.stream(params, route, timing)])
+            chunks = []
+            async for chunk in self.stream(params, route, timing):
+                chunks.append(chunk)
+                if sink is not None:
+                    await sink(chunk)
+            body = _chat_body(chunks)
             return Result(body, _openai_usage(body.get("usage")))
         if op == "embeddings":
             client = self._pool.openai(route)

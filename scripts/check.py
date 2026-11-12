@@ -145,6 +145,17 @@ STEPS: dict[str, Step] = {
         tests=("tests/integration/engine/test_runtime.py",),
         needs_stack=True,
     ),
+    "a17": Step(
+        "Streaming to the caller: chunk streams, flush window, cuts, worker lost, idle",
+        sources=(
+            "src/taskiq_llm_queue/engine",
+            "src/taskiq_llm_queue/clients",
+            "src/taskiq_llm_queue/llm_queue.py",
+            "tools/fakellm/fakellm",
+        ),
+        tests=("tests/integration/engine/test_stream.py",),
+        needs_stack=True,
+    ),
 }
 
 

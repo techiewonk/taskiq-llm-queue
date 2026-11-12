@@ -15,7 +15,7 @@ import hashlib
 import random
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +45,7 @@ from taskiq_llm_queue.engine.offload import ResultOffload
 from taskiq_llm_queue.engine.queue import Message, QueueFull, QueueSettings, StreamQueues
 from taskiq_llm_queue.engine.requests import RequestStore
 from taskiq_llm_queue.engine.status import AlertEvaluator, StatusReader
+from taskiq_llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from taskiq_llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
 from taskiq_llm_queue.providers.classify import is_target_error
 
@@ -217,6 +218,7 @@ class Engine:
         self._idle = asyncio.Event()
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
+        self.chunks = ChunkReader(state)
 
     # ================================================================ lifecycle
 
@@ -273,6 +275,7 @@ class Engine:
         for task in [*self._tasks, *self._running]:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await self.chunks.aclose()
         for pubsub in (self._pubsub, self._cancels):
             if pubsub is not None:
                 with contextlib.suppress(Exception):
@@ -300,10 +303,13 @@ class Engine:
         allowed_regions: Sequence[str] | None = None,
         allowed_accounts: Sequence[str] | None = None,
         force_direct: bool = False,
+        stream: bool = False,
+        stream_id: str | None = None,
     ) -> Reply:
         """Run one call through the queue and return its reply; `CallFailed` on failure.
 
         `force_direct` runs it in this process (sync calls), with the same admission.
+        `stream` has the worker write events to the chunk stream of `stream_id` (`stream`).
         """
         view = self.registry.current
         alias = view.registry.alias_of(model)
@@ -317,7 +323,7 @@ class Engine:
         op = OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
         timeout = float(timeout_secs or view.value(alias, "timeout_secs"))
         timeout = min(timeout, float(view.value(alias, "timeout_max_secs")))
-        rid = request_id or uuid.uuid4().hex
+        rid = request_id or stream_id or uuid.uuid4().hex
         envelope = Envelope(
             request_id=rid,
             op=op,
@@ -334,6 +340,7 @@ class Engine:
             user_id=user_id,
             tenant_id=tenant_id,
             app_request_id=request_id is not None,
+            stream=stream,
         )
         hook_name = view.value(alias, "admission")
         hook = hooks.get("admission", hook_name)
@@ -359,7 +366,80 @@ class Engine:
                     await asyncio.shield(self.cancel(rid))
             raise
         except STORE_ERRORS as exc:
+            if stream:  # chunks travel through the state store
+                raise CallFailed("queue_unavailable", "the state store is unreachable") from exc
             return await self._store_down(view, alias, envelope, exc)
+
+    async def stream(
+        self, model: str, params: Mapping[str, Any], **call: Any
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run a chat call and yield the provider's events as they arrive (plan §3.13, F6).
+
+        Takes `call`'s options. The events are ConverseStream events (Bedrock) or chat
+        completion chunks (OpenAI-compatible). A failure after events were yielded raises
+        `CallFailed` with `partial_text`; no switch to another deployment happens then.
+        """
+        view = self.registry.current
+        alias = view.registry.alias_of(model)
+        idle = float(view.value(alias, "stream_idle_secs"))
+        rid = call.pop("request_id", None) or uuid.uuid4().hex
+        key = self.keys.request(rid, "chunks")
+        queue = self.chunks.open(key)
+        task = asyncio.create_task(self.call(model, params, stream=True, stream_id=rid, **call))
+        expected, started = 1, False
+        try:
+            while True:
+                getter = asyncio.ensure_future(queue.get())
+                finished = task.done()
+                done, _ = await asyncio.wait(
+                    {getter} if finished else {getter, task},
+                    timeout=idle if started or finished else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if getter not in done:
+                    getter.cancel()
+                    if task in done:
+                        if not started and not await self.state.xlen(key):
+                            task.result()  # raises the call's failure (nothing was streamed)
+                            return  # a finished call whose chunks expired: nothing to replay
+                        continue  # its last entries are still on the way
+                    if finished:
+                        task.result()
+                        raise CallFailed(
+                            "worker_lost", "the stream ended without its end entry", request_id=rid
+                        )
+                    raise CallFailed(
+                        "deadline_exceeded",
+                        f"no chunk for {idle:g} s (stream_idle_secs)",
+                        request_id=rid,
+                    )
+                entry = getter.result()
+                if entry["seq"] != expected:
+                    raise CallFailed(
+                        "worker_lost", f"gap in the stream at {expected}", request_id=rid
+                    )
+                expected += 1
+                started = True
+                if entry["t"] == "chunk":
+                    for event in entry["d"]:
+                        yield event
+                elif entry["t"] == "end":
+                    await task
+                    return
+                else:
+                    data = entry["d"]
+                    raise CallFailed(
+                        data.get("kind", "provider_error"),
+                        data.get("message", ""),
+                        partial_text=data.get("partial") or None,
+                        request_id=rid,
+                    )
+        finally:
+            self.chunks.close(key)
+            if not task.done():
+                task.cancel()  # the call's own handler cancels the request
+            with contextlib.suppress(BaseException):
+                await task
 
     def _direct_route(
         self, view: ResolvedRegistry, alias: str, rid: str, user_id: str | None
@@ -1235,6 +1315,9 @@ class Engine:
             if outcome == "ok":
                 return
             kind, info, exc = reply_or_error
+            if outcome == "stream_failed":  # never switched silently once chunks were sent
+                await self._finish_call(held, kind, str(exc), partial=info)
+                return
             entry = view.registry.models[alias]
             if outcome == "throttle":
                 throttles += 1
@@ -1335,12 +1418,65 @@ class Engine:
         if attempt == 1:
             minute = int(self.clock.now() // 60)
             await self.state.hincrby(self.keys.model(env.model, f"retries:{minute}"), "first", 1)
+        writer = None
+        if env.stream and env.op in ("converse", "chat"):
+            writer = ChunkWriter(
+                self.state,
+                self.keys.request(env.request_id, "chunks"),
+                owner,
+                flush_ms=int(view.value(alias, "stream_flush_ms", dep_key)),
+                max_bytes=int(view.value(alias, "stream_max_bytes")),
+                ttl_secs=self.settings.result_ttl_secs + int(env.timeout_secs),
+            )
+            if await self.state.xlen(writer.key):
+                # Another worker already streamed part of this answer (plan R19).
+                await self.admission.finish(
+                    alias,
+                    owner,
+                    env.request_id,
+                    refund_r=1,
+                    refund_t=estimate.total,
+                    outcome="none",
+                    latency_ms=-1,
+                )
+                lost = "the worker serving this stream was lost"
+                await writer.error("worker_lost", lost)
+                return "stream_failed", ("worker_lost", None, RuntimeError(lost))
         started = time.monotonic()
         try:
-            result = await asyncio.wait_for(provider.call(env.op, params, route, timing), remaining)
+            result = await asyncio.wait_for(
+                provider.call(env.op, params, route, timing, sink=writer.add if writer else None),
+                remaining,
+            )
+            if writer is not None:
+                await writer.end(
+                    {
+                        "inputTokens": result.usage.input_tokens,
+                        "outputTokens": result.usage.output_tokens,
+                    }
+                )
         except Exception as exc:
             latency = (time.monotonic() - started) * 1000
             info = provider.classify(exc)
+            if writer is not None and writer.sent:
+                # Chunks reached the caller: end the stream with the partial text (plan §3.13).
+                refund = tokens.refund(estimate, "cut")
+                await self.admission.finish(
+                    alias,
+                    owner,
+                    env.request_id,
+                    refund_r=refund.requests,
+                    refund_t=refund.tokens,
+                    outcome="fail",
+                    latency_ms=latency,
+                )
+                kind = "rate_limited" if info.kind is ErrorKind.THROTTLE else "provider_error"
+                message = (
+                    "stream above stream_max_bytes" if isinstance(exc, StreamTooLarge) else str(exc)
+                )
+                with contextlib.suppress(Exception):
+                    await writer.error(kind, message)
+                return "stream_failed", (kind, writer.partial_text, exc)
             cut = isinstance(exc, AttemptTimeout) and "chunk" in str(exc)
             if info.kind is ErrorKind.THROTTLE:
                 refund = tokens.refund(estimate, "throttle")
@@ -1531,6 +1667,7 @@ class Engine:
         *,
         final: str = "failed",
         retry_after: float | None = None,
+        partial: str | None = None,
     ) -> None:
         reply = Reply(
             request_id=env.request_id,
@@ -1538,6 +1675,7 @@ class Engine:
             error=kind,
             message=message,
             retry_after_secs=retry_after,
+            partial_text=partial or None,
             meta=Meta(served_model=env.model, worker=self.worker_id),
         )
         await self.requests.put_result(reply, final_state=final)
@@ -1551,8 +1689,11 @@ class Engine:
         *,
         final: str = "failed",
         retry_after: float | None = None,
+        partial: str | None = None,
     ) -> None:
-        await self._reply(held.envelope, kind, message, final=final, retry_after=retry_after)
+        await self._reply(
+            held.envelope, kind, message, final=final, retry_after=retry_after, partial=partial
+        )
         await self._count_target_errors(held, succeeded=False)
         self._record(held, held.envelope.model, "", "", kind, None)
         await self._ack(held)

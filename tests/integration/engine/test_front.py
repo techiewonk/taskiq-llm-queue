@@ -89,6 +89,14 @@ async def test_converse_with_request_context(llmq: LLMQueue) -> None:
     assert (await llmq.health())["ready"]
 
 
+async def test_converse_stream(llmq: LLMQueue) -> None:
+    request = {"messages": [{"role": "user", "content": [{"text": "hi"}]}]}
+    with request_context(priority=True):
+        events = [e async for e in llmq.converse_stream("big", request)]
+    assert "messageStart" in events[0]
+    assert "metadata" in events[-1]
+
+
 async def test_embed_and_jobs(llmq: LLMQueue) -> None:
     result = await llmq.embed("cohere", ["a", "b", "c"], input_type="search_query")
     assert len(result.vectors) == 3

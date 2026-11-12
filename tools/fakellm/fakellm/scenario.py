@@ -31,6 +31,7 @@ _FIELDS = frozenset(
         "output_tokens",
         "usage_missing",
         "hang",
+        "cut_after_chunks",
     }
 )
 
@@ -46,7 +47,9 @@ class Behaviour:
     `max_concurrency` / `rpm` / `tpm` of None mean unlimited; `force_error` names an `ERRORS`
     entry returned on every call. `tpm` reserves input + max_tokens at the start and settles to
     the real usage at the end, like Bedrock. `tokens_per_s` paces the output (0 = instant),
-    `output_tokens` fixes the reply length, `usage_missing` drops usage, `hang` never answers.
+    `output_tokens` fixes the reply length, `usage_missing` drops usage, `hang` never answers;
+    `cut_after_chunks` ends a Bedrock stream with `modelStreamErrorException` after that many
+    text chunks.
     """
 
     latency_p50_ms: float = 0.0
@@ -65,6 +68,7 @@ class Behaviour:
     output_tokens: int | None = None
     usage_missing: bool = False
     hang: bool = False
+    cut_after_chunks: int | None = None
 
 
 def _positive_int(name: str, value: Any, *, nullable: bool) -> int | None:
@@ -125,6 +129,9 @@ def build_behaviour(block: dict[str, Any]) -> Behaviour:
         output_tokens=_positive_int("output_tokens", block.get("output_tokens"), nullable=True),
         usage_missing=_flag("usage_missing", block.get("usage_missing", False)),
         hang=_flag("hang", block.get("hang", False)),
+        cut_after_chunks=_positive_int(
+            "cut_after_chunks", block.get("cut_after_chunks"), nullable=True
+        ),
         **rates,
     )
 

@@ -272,6 +272,7 @@ SETTINGS: Mapping[str, Spec] = {
     "retry_budget_pct": _spec("D,M", _PCT, 20),
     "retry_budget_min": _spec("D,M", number(0, integer=True), 10),
     "stream_idle_secs": _spec("D,M", _POS, 30),
+    "stream_max_bytes": _spec("M", number(1024, integer=True), 8_388_608),
     "max_waiting": _spec("D,M", number(0, integer=True), 50_000),
     "sticky_move_after_secs": _spec("D,M", _POS, 1),
     "require_headroom_pct": _spec("D,M", _PCT, 20),
