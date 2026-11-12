@@ -8,6 +8,7 @@ client is ever created: both classes get a placeholder client that refuses direc
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -17,7 +18,7 @@ from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from pydantic import Field, model_validator
 
 from taskiq_llm_queue.errors import LLMQueueError
-from taskiq_llm_queue.langchain._client import resolve_queue
+from taskiq_llm_queue.langchain._client import get_default_queue, resolve_queue
 
 if TYPE_CHECKING:
     from langchain_core.callbacks import (
@@ -85,18 +86,23 @@ def _looks_like_bedrock_id(model_id: str) -> bool:
 def _alias_values(values: Any) -> Any:
     """Resolve `model_alias` / `model_id` and reject a queue alias passed as the model id.
 
-    Without `model_id`, it is looked up from the queue's registry when a queue is given.
+    Without `model_id`, it is looked up from the registry of the given queue, else of the
+    started default queue.
     """
     if not isinstance(values, dict):
         return values
     model_id = values.get("model_id", values.get("model"))
     alias = values.get("model_alias")
     if model_id is None and alias is not None:
-        registry = getattr(values.get("llmq"), "registry", None)
+        queue = values.get("llmq")
+        if queue is None:
+            with contextlib.suppress(LLMQueueError):
+                queue = get_default_queue()
+        registry = getattr(queue, "registry", None)
         if registry is None:
             raise ValueError(
-                f"model_alias={alias!r} needs model_id='<Bedrock model id>' "
-                "(or llmq=<LLMQueue> so it can be looked up from the registry)"
+                f"model_alias={alias!r} needs model_id='<Bedrock model id>', llmq=<LLMQueue>, "
+                "or a started LLMQueue so it can be looked up from the registry"
             )
         values["model_id"] = registry.current.model(alias).model_id
     elif isinstance(model_id, str) and alias is None and not _looks_like_bedrock_id(model_id):

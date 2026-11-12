@@ -282,7 +282,11 @@ local function evaluate(cand)
     end
     table.insert(states, {b[1], b[2], mode, value})
     local left = avail(b[1], b[2], b[3], num(row.rate_burst, 0.1), mode) - R - cost
-    local frac = left / b[3]
+    -- Headroom is the share of what can be taken now: the minute (fixed) or the bucket
+    -- (smooth, which never holds more than rate_burst of the minute).
+    local size = b[3]
+    if mode ~= 'fixed' then size = math.max(1, math.floor(b[3] * num(row.rate_burst, 0.1))) end
+    local frac = left / size
     if headroom == nil or frac < headroom then headroom = frac end
     if b[4] == 'r' and not string.find(b[1], '{a:', 1, true) then most = left end
   end

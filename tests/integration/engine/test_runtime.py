@@ -106,6 +106,31 @@ async def test_model_fallback(make: Make) -> None:
     assert second.meta.fallback == "model"
 
 
+async def test_model_fallback_with_headroom_on_smooth_window(make: Make) -> None:
+    """Bug: smooth-window headroom was measured against the minute, never above rate_burst.
+
+    So `require_headroom` (20%) refused every fallback model, even an idle one.
+    """
+    engine, _ = await make(
+        {
+            "big": {
+                "rpm": 1,
+                "rate_window": "smooth",
+                "deployments": {"aws-a": {"confirmed": ["r1"]}},
+                "model_fallback": {
+                    "on": ["exhausted"],
+                    "after_secs": 0,
+                    "models": [{"model": "small", "require_headroom": True}],
+                },
+            },
+            "small": {"rpm": 600, "rate_window": "smooth"},
+        }
+    )
+    await engine.call("big", CHAT)
+    second = await engine.call("big", CHAT)
+    assert second.meta.served_model == "small"
+
+
 async def test_duplicate_request_ids(make: Make) -> None:
     engine, fake = await make(scenario={"defaults": {"latency_ms": {"p50": 200, "p95": 200}}})
     one, two = await asyncio.gather(
