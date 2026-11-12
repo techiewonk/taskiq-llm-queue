@@ -28,6 +28,14 @@ A clean break from 0.2 (plan E101): nothing is carried over. Empty the 0.2 queue
   per provider, embeddings batched per model, large results in S3.
 - Status, alerts, metrics (CloudWatch EMF, Prometheus), one `llmq_call_finished` record per call,
   HTTP routes, the new `llm-queue` CLI, jobs on the stream queue.
+- Assume-role accounts (`role_arn`, `external_id_ref`): STS AssumeRole per account, sessions
+  named `llmq-<env>-<pod>`, refreshed before expiry; an STS failure is a per-process
+  credential failure. `LLMQ_STS_ENDPOINT_URL` for tests.
+- Latency-aware exclusion: a deployment much slower than the model's median (`health`
+  settings) becomes a last choice.
+- Streaming to the caller: `LLMQueue.converse_stream` / `chat_stream` yield provider events
+  through a chunk stream in the state store (`stream_flush_ms`, `stream_max_bytes`,
+  `stream_idle_secs`); a cut mid-stream raises `CallFailed` with `partial_text`.
 
 ### Removed
 

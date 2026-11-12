@@ -1952,9 +1952,14 @@ Valkey 8.1 and Redis 7.4 against fakellm. No test calls a real LLM.
 | A12 | Status, readiness, alerts, metrics, call record, drain, HTTP handlers, CLI, process settings | `a12` |
 | A13 | Embeddings batched per model; large results in S3 | `a13` |
 | A14 | `LLMQueue` front door, jobs on the stream queue, sync calls, LangChain adapters; every 0.2 module, test, sample and harness removed; the app moved to 0.3 | `a14` |
-| A15 | Assume-role accounts (0.3.1) | not built: the pool refuses `role_arn` with a clear error |
-| A16 | Latency-aware exclusion (0.3.1); sticky sessions are built (A6) | latency samples are recorded; exclusion not built |
-| A17 | Streaming to the caller (0.3.1); chat already streams underneath | not built |
+| A15 | Assume-role accounts: STS AssumeRole per account (external id from secrets, session `llmq-<env>-<pod>`, one hour, refreshed by aiobotocore before expiry); STS failures are per-process credential failures; tested against moto's STS server | `a15` |
+| A16 | Latency-aware exclusion in PICK_TAKE: with 3+ sampled deployments, one slower than `slow_ratio` x the median and `slow_min_secs` becomes a last choice; status shows `samples` | `a16` |
+| A17 | Streaming to the caller: chunk stream per request (first event at once, then `stream_flush_ms` batches, `stream_max_bytes` cap, end / error entries with the partial text), one multiplexed reader per caller process, `worker_lost` for a stream begun elsewhere, gap and idle checks; direct path streams the same way; `LLMQueue.converse_stream` | `a17` |
+
+All plan steps are built; A15-A17 ship in 0.3.0 instead of 0.3.1 since 0.3.0 is not released.
+Known limits: a streaming call fails with `queue_unavailable` when the state store is down
+(chunks travel through it); a caller's chunk reader adds at most 100 ms before the first
+chunk of a newly opened stream (one blocking read is shared by all open streams).
 
 Open items for the owner: real quotas (Q1), region lists (Q2), residency sign-off (Q4), the
 streaming permission in every listed account and region (Q6), and releasing 0.3.0 through the
