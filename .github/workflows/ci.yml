@@ -18,7 +18,7 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
@@ -34,7 +34,7 @@ jobs:
     # Oldest versions the ranges in pyproject allow: catches floors that are wrong in practice.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
@@ -45,7 +45,7 @@ jobs:
     # The dev lock pins the LangChain 0.3 line; the extras also allow 1.x, so test the adapters there.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -59,7 +59,7 @@ jobs:
     # Valkey 8.1, ElasticMQ 1.7.1 and fakellm from docker/compose.yaml (same stack as local).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
