@@ -2,7 +2,9 @@
 
 A call's record is written only if absent when it is sent and confirmed only after the send
 succeeded, so a failed send never leaves a phantom (plan §3.18 R23). Results are written once
-and read without deleting; a final status is never replaced. Scripts use the store's clock.
+(and announced to the caller in the same script); a library id's result is deleted on its
+first read, an app id's kept `result_ttl_secs`. A final status is never replaced. Scripts use
+the store's clock.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+import orjson
 
 from taskiq_llm_queue.engine.envelope import Reply
 from taskiq_llm_queue.engine.keys import Keys
@@ -58,6 +62,14 @@ if #job == 0 then
 end
 local fields = {}
 for i = 1, #job, 2 do fields[job[i]] = job[i + 1] end
+if fields['params'] == nil then
+  -- A record a worker's claim made (its caller's record was gone): the call is running;
+  -- attach to it rather than call it a conflict.
+  redis.call('HSET', KEYS[1], 'user', ARGV[1], 'params', ARGV[2], 'caller', ARGV[3],
+    'confirmed', '1', 'created', now)
+  redis.call('SADD', KEYS[2], ARGV[3])
+  return 'attached'
+end
 if fields['user'] ~= ARGV[1] or fields['params'] ~= ARGV[2] then return 'conflict' end
 local state = fields['state']
 if state == 'done' or state == 'failed' or state == 'expired' or state == 'cancelled' then
@@ -115,8 +127,14 @@ RESULT_TAKE = """
 local value = redis.call('GET', KEYS[1])
 if not value then return false end
 if redis.call('HGET', KEYS[2], 'app') ~= '1' then
-  local ttl = redis.call('TTL', KEYS[1])
-  if ttl > tonumber(ARGV[1]) then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+  -- A library id has one reader, and the job record still says `done` to any redelivery:
+  -- with no dedupe window the body goes at once (bulk embeddings kept ~2 MB a call: B97).
+  if tonumber(ARGV[1]) <= 0 then
+    redis.call('DEL', KEYS[1])
+  else
+    local ttl = redis.call('TTL', KEYS[1])
+    if ttl > tonumber(ARGV[1]) then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+  end
 end
 return value
 """
@@ -148,11 +166,6 @@ class Registration:
 
     outcome: str
 
-    @property
-    def must_send(self) -> bool:
-        """True when this caller must put the message on the queue."""
-        return self.outcome in ("new", "takeover")
-
 
 class RequestStore:
     """Claim records, results and request status of one environment."""
@@ -163,7 +176,7 @@ class RequestStore:
         keys: Keys,
         *,
         result_ttl_secs: int = 300,
-        result_dedupe_secs: int = 30,
+        result_dedupe_secs: int = 0,
         status_ttl_secs: int = 1800,
         unconfirmed_secs: int = 30,
         takeover_grace_secs: int = 5,
@@ -258,7 +271,7 @@ class RequestStore:
         return bool(written)
 
     async def take_result(self, request_id: str) -> Reply | None:
-        """A stored result (not deleted; a library id keeps it `result_dedupe_secs` more)."""
+        """A stored result; a library id's is then deleted (or kept `result_dedupe_secs`)."""
         job, _, _, result = self._req(request_id)
         raw = await self._take([result, job], [self.dedupe])
         if raw is None:
@@ -267,7 +280,7 @@ class RequestStore:
             raw = await self.offload.get(raw[len(MARKER) :].decode())
             if raw is None:
                 return None
-        return Reply.model_validate_json(raw)
+        return Reply.model_validate(orjson.loads(raw))
 
     async def set_status(self, request_id: str, state: str, **fields: Any) -> bool:
         """Write a status (False when a final state was already there)."""

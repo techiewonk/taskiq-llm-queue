@@ -92,6 +92,7 @@ async def rig(
     account: dict[str, Any] | None = None,
     lease_secs: float = 60,
     waiter_secs: float = 2,
+    timings: Any = None,
 ) -> Rig:
     doc = copy.deepcopy(BASE)
     doc["models"]["m"].update(model or {})
@@ -101,7 +102,9 @@ async def rig(
         doc["accounts"]["aws-a"]["settings"] = account
     store = RegistryStore(client, prefix, config=doc)
     await store.boot()
-    admission = Admission(client, Keys(prefix), lease_secs=lease_secs, waiter_secs=waiter_secs)
+    admission = Admission(
+        client, Keys(prefix), lease_secs=lease_secs, waiter_secs=waiter_secs, timings=timings
+    )
     return Rig(admission, store.changes, store)
 
 
@@ -297,12 +300,83 @@ async def test_foreign_call(store: redis.asyncio.Redis, prefix: str) -> None:
 
 
 async def test_renew_and_sweep(store: redis.asyncio.Redis, prefix: str) -> None:
+    """A renewed grant survives the sweep; one nobody renews is removed once its lease ends.
+
+    Renews like the heartbeat, while polling the sweep: fixed sleeps around a 0.3 s lease
+    failed when the machine was busy (the kept lease ran out between the two sleeps).
+    """
     r = await rig(store, prefix, lease_secs=0.3)
     await r.ask("kept")
     await r.ask("dead")
-    await asyncio.sleep(0.15)
-    assert await r.admission.renew([("m", owner_token("kept", "w1", 1), "kept")]) == 1
-    await asyncio.sleep(0.2)
-    assert await r.admission.sweep("m") == 1
+    kept = [("m", owner_token("kept", "w1", 1), "kept")]
+    removed = 0
+    for _ in range(100):
+        assert await r.admission.renew(kept) == 1
+        removed += await r.admission.sweep("m")
+        if removed:
+            break
+        await asyncio.sleep(0.05)
+    assert removed == 1
     left = await store.zrange(f"{prefix}:{{m:m}}:inprog", 0, -1)
     assert left == [owner_token("kept", "w1", 1).encode()]
+
+
+async def test_breaker_counts_recent_failures_only(store: redis.asyncio.Redis, prefix: str) -> None:
+    """Bug (0.3.0 review): failures counted forever until a success, so failures spread over
+    hours opened the breaker; a failure more than 60 s after the last now starts again."""
+    r = await rig(store, prefix, model={"breaker_threshold": 2})
+    one = [Candidate("aws-a/r1")]
+    cb = f"{prefix}:{{m:m}}:cb:aws-a/r1"
+
+    async def fail(rid: str) -> None:
+        assert (await r.ask(rid, worker="w1", candidates=one)).kind == "granted"
+        await r.admission.finish(
+            "m", owner_token(rid, "w1", 1), rid, refund_r=0, refund_t=0, outcome="fail"
+        )
+
+    await fail("f1")
+    await store.hset(cb, "fail_at", 0)  # the last failure was long ago
+    await fail("f2")
+    assert await store.hget(cb, "state") != b"open"
+    await fail("f3")  # two recent failures: the threshold
+    assert await store.hget(cb, "state") == b"open"
+
+
+async def test_a_call_waits_for_a_breaker_probe_in_flight(
+    store: redis.asyncio.Redis, prefix: str
+) -> None:
+    """Scenario P7 bug: while a breaker's one probe call ran, other calls failed at once as
+    `model_unavailable` (admission said "none") although the provider had recovered. They now
+    wait (`probe`) for `EngineTimings.admission_probe_wait_ms`, then try again.
+    """
+    from taskiq_llm_queue.tuning import EngineTimings
+
+    r = await rig(store, prefix, timings=EngineTimings(admission_probe_wait_ms=350))
+    one = [Candidate("aws-a/r1")]
+    cb = f"{prefix}:{{m:m}}:cb:aws-a/r1"
+    await store.hset(cb, mapping={"state": "open", "until": 0})  # cooled down: half-open
+    assert (await r.ask("probe", worker="w1", candidates=one)).kind == "granted"  # the probe
+    second = await r.ask("next", worker="w2", candidates=one)
+    assert second.kind == "wait"
+    assert second.reason == "probe"
+    assert second.wait_secs == 0.35
+
+
+async def test_breaker_window_is_a_setting(store: redis.asyncio.Redis, prefix: str) -> None:
+    """The failure window was a fixed 60 s in the script; it is now `breaker_window_secs`."""
+    r = await rig(store, prefix, model={"breaker_threshold": 2, "breaker_window_secs": 1})
+    one = [Candidate("aws-a/r1")]
+    cb = f"{prefix}:{{m:m}}:cb:aws-a/r1"
+
+    async def fail(rid: str) -> None:
+        assert (await r.ask(rid, worker="w1", candidates=one)).kind == "granted"
+        await r.admission.finish(
+            "m", owner_token(rid, "w1", 1), rid, refund_r=0, refund_t=0, outcome="fail"
+        )
+
+    await fail("f1")
+    await asyncio.sleep(1.2)  # time is what is under test: past the 1 s window
+    await fail("f2")
+    assert await store.hget(cb, "state") != b"open"  # the count started again
+    await fail("f3")
+    assert await store.hget(cb, "state") == b"open"

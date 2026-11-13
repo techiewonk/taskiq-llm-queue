@@ -1,20 +1,10 @@
 # Local test stack for taskiq-llm-queue. All config is in this file (no .env needed).
-# Start:  docker compose -f docker/compose.yaml up -d --wait     (or: make up)
-# Stop:   docker compose -f docker/compose.yaml down              (or: make down)
+# Start:  python scripts/stack.py up      (docker compose -f docker/compose.yaml up -d --wait)
+# Stop:   python scripts/stack.py down
 #
-# Core services (valkey, sqs, fakellm) for now. worker, locust, prometheus and grafana are added as they're built.
+# Valkey and Redis (every store test runs on both) and fakellm (fake Bedrock / OpenAI). Queues
+# are Valkey streams in the same store; there is no separate queue service.
 name: llmq-test
-
-x-llmq-env: &llmq-env
-  LLMQ_KEY_PREFIX: llmq:local
-  LLMQ_REDIS_HOST: valkey
-  LLMQ_REDIS_PORT: "6379"
-  LLMQ_REDIS_PASSWORD: localdev
-  LLMQ_REDIS_SSL: "false"
-  LLMQ_SQS_ENDPOINT_URL: http://sqs:9324
-  AWS_ACCESS_KEY_ID: test
-  AWS_SECRET_ACCESS_KEY: test
-  AWS_DEFAULT_REGION: ap-south-1
 
 services:
   valkey:
@@ -39,11 +29,6 @@ services:
       timeout: 2s
       retries: 15
 
-  sqs:
-    image: softwaremill/elasticmq-native:1.7.1
-    volumes: ["./elasticmq.conf:/opt/elasticmq.conf:ro"]
-    ports: ["9324:9324", "9325:9325"]
-
   fakellm:
     # Fake Bedrock (Converse, InvokeModel) + OpenAI (chat, embeddings); admin API on the same port.
     # Pick a scenario with SCENARIO=<name> (file tools/fakellm/scenarios/<name>.yaml).
@@ -58,55 +43,3 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
-
-  # ---------------------------------------------------------------- scenario harness (profile scn)
-  # An isolated stack for `python -m tools.scenarios`: chaos scenarios stop/kill these services,
-  # never the shared ones above. Start: docker compose -f docker/compose.yaml --profile scn up -d --wait
-  # Persistent twin of valkey-scn, configured like a production queue server (AOF, fsync on
-  # every write, no eviction): `SCN_QUEUE_BACKEND=valkey` runs state and queues on it.
-  valkey-scn-persist:
-    image: valkey/valkey:8.1-alpine
-    profiles: ["scn"]
-    command: ["valkey-server", "--port", "16380", "--requirepass", "localdev", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
-    ports: ["16380:16380"]
-    healthcheck:
-      test: ["CMD", "valkey-cli", "-p", "16380", "-a", "localdev", "--no-auth-warning", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-
-  valkey-scn:
-    image: valkey/valkey:8.1-alpine
-    profiles: ["scn"]
-    command: ["valkey-server", "--port", "16379", "--requirepass", "localdev", "--save", "", "--appendonly", "no"]
-    ports: ["16379:16379"]
-    healthcheck:
-      test: ["CMD", "valkey-cli", "-p", "16379", "-a", "localdev", "--no-auth-warning", "ping"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-
-  sqs-scn:
-    # No pre-declared queues: the harness creates its own (with DLQs). host "*" keeps queue URLs
-    # valid from the host (localhost:19324) and from containers (sqs-scn:19324).
-    image: softwaremill/elasticmq-native:1.7.1
-    profiles: ["scn"]
-    volumes: ["../tools/scenarios/docker/elasticmq-scn.conf:/opt/elasticmq.conf:ro"]
-    ports: ["19324:19324"]
-
-  worker-scn:
-    # Scenario worker built from the package (rolling-deploy / docker stop chaos). The harness
-    # runs workers as local processes by default; `--scale worker-scn=3` for container workers.
-    build: {context: .., dockerfile: tools/scenarios/docker/worker.Dockerfile}
-    profiles: ["scn-docker"]
-    environment:
-      SCN_REDIS_HOST: valkey-scn
-      SCN_REDIS_PORT: "16379"
-      SCN_SQS_URL: http://sqs-scn:19324
-      SCN_FAKELLM_URL: ${SCN_FAKELLM_URL:-http://host.docker.internal:18080}
-      SCN_PREFIX: ${SCN_PREFIX:-llmq:scn}
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: ap-south-1
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    stop_grace_period: 60s

@@ -24,6 +24,13 @@ pytestmark = pytest.mark.integration
 _stats = stats
 
 
+async def _away_from_minute_end(engine: Any, margin_secs: float = 15.0) -> None:
+    """Start a fixed-window test with `margin_secs` left in the minute (no budget reset)."""
+    left = 60 - engine.clock.now() % 60
+    if left < margin_secs:
+        await asyncio.sleep(left + 0.1)
+
+
 async def test_chat_round_trip(make: Make) -> None:
     engine, fake = await make()
     reply = await engine.call("big", CHAT, priority=True)
@@ -147,8 +154,11 @@ async def test_duplicate_request_ids(make: Make) -> None:
 
 async def test_queue_full(make: Make) -> None:
     engine, _ = await make({"big": {"max_waiting": 1}}, worker=False)
-    first = asyncio.create_task(engine.call("big", CHAT, timeout_secs=2))
-    await asyncio.sleep(0.2)
+    first = asyncio.create_task(engine.call("big", CHAT, timeout_secs=2, request_id="q-first"))
+    for _ in range(100):  # until the first call is on the queue (a fixed 0.2 s was flaky)
+        if (await engine.requests.job("q-first")).get("confirmed") or first.done():
+            break
+        await asyncio.sleep(0.02)
     with pytest.raises(CallFailed) as info:
         await engine.call("big", CHAT, timeout_secs=2)
     assert info.value.kind == "queue_full"
@@ -212,6 +222,7 @@ async def test_fallback_only_for_listed_causes(make: Make) -> None:
             }
         }
     )
+    await _away_from_minute_end(engine)  # rpm 1 per fixed minute: stay in one minute
     await engine.call("big", CHAT)
     await engine.call("big", CHAT)
     with pytest.raises(CallFailed) as info:  # exhausted is not a listed cause: no spill to r3
@@ -367,14 +378,15 @@ async def test_store_down_modes(make: Make) -> None:
     env = Envelope(
         request_id="x", op="converse", model="small", params=CHAT, caller="c", timeout_secs=5
     )
-    reply = await engine._store_down(view, "small", env, ConnectionError("down"))
+    deadline = asyncio.get_running_loop().time() + 10
+    reply = await engine._store_down(view, "small", env, ConnectionError("down"), deadline)
     assert reply.ok
     assert _stats(fake, f"{SMALL}@r1")["ok"] == 1
     fast = Envelope(
         request_id="y", op="converse", model="big", params=CHAT, caller="c", timeout_secs=5
     )
     with pytest.raises(CallFailed) as info:
-        await engine._store_down(view, "big", fast, ConnectionError("down"))
+        await engine._store_down(view, "big", fast, ConnectionError("down"), deadline)
     assert info.value.kind == "queue_unavailable"
 
 
@@ -383,7 +395,10 @@ async def test_store_reset_reregisters_running_calls(
 ) -> None:
     engine, _ = await make(scenario={"defaults": {"latency_ms": {"p50": 2000, "p95": 2000}}})
     task = asyncio.create_task(engine.call("big", CHAT, request_id="long"))
-    await asyncio.sleep(0.6)
+    for _ in range(100):  # until the call runs (not a fixed sleep: client start-up varies)
+        if await store.exists(engine.keys.model("big", "inprog:long")):
+            break
+        await asyncio.sleep(0.05)
     keys = [k async for k in store.scan_iter(match=f"{engine.keys.prefix}:*", count=500)]
     await store.delete(*keys)  # the store lost everything (flush / failover)
     await engine._check_epoch()
@@ -405,6 +420,12 @@ async def test_target_errors_disable_a_deployment(make: Make) -> None:
         reply = await engine.call("big", CHAT)
         assert reply.meta.deployment == "aws-a/r2"
         assert reply.meta.attempts == 2
+    # The reply is published before the error is counted (the user never waits for health
+    # bookkeeping), so the third disable may land just after the call returns.
+    for _ in range(40):
+        if "aws-a/r1" in await engine.health.disabled("big"):
+            break
+        await asyncio.sleep(0.05)
     assert "aws-a/r1" in await engine.health.disabled("big")
     after = await engine.call("big", CHAT)
     assert after.meta.attempts == 1  # r1 is skipped now
@@ -456,7 +477,7 @@ async def test_credential_failure_is_per_process(make: Make) -> None:
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT)
     assert info.value.kind == "credentials_unavailable"
-    assert "aws-a" in engine._bad_accounts
+    assert any(account == "aws-a" for account, _ in engine._bad_accounts)
 
 
 async def test_assume_role_failure_is_a_credential_failure(make: Make) -> None:
@@ -470,7 +491,7 @@ async def test_assume_role_failure_is_a_credential_failure(make: Make) -> None:
     with pytest.raises(CallFailed) as info:
         await engine.call("small", CHAT)
     assert info.value.kind == "credentials_unavailable"
-    assert "aws-a" in engine._bad_accounts
+    assert any(account == "aws-a" for account, _ in engine._bad_accounts)
     assert not await engine.health.snapshot("small")
 
 

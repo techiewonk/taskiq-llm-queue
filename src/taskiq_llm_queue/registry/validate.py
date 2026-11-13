@@ -92,17 +92,6 @@ def _check_model(
         if weights and not any(weights):
             errors.append(f"{path}: every confirmed deployment has weight 0")
 
-    # Output reservation from observed usage: only where TPM is enforced, never on Bedrock.
-    if view.value(alias, "output_reserve") == "observed":
-        if entry.provider == "bedrock":
-            errors.append(
-                f"{path}.output_reserve: Bedrock reserves max_tokens itself; use max_tokens"
-            )
-        for dep in deployments:
-            limits = view.value(alias, "rate_limits", dep.key)
-            if limits not in ("both", "tpm") or _budget_numbers(view, alias, dep)[1] is None:
-                errors.append(f"{path}.output_reserve @ {dep.key}: needs TPM to be enforced")
-
     # Inference parameters by model type and provider; defaults within their limits.
     wrong = EMBED_INFERENCE if entry.type == "chat" else CHAT_INFERENCE
     for dep_key in (None, *(d.key for d in deployments)):
@@ -195,6 +184,23 @@ def _check_registry(view: ResolvedRegistry) -> tuple[list[str], list[str]]:
     for account in registry.routing.blocked_accounts:
         if account not in registry.accounts:
             warnings.append(f"routing.blocked_accounts: `{account}` is not an account")
+    # One shared account budget, one window: a fixed and a smooth window (or two bursts) on the
+    # same counter each enforced their own view of it, and 4 shared RPM let 8 calls through.
+    for name, account_entry in registry.accounts.items():
+        settings = account_entry.settings
+        if settings.get("shared_rpm") is None and settings.get("shared_tpm") is None:
+            continue
+        windows = {
+            (view.value(alias, "rate_window", d.key), view.value(alias, "rate_burst", d.key))
+            for alias in registry.models
+            for d in view.deployments(alias)
+            if d.account == name
+        }
+        if len(windows) > 1:
+            errors.append(
+                f"accounts.{name}: deployments sharing `shared_rpm` / `shared_tpm` must use one "
+                "`rate_window` and `rate_burst` (set them on the account)"
+            )
     return errors, warnings
 
 

@@ -18,6 +18,7 @@ import orjson
 from redis.exceptions import RedisError
 
 from taskiq_llm_queue._logging import get_logger
+from taskiq_llm_queue.engine.store_guard import store_op
 from taskiq_llm_queue.errors import ConfigError
 from taskiq_llm_queue.registry import _lua
 from taskiq_llm_queue.registry.resolve import ResolvedRegistry
@@ -29,8 +30,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 AUDIT_RETENTION_DAYS = 90
-HISTORY_SIZE = 20
-EDIT_RETRIES = 3
 LIVE_EDIT_MODES = ("safe", "all", "off")
 _SECRET_FIELDS = frozenset({"role_arn", "external_id_ref", "api_key_ref"})
 # Settings whose value goes into a model's resolved numbers (read by the admission script).
@@ -43,11 +42,12 @@ ADMISSION_SETTINGS = (
     "rate_burst",
     "tpm_output_weight",
     "max_concurrency",
-    "limiter_initial",
     "weight",
     "attempt_timeout_secs",
     "breaker_threshold",
     "breaker_cooldown_secs",
+    "breaker_window_secs",
+    "breaker_probe_secs",
 )
 MODEL_ADMISSION_SETTINGS = (
     "balance",
@@ -56,7 +56,6 @@ MODEL_ADMISSION_SETTINGS = (
     "priority_reserve",
     "normal_min_share",
     "require_headroom_pct",
-    "output_reserve",
     "max_waiting",
     "health",
 )
@@ -136,6 +135,8 @@ def _protected(path: Path) -> str | None:
     """Why a changed path is protected under `registry_live_edit=safe`, or None."""
     if "residency" in path:
         return "residency changes only with a deploy"
+    if path[-1:] == ("debug_capture",):
+        return "debug_capture (stores prompt text) changes only with a deploy"
     if path[:1] == ("accounts",):
         if len(path) == 2:
             return "adding or removing an account changes only with a deploy"
@@ -256,6 +257,8 @@ class RegistryStore:
         live_edit: str = "safe",
         allowed_hosts: tuple[str, ...] = (),
         audit_retention_days: int = AUDIT_RETENTION_DAYS,
+        history_size: int = 20,
+        edit_retries: int = 3,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         """Keep the client and settings; nothing is read or written until `boot` or `load`."""
@@ -263,6 +266,8 @@ class RegistryStore:
             raise ConfigError(f"registry_live_edit must be one of {', '.join(LIVE_EDIT_MODES)}")
         self._client = client
         self.prefix = prefix
+        self._history_size = history_size  # `Tuning.registry`
+        self._edit_retries = edit_retries
         self.config = dict(config) if config is not None else None
         self.live_edit = live_edit
         self._hosts = allowed_hosts
@@ -371,6 +376,7 @@ class RegistryStore:
         values = [orjson.dumps(admission_numbers(view, a)).decode() for a in aliases]
         return keys, values
 
+    @store_op
     async def publish(self, doc: Mapping[str, Any], *, actor: str) -> PublishResult:
         """Publish a document by the version rule; raise `RegistryError` when it is invalid."""
         registry, errors, warnings = check(doc, strict=True, allowed_hosts=self._hosts)
@@ -389,7 +395,7 @@ class RegistryStore:
                 actor,
                 changes,
                 self._retention_ms,
-                HISTORY_SIZE,
+                self._history_size,
                 *values,
             ],
         )
@@ -423,6 +429,7 @@ class RegistryStore:
 
     # ---------------------------------------------------------------- live edits
 
+    @store_op
     async def edit(
         self, change: Callable[[dict[str, Any]], None], *, actor: str
     ) -> ResolvedRegistry:
@@ -431,7 +438,7 @@ class RegistryStore:
         Compare-and-set on the change counter; on a race the document is read again and the
         change re-applied (up to three times).
         """
-        for _ in range(EDIT_RETRIES):
+        for _ in range(self._edit_retries):
             doc, meta = await self._read()
             if doc is None:
                 raise ConfigError("no registry is stored; publish one first")
@@ -464,6 +471,7 @@ class RegistryStore:
                 return loaded
         raise RegistryConflict("the registry kept changing; try again")
 
+    @store_op
     async def set(
         self, values: Mapping[str, Any], *, actor: str, model: str | None = None
     ) -> ResolvedRegistry:
@@ -481,6 +489,7 @@ class RegistryStore:
 
         return await self.edit(change, actor=actor)
 
+    @store_op
     async def set_enabled(
         self, model: str, deployment: str, enabled: bool, *, actor: str
     ) -> ResolvedRegistry:
@@ -494,10 +503,25 @@ class RegistryStore:
 
         return await self.edit(change, actor=actor)
 
+    @store_op
     async def block(
         self, *, region: str | None = None, account: str | None = None, on: bool, actor: str
     ) -> ResolvedRegistry:
-        """Block (or unblock) a region or an account for every model."""
+        """Block (or unblock) a region or an account for every model.
+
+        `ConfigError` when neither is given, or when blocking a name the registry does not use
+        (a typo would otherwise block nothing and look done).
+        """
+        if not region and not account:
+            raise ConfigError("give a region or an account to block")
+        if on:
+            view = self.current
+            accounts = set(view.registry.raw.get("accounts", {}))
+            regions = {d.region for alias in view.registry.models for d in view.deployments(alias)}
+            if account and account not in accounts:
+                raise ConfigError(f"unknown account {account!r}")
+            if region and region not in regions:
+                raise ConfigError(f"no deployment uses region {region!r}")
 
         def change(doc: dict[str, Any]) -> None:
             routing = doc.setdefault("routing", {})
@@ -511,6 +535,7 @@ class RegistryStore:
 
     # ---------------------------------------------------------------- history, rollback, diff
 
+    @store_op
     async def log(self, count: int = 20, path_prefix: str = "") -> list[dict[str, Any]]:
         """Latest audit entries, newest first; `path_prefix` keeps entries that touch it."""
         entries = await self._client.xrevrange(self.audit_key, count=max(count * 5, count))
@@ -525,10 +550,12 @@ class RegistryStore:
                 break
         return out
 
+    @store_op
     async def versions(self) -> list[int]:
         """Published versions still kept for rollback, oldest first."""
         return sorted(int(_text(v)) for v in await self._client.hkeys(self.history_key))
 
+    @store_op
     async def rollback(self, version: int, *, actor: str) -> PublishResult:
         """Publish the content of an earlier version as a new, higher version."""
         raw = await self._client.hget(self.history_key, str(version))
@@ -539,6 +566,7 @@ class RegistryStore:
         doc["registry_version"] = int(meta.get("version", "0")) + 1
         return await self.publish(doc, actor=f"{actor} (rollback to {version})")
 
+    @store_op
     async def diff_with_config(self) -> list[dict[str, Any]]:
         """What is live but not in this process's config (live edits a deploy would drop)."""
         doc, _ = await self._read()

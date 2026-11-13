@@ -1,15 +1,14 @@
 taskiq-llm-queue
 Copyright (c) 2026 The taskiq-llm-queue authors. Licensed under the MIT License.
 
-The SQS broker's design and feature set build on two MIT-licensed projects. This package is
-an independent implementation; any code adapted from them keeps its original notice below.
+The queue's design (visibility heartbeat, message metadata, large results in S3) builds on
+ideas from two MIT-licensed SQS brokers. This package is an independent implementation on
+Valkey / Redis streams; any code adapted from them keeps its original notice below.
 
 taskiq-aio-sqs — https://github.com/vonsteer/taskiq-aio-sqs
   Copyright (c) 2022-2024 Jesse Constante. MIT License.
-  Ideas used: aiobotocore-based broker, visibility heartbeat, message metadata,
-  extended (S3) messages, batching, fair queues.
+  Ideas used: visibility heartbeat, message metadata, extended (S3) messages.
 
 taskiq-sqs — https://github.com/taskiq-python/taskiq-sqs
   Copyright (c) 2026 Mike Shultz and Taskiq team. MIT License.
-  Ideas used: multi-queue structure, queue declaration, message expiry,
-  batch flush on shutdown, S3 offload middleware and result backend.
+  Ideas used: message expiry, flush on shutdown, S3 offload of large results.

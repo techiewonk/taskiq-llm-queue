@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +18,7 @@ import orjson
 from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.engine.queue import Message, QueueSettings, StreamQueues
 from taskiq_llm_queue.errors import ConfigError
+from taskiq_llm_queue.ids import new_id
 
 if TYPE_CHECKING:
     pass
@@ -47,6 +47,7 @@ class JobRunner:
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
         self._stopping = False
+        self._paused = False
 
     def queue(self, name: str) -> str:
         """The queue of one job name."""
@@ -62,7 +63,7 @@ class JobRunner:
         self, name: str, payload: Mapping[str, Any], *, job_id: str | None = None
     ) -> str:
         """Queue a job; returns its id (jobs run at least once: make them idempotent)."""
-        ident = job_id or uuid.uuid4().hex
+        ident = job_id or new_id()
         body = orjson.dumps({"id": ident, "name": name, "payload": payload})
         await self.queues.send(self.queue(name), body, self.settings)
         return ident
@@ -71,6 +72,10 @@ class JobRunner:
         """One worker loop per registered job."""
         for name in self._jobs:
             self._tasks.append(asyncio.create_task(self._loop(name)))
+
+    def pause(self) -> None:
+        """Take no new jobs; running ones go on (`stop()` follows)."""
+        self._paused = True
 
     async def stop(self, drain_secs: float = 10.0) -> None:
         """Stop receiving, let running jobs finish (up to `drain_secs`), then stop."""
@@ -86,6 +91,9 @@ class JobRunner:
     async def _loop(self, name: str) -> None:
         gate = asyncio.Semaphore(self.concurrency)
         while not self._stopping:
+            if self._paused:
+                await asyncio.sleep(0.2)
+                continue
             try:
                 await gate.acquire()
                 messages, dead = await self.queues.receive_wait(
@@ -119,6 +127,11 @@ class JobRunner:
             gate.release()
 
     async def _keep_visible(self, message: Message) -> None:
+        """Keep a running job hidden; a store blip must not end it (the job would run twice)."""
         while True:
             await asyncio.sleep(max(1.0, self.settings.visibility_secs / 3))
-            await self.queues.extend(message, self.settings.visibility_secs)
+            try:
+                if not await self.queues.extend(message, self.settings.visibility_secs):
+                    logger.warning("job_lost_visibility", queue=message.queue, message=message.id)
+            except Exception as exc:
+                logger.warning("job_extend_failed", message=message.id, error=str(exc))

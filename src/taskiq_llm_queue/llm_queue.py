@@ -21,6 +21,7 @@ import orjson
 import redis.asyncio
 from redis.credentials import CredentialProvider
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.clients import ClientPool, Providers
 from taskiq_llm_queue.context import current_context
 from taskiq_llm_queue.engine.envelope import Meta, Reply
@@ -29,9 +30,13 @@ from taskiq_llm_queue.engine.metrics import Metrics, sink_for
 from taskiq_llm_queue.engine.offload import ResultOffload
 from taskiq_llm_queue.engine.runtime import Engine, EngineSettings
 from taskiq_llm_queue.engine.settings import InfraSettings
-from taskiq_llm_queue.errors import LLMQueueError
+from taskiq_llm_queue.engine.store_client import store_client
+from taskiq_llm_queue.engine.store_guard import store_op
+from taskiq_llm_queue.errors import ConfigError, LLMQueueError
 from taskiq_llm_queue.registry.store import RegistryStore
+from taskiq_llm_queue.tuning import StoreOptions, Tuning
 
+logger = get_logger(__name__)
 _T = TypeVar("_T")
 Secrets = Callable[[str], "str | None"]
 
@@ -57,11 +62,12 @@ class _FreshPassword(CredentialProvider):
         return (self._username, password) if self._username else (password,)
 
 
-def _client(url: str, secrets: Secrets | None, name: str) -> redis.asyncio.Redis:
+def _client(
+    url: str, secrets: Secrets | None, name: str, max_connections: int, options: StoreOptions
+) -> redis.asyncio.Redis:
     """An async client (bytes replies) for a store URL; a password secret wins when present."""
-    if secrets is not None and secrets(name):
-        return redis.asyncio.Redis.from_url(url, credential_provider=_FreshPassword(secrets, name))
-    return redis.asyncio.Redis.from_url(url)
+    provider = _FreshPassword(secrets, name) if secrets is not None and secrets(name) else None
+    return store_client(url, provider, max_connections=max_connections, options=options)
 
 
 class LLMQueue:
@@ -80,7 +86,9 @@ class LLMQueue:
         self.jobs = JobRunner(engine.queues, queue_prefix=engine.settings.queue_prefix)
         self._builder = builder
         self._sync: _SyncRunner | None = None
+        self._sync_lock = threading.Lock()
         self.started = False
+        self._stopped = False
 
     # ---------------------------------------------------------------- construction
 
@@ -95,14 +103,29 @@ class LLMQueue:
         credentials: Callable[[Any], Mapping[str, Any] | None] | None = None,
         offload: ResultOffload | None = None,
         offload_bytes: int | None = None,
+        tuning: Tuning | None = None,
     ) -> LLMQueue:
-        """Build from `LLMQ_*` (secret first when `secrets` is given, then the environment)."""
+        """Build from `LLMQ_*` (secret first when `secrets` is given, then the environment).
+
+        `tuning` sets timeouts, pool sizes and loop pacing in code (`Tuning()` is the
+        defaults); a bad value or combination raises `ConfigError` listing every problem.
+        """
         settings = InfraSettings.from_env(environ, secrets=secrets)
+        tuning = tuning or Tuning()
+        if problems := tuning.problems(queue_wait_ms=settings.queue_wait_ms):
+            raise ConfigError("invalid tuning:\n  " + "\n  ".join(problems))
 
         def build() -> Engine:
-            state = _client(settings.store_url, secrets, "LLMQ_STORE_PASSWORD")
+            cap = settings.store_max_connections
+            state = _client(settings.store_url, secrets, "LLMQ_STORE_PASSWORD", cap, tuning.store)
             queue_store = (
-                _client(settings.queue_store_url, secrets, "LLMQ_QUEUE_STORE_PASSWORD")
+                _client(
+                    settings.queue_store_url,
+                    secrets,
+                    "LLMQ_QUEUE_STORE_PASSWORD",
+                    cap,
+                    tuning.store,
+                )
                 if settings.queue_store_url
                 else None
             )
@@ -113,12 +136,14 @@ class LLMQueue:
                 live_edit=settings.registry_live_edit,
                 allowed_hosts=settings.base_url_allowed_hosts,
                 audit_retention_days=settings.audit_retention_days,
+                history_size=tuning.registry.history_size,
+                edit_retries=tuning.registry.edit_retries,
             )
             pool_kwargs: dict[str, Any] = {
                 "bedrock_endpoint_url": settings.bedrock_endpoint_url,
-                "denied_hosts": (),
                 "sts_endpoint_url": settings.sts_endpoint_url,
                 "session_name": f"llmq-{settings.environment}-{worker_id or socket.gethostname()}",
+                "options": tuning.bedrock,
             }
             if credentials is not None:
                 pool_kwargs["credentials"] = credentials
@@ -133,6 +158,13 @@ class LLMQueue:
                 caller_ttl_secs=settings.caller_ttl_secs,
                 drain_secs=settings.drain_secs,
                 local_limit_cap=settings.local_limit_cap,
+                id_hash_salt=settings.id_hash_salt or "",
+                cfg_reload_secs=settings.cfg_reload_secs,
+                queue_failover_secs=settings.queue_failover_secs,
+                queue_wait_replicas=settings.queue_wait_replicas,
+                queue_wait_ms=settings.queue_wait_ms,
+                debug_capture_allowed=settings.debug_capture_from_config,
+                timings=tuning.engine,
             )
             return Engine(
                 state,
@@ -151,7 +183,14 @@ class LLMQueue:
     # ---------------------------------------------------------------- lifecycle
 
     async def start(self) -> None:
-        """Publish / load the registry; run the worker side unless `mode=caller`."""
+        """Publish / load the registry; run the worker side unless `mode=caller`.
+
+        A second `start()` does nothing; a stopped queue cannot start again (build a new one).
+        """
+        if self.started:
+            return
+        if self._stopped:
+            raise LLMQueueError("this LLMQueue was stopped; build a new one to start again")
         mode = self.settings.mode if self.settings else "both"
         await self.engine.start(
             worker=mode in ("both", "worker"), caller=mode in ("both", "caller")
@@ -163,19 +202,33 @@ class LLMQueue:
         set_default_queue(self)
         self.started = True
 
-    async def stop(self) -> None:
-        """Shut down in order (plan §3.18) and close the clients."""
+    def pause_receiving(self) -> None:
+        """Fail readiness and take no new calls or jobs; running work goes on (preStop hook)."""
+        self.engine.pause_receiving()
+        self.jobs.pause()
+
+    async def stop(self, drain_secs: float | None = None) -> None:
+        """Shut down in order (plan §3.18) and close every client; a second call does nothing.
+
+        `drain_secs` (default `LLMQ_DRAIN_SECS`) bounds the whole wait: jobs first (they make
+        calls), then running calls get what is left of it.
+        """
         from taskiq_llm_queue.langchain import get_default_queue, set_default_queue
 
+        if self._stopped:
+            return
+        self._stopped = True
         with contextlib.suppress(LLMQueueError):
             if get_default_queue() is self:
                 set_default_queue(None)
         self.started = False
-        await self.jobs.stop()
-        await self.engine.stop()
-        await self.engine.providers.aclose()
-        self.close_sync()
-        await self.engine.state.aclose()
+        loop = asyncio.get_running_loop()
+        drain = self.engine.settings.drain_secs if drain_secs is None else drain_secs
+        until = loop.time() + drain
+        await self.jobs.stop(drain_secs=drain)
+        await self.engine.stop(drain_secs=max(0.0, until - loop.time()))
+        await asyncio.to_thread(self.close_sync)  # blocking: off the event loop
+        await self.engine.aclose()
 
     # ---------------------------------------------------------------- calls
 
@@ -240,11 +293,18 @@ class LLMQueue:
     # ---------------------------------------------------------------- sync (direct path)
 
     def _sync_runner(self) -> _SyncRunner:
-        if self._sync is None:
+        if threading.current_thread().name == _SyncRunner.THREAD_NAME:
+            raise LLMQueueError("a sync call from inside the sync runner would deadlock")
+        _warn_if_loop_running()
+        runner = self._sync
+        if runner is None:
             if self._builder is None:
                 raise LLMQueueError("sync calls need LLMQueue.from_env (a second, private engine)")
-            self._sync = _SyncRunner(self._builder)
-        return self._sync
+            with self._sync_lock:  # threads making their first sync call together build one
+                if self._sync is None:
+                    self._sync = _SyncRunner(self._builder)
+                runner = self._sync
+        return runner
 
     def converse_sync(
         self, model: str, request: Mapping[str, Any], *, priority: bool | None = None, **kw: Any
@@ -277,15 +337,17 @@ class LLMQueue:
             vectors = await engine.embed(
                 model, texts, input_type=input_type, force_direct=True, **kwargs
             )
-            return EmbedResult(vectors, Meta(served_model=model))
+            alias = engine.registry.current.registry.alias_of(model)
+            return EmbedResult(vectors, Meta(served_model=alias))
 
         return self._sync_runner().run(run)
 
     def close_sync(self) -> None:
         """Stop the private engine of the sync calls (sync-only processes; `stop()` does too)."""
-        if self._sync is not None:
-            self._sync.close()
-            self._sync = None
+        with self._sync_lock:
+            runner, self._sync = self._sync, None
+        if runner is not None:
+            runner.close()
 
     # ---------------------------------------------------------------- jobs and admin
 
@@ -293,20 +355,24 @@ class LLMQueue:
         """Allow this process to run job `name` (call before `start`)."""
         self.jobs.register(name, fn)
 
+    @store_op
     async def send_job(
         self, name: str, payload: Mapping[str, Any], *, job_id: str | None = None
     ) -> str:
         """Queue a job; returns its id (jobs run at least once)."""
         return await self.jobs.send(name, payload, job_id=job_id)
 
+    @store_op
     async def cancel(self, request_id: str) -> None:
         """Cancel a call (waiting or running)."""
         await self.engine.cancel(request_id)
 
+    @store_op
     async def status(self, model: str | None = None) -> dict[str, Any]:
         """Status of a model or of everything."""
         return await self.engine.status(model)
 
+    @store_op
     async def request_status(self, request_id: str) -> dict[str, Any]:
         """Status of one call."""
         return await self.engine.request_status(request_id)
@@ -320,45 +386,97 @@ class LLMQueue:
         """The registry store (live edits, audit, rollback)."""
         return self.engine.registry
 
-    def http_router(self, *, dependencies: Sequence[Any] = (), allow_writes: bool = False) -> Any:
-        """A FastAPI router with status, requests, registry and health (extra `http`)."""
+    def http_router(
+        self,
+        *,
+        dependencies: Sequence[Any] = (),
+        allow_writes: bool = False,
+        actor: Callable[[Any], str] | None = None,
+    ) -> Any:
+        """A FastAPI router with status, requests, registry and health (extra `http`).
+
+        Writes need `actor(request) -> str`, the authenticated name recorded in the audit.
+        """
         from taskiq_llm_queue.engine.http import status_router
 
-        return status_router(self.engine, dependencies=dependencies, allow_writes=allow_writes)
+        return status_router(
+            self.engine, dependencies=dependencies, allow_writes=allow_writes, actor=actor
+        )
 
 
 class _SyncRunner:
     """A private event loop in a thread with its own caller-only engine, for sync calls."""
 
+    THREAD_NAME = "llmq-sync"
+
     def __init__(self, build: Callable[[], Engine]) -> None:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
-            target=self._loop.run_forever, name="llmq-sync", daemon=True
+            target=self._loop.run_forever, name=self.THREAD_NAME, daemon=True
         )
         self._thread.start()
+        self._closing = False
 
         async def boot() -> Engine:
             engine = build()
             await engine.start(worker=False, caller=True)
             return engine
 
-        self._engine: Engine = self._submit(boot()).result()
+        try:
+            self._engine: Engine = self._submit(boot()).result()
+        except BaseException:
+            self._loop.call_soon_threadsafe(self._loop.stop)  # no thread left behind
+            self._thread.join(timeout=5)
+            self._loop.close()
+            raise
 
     def _submit(self, coro: Coroutine[Any, Any, _T]) -> Future[_T]:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def run(self, fn: Callable[[Engine], Coroutine[Any, Any, _T]]) -> _T:
         """Run one call on the private loop and wait for it."""
+        if self._closing:
+            raise LLMQueueError("the sync runner is closed")
         return self._submit(fn(self._engine)).result()
 
     def close(self) -> None:
-        """Stop the private engine and loop."""
+        """Stop the private engine and loop; calls still running are cancelled.
+
+        Their callers get the error: before, a call running at close never returned.
+        """
+        self._closing = True
 
         async def stop() -> None:
             await self._engine.stop(drain_secs=1)
-            await self._engine.providers.aclose()
+            current = asyncio.current_task()
+            rest = [t for t in asyncio.all_tasks() if t is not current]
+            for task in rest:
+                task.cancel()
+            await asyncio.gather(*rest, return_exceptions=True)
+            await self._engine.aclose()
 
         with contextlib.suppress(Exception):
             self._submit(stop()).result(timeout=10)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+        if not self._thread.is_alive():
+            self._loop.close()
+
+
+_warned_loop = False
+
+
+def _warn_if_loop_running() -> None:
+    """Warn once when a sync call blocks a running event loop (use the async methods there)."""
+    global _warned_loop
+    if _warned_loop:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _warned_loop = True
+    logger.warning(
+        "sync_call_on_event_loop",
+        hint="converse_sync / embed_sync block this event loop; await converse / embed instead",
+    )

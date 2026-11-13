@@ -35,6 +35,7 @@ async def test_events_arrive_in_order_and_early(make: Make) -> None:
         {"small": {"stream_flush_ms": 0}},
         {"models": {KEY: {"output_tokens": 80, "tokens_per_s": 100}}},
     )
+    await engine.call("small", CHAT)  # warm: the client's start-up is not what is measured
     started = time.monotonic()
     events: list[dict[str, Any]] = []
     first = None

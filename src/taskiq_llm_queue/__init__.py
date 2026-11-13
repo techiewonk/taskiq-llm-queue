@@ -25,7 +25,20 @@ from taskiq_llm_queue.engine.hooks import (
     register_probe,
     register_sticky_key,
 )
-from taskiq_llm_queue.errors import ConfigError, LLMQueueError
+from taskiq_llm_queue.errors import (
+    ConfigError,
+    LLMQueueError,
+    MissingExtra,
+    StoreUnavailable,
+    UnknownModel,
+)
+from taskiq_llm_queue.tuning import (
+    BedrockOptions,
+    EngineTimings,
+    RegistryOptions,
+    StoreOptions,
+    Tuning,
+)
 
 if TYPE_CHECKING:
     from taskiq_llm_queue.clients.providers import register_provider
@@ -48,18 +61,26 @@ _LAZY = {
 
 __all__ = [
     "KINDS",
+    "BedrockOptions",
     "CallContext",
     "CallFailed",
     "ConfigError",
     "DeploymentView",
     "EmbedResult",
+    "EngineTimings",
     "LLMQueue",
     "LLMQueueError",
     "Meta",
+    "MissingExtra",
     "RegistryError",
+    "RegistryOptions",
     "Reject",
     "Reply",
     "RequestContext",
+    "StoreOptions",
+    "StoreUnavailable",
+    "Tuning",
+    "UnknownModel",
     "__version__",
     "current_context",
     "register_account_kind",

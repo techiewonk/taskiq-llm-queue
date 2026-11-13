@@ -19,6 +19,35 @@ class ConfigError(LLMQueueError):
     """Invalid configuration, raised at startup or on a refused edit (never mid-call)."""
 
 
+class UnknownModel(ConfigError, KeyError):  # named for what it is
+    """A model name that is neither an alias nor a model id in the registry.
+
+    Also a `KeyError`, so code that looks models up by key keeps working (HTTP 404, CLI).
+    """
+
+    def __str__(self) -> str:
+        return f"unknown model {self.args[0]!r}"
+
+
+class StoreUnavailable(LLMQueueError, ConnectionError):  # named for what it is
+    """The state store could not serve an admin operation (unreachable, read-only, full).
+
+    Raised by `cancel`, `status`, `send_job` and the registry's edits and reads; a call
+    raises `CallFailed` instead. Also a `ConnectionError`, so existing handlers keep working.
+    """
+
+
+class MissingExtra(ConfigError, ImportError):  # named for what it is
+    """An optional feature's dependencies are not installed; names the extra to install.
+
+    Also an `ImportError`, so `except ImportError` around optional imports keeps working.
+    """
+
+    def __init__(self, feature: str, extra: str) -> None:
+        """`feature` needs `pip install 'taskiq-llm-queue[extra]'`."""
+        super().__init__(f"{feature} needs: pip install 'taskiq-llm-queue[{extra}]'")
+
+
 class UnsupportedEnvelopeError(LLMQueueError):
     """A message is newer than this worker understands; it is returned, never dropped."""
 

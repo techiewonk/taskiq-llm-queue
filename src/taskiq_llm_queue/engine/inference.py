@@ -23,6 +23,7 @@ _CHAT_BEDROCK = {
     "frequency_penalty": ("additionalModelRequestFields", "frequency_penalty"),
     "presence_penalty": ("additionalModelRequestFields", "presence_penalty"),
 }
+_WRITTEN = ("inferenceConfig", "additionalModelRequestFields", "body")
 _CHAT_OPENAI = (
     "max_tokens",
     "temperature",
@@ -54,7 +55,12 @@ def apply(
     limits: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The request with defaults filled, locked values enforced and `max_tokens` capped."""
-    out = copy.deepcopy(dict(params))
+    # Only the top level and the sub-dicts written below are copied (the messages are never
+    # changed): a deepcopy of the whole request was 1.86 ms per call at 217 KB (measured).
+    out = dict(params)
+    for key in _WRITTEN:
+        if isinstance(out.get(key), Mapping):
+            out[key] = dict(out[key])
     locked = set(limits.get("locked", ()))
     if provider == "bedrock" and op == "converse":
         for name, path in _CHAT_BEDROCK.items():

@@ -139,5 +139,5 @@ def test_envelope_version_rule() -> None:
     with pytest.raises(ValueError, match="not supported"):
         parse(b'{"v": 1, "request_id": "r"}')
     with pytest.raises(ValueError, match="params"):
-        Envelope(request_id="r", op="converse", model="m", caller="c", timeout_secs=1)
+        Envelope(request_id="r", op="converse", model="m", caller="c", timeout_secs=1)  # type: ignore[call-arg]  # params is required
     assert params_hash({"b": 1, "a": 2}) == params_hash({"a": 2, "b": 1})

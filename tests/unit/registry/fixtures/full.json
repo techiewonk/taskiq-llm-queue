@@ -5,11 +5,9 @@
     "normal_min_share": 0.1,
     "balance": "ordered",
     "store_down": "pause",
-    "request_status": "full",
     "queue_pct": 100,
     "worker_slots": 20,
     "attempt_timeout_secs": 60,
-    "retry_attempts": 3,
     "throttle_retry_attempts": 6,
     "inference": {
       "temperature": 0.2,

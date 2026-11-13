@@ -8,6 +8,7 @@ import pytest
 
 from taskiq_llm_queue.clients import Usage
 from taskiq_llm_queue.engine import inference, tokens
+from taskiq_llm_queue.errors import ConfigError
 
 CHAT: dict[str, Any] = {
     "messages": [{"role": "user", "content": [{"text": "x" * 400}]}],
@@ -152,5 +153,5 @@ def test_hook_failure_falls_back_once() -> None:
 
     assert hooks.call_safely("balancer", "b", broken, default="built-in") == "built-in"
     assert hooks.get("balancer", "missing") is None
-    with pytest.raises(ValueError, match="name"):
+    with pytest.raises(ConfigError, match="name"):
         hooks.register_balancer("", lambda c, x: [])

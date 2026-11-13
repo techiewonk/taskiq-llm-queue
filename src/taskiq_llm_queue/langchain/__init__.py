@@ -11,6 +11,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
+from taskiq_llm_queue.errors import MissingExtra
 from taskiq_llm_queue.langchain._client import (
     EmbedResultLike,
     QueueClient,
@@ -55,8 +56,6 @@ def __getattr__(name: str) -> Any:
     try:
         value = getattr(import_module(f"{__name__}.{module}"), name)
     except ImportError as exc:
-        raise ImportError(
-            f"{name} needs the optional dependencies: uv add 'taskiq-llm-queue[{extra}]'"
-        ) from exc
+        raise MissingExtra(name, extra) from exc
     globals()[name] = value
     return value

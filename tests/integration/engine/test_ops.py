@@ -8,6 +8,7 @@ settings. No real LLM is called.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from typing import Any
@@ -33,8 +34,11 @@ async def test_status_of_model_and_request(make: Make) -> None:
     )
     minute = engine.clock.now() // 60
     task = asyncio.create_task(engine.call("big", CHAT, request_id="r-status"))
-    await asyncio.sleep(0.3)
-    running = await engine.request_status("r-status")
+    for _ in range(100):  # until it runs (not a fixed sleep: client start-up time varies)
+        running = await engine.request_status("r-status")
+        if running.get("state") == "in_progress":
+            break
+        await asyncio.sleep(0.03)
     assert running["state"] == "in_progress"
     assert running["deployment"] == "aws-a/r1"
     await task
@@ -177,12 +181,15 @@ def test_environment_settings() -> None:
     text = str(info.value)
     assert "LLMQ_REDIS_HOST is removed in 0.3; use LLMQ_STORE_URL" in text
     assert "must use TLS" in text
-    assert "LLMQ_ID_HASH_SALT is required in prod" in text
+    assert "LLMQ_ID_HASH_SALT is required outside dev (prod)" in text
     assert "not both" in text
 
 
 async def test_debug_capture(make: Make) -> None:
     engine, _ = await make({"big": {"debug_capture": True}})
+    reply = await engine.call("big", CHAT)  # without the process opt-in: nothing is kept
+    assert await engine.state.get(engine.keys.request(reply.request_id, "debug")) is None
+    engine.settings = dataclasses.replace(engine.settings, debug_capture_allowed=True)
     reply = await engine.call("big", CHAT)
     captured = await engine.state.get(engine.keys.request(reply.request_id, "debug"))
     assert captured is not None

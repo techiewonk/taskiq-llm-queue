@@ -23,7 +23,8 @@ from taskiq_llm_queue.engine.keys import Keys
 from taskiq_llm_queue.engine.queue import StreamQueues
 from taskiq_llm_queue.engine.settings import InfraSettings
 from taskiq_llm_queue.engine.status import StatusReader
-from taskiq_llm_queue.errors import ConfigError
+from taskiq_llm_queue.engine.store_client import store_client
+from taskiq_llm_queue.errors import ConfigError, LLMQueueError
 from taskiq_llm_queue.registry.store import RegistryStore
 
 
@@ -57,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     log.add_argument("--count", type=int, default=20)
     log.add_argument("--path", default="")
     pub = reg.add_parser("publish", help="publish LLMQ_REGISTRY, or roll back")
-    pub.add_argument("--from-audit", type=int, dest="from_version")
+    pub.add_argument("--from-version", type=int, dest="from_version")
     reg.add_parser("gc", help="delete keys of models that no longer exist")
 
     settings = sub.add_parser("settings").add_subparsers(dest="action", required=True)
@@ -97,8 +98,14 @@ def _parser() -> argparse.ArgumentParser:
 class Cli:
     """The command implementations over one environment's stores."""
 
-    def __init__(self, settings: InfraSettings, client: redis.asyncio.Redis, actor: str) -> None:
-        """Wire the stores."""
+    def __init__(
+        self,
+        settings: InfraSettings,
+        client: redis.asyncio.Redis,
+        actor: str,
+        queue_client: redis.asyncio.Redis | None = None,
+    ) -> None:
+        """Wire the stores: queues live on `queue_client` when `LLMQ_QUEUE_STORE_URL` is set."""
         self.settings = settings
         self.client = client
         self.actor = actor
@@ -114,7 +121,7 @@ class Cli:
             allowed_hosts=settings.base_url_allowed_hosts,
             audit_retention_days=settings.audit_retention_days,
         )
-        self.queues = StreamQueues(client, self.keys)
+        self.queues = StreamQueues(queue_client or client, self.keys)
 
     async def loaded(self) -> Any:
         """The stored registry; `ConfigError` when none is published."""
@@ -263,19 +270,22 @@ async def amain(argv: Sequence[str], environ: Mapping[str, str] | None = None) -
     """Parse and run one command; returns its JSON-able result."""
     args = _parser().parse_args(list(argv))
     settings = InfraSettings.from_env(environ)
-    client = redis.asyncio.Redis.from_url(settings.store_url)
+    client = store_client(settings.store_url)
+    queue_client = store_client(settings.queue_store_url) if settings.queue_store_url else None
     try:
-        cli = Cli(settings, client, args.actor or getpass.getuser())
+        cli = Cli(settings, client, args.actor or getpass.getuser(), queue_client)
         return await cli.run(args)
     finally:
         await client.aclose()
+        if queue_client is not None:
+            await queue_client.aclose()
 
 
 def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None) -> int:
     """Console entry point: print the result as JSON; exit 1 with the message on errors."""
     try:
         result = asyncio.run(amain(sys.argv[1:] if argv is None else argv, environ))
-    except ConfigError as exc:
+    except (LLMQueueError, KeyError) as exc:  # a bad name or edit: one line, not a traceback
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, default=str))

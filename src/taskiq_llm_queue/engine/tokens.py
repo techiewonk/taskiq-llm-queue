@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from taskiq_llm_queue.clients.providers import Usage
+from taskiq_llm_queue.errors import ConfigError
 
 Estimator = Callable[[str, Mapping[str, Any]], int]
 _ESTIMATORS: dict[str, Estimator] = {}
@@ -23,6 +24,8 @@ _SKIP = frozenset({"inferenceConfig", "modelId", "max_tokens", "temperature", "t
 
 def register_token_estimator(name: str, fn: Estimator) -> None:
     """Add an estimator chosen by the `token_estimator` setting: fn(op, params) -> input tokens."""
+    if not name or not callable(fn):
+        raise ConfigError("register_token_estimator needs a name and a callable")
     _ESTIMATORS[name] = fn
 
 

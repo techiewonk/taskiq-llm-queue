@@ -315,10 +315,6 @@ def test_profile_name_cannot_equal_a_region(full: dict[str, Any]) -> None:
             ["headroom needs `rpm` or `tpm`"],
         ),
         (
-            lambda d: d["models"]["gpt20b"].update(output_reserve="observed"),
-            ["Bedrock reserves max_tokens itself"],
-        ),
-        (
             lambda d: d["models"]["gpt20b"].update(inference={"dimensions": 256}),
             ["inference.dimensions", "not a parameter of a chat model"],
         ),
@@ -438,5 +434,39 @@ def test_custom_account_kind(small: dict[str, Any], monkeypatch: pytest.MonkeyPa
         "deployments": {"az": {"confirmed": ["eastus"]}},
     }
     assert load_registry(doc).deployments("az-gpt")[0].key == "az/eastus"
-    with pytest.raises(ValueError, match="lowercase"):
+    with pytest.raises(ConfigError, match="lowercase"):
         register_account_kind("Bad Kind", "x")
+
+
+def test_one_window_per_shared_account_budget(small: dict[str, Any]) -> None:
+    """Bug (0.3.0 review): fixed + smooth windows on one shared counter let 4 RPM grant 8."""
+    doc = copy.deepcopy(small)
+    account = next(iter(doc["accounts"]))
+    doc["accounts"][account].setdefault("settings", {})["shared_rpm"] = 4
+    model = next(iter(doc["models"]))
+    other = copy.deepcopy(doc["models"][model])
+    other["model_id"] = other["model_id"] + "-other"
+    other["rate_window"] = "fixed"
+    doc["models"]["other"] = other
+    assert _has(_errors(doc), "must use one `rate_window`")
+    doc["models"]["other"]["rate_window"] = "smooth"
+    registry, errors, _ = check(doc)
+    assert registry is not None, errors
+
+
+def test_accounts_cannot_point_at_metadata_or_process_secrets(small: dict[str, Any]) -> None:
+    """0.3.0 review: a registry edit could aim a key ref at the store password, or base_url at
+    the instance metadata endpoint."""
+    doc = copy.deepcopy(small)
+    doc["accounts"]["vllm"] = {
+        "kind": "openai",
+        "base_url": "http://169.254.169.254/v1",
+        "api_key_ref": "LLMQ_STORE_PASSWORD",
+    }
+    errors = _errors(doc)
+    assert _has(errors, "link-local")
+    assert _has(errors, "process secret")
+    doc["accounts"]["vllm"].update(
+        base_url="https://llm.example.com/v1", api_key_ref="AWS_SECRET_ACCESS_KEY"
+    )
+    assert _has(_errors(doc), "process secret")

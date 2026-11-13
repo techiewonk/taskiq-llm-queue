@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from taskiq_llm_queue.clients.providers import decode_invoke_body
+from taskiq_llm_queue.engine.errors import CallFailed
 from taskiq_llm_queue.providers.embeddings import batches, max_batch_size, parse_embeddings
 
 if TYPE_CHECKING:
@@ -80,11 +81,23 @@ async def embed(
                 timeout_secs=timeout_secs,
                 **call,
             )
-        assert reply.response is not None
+        if reply.response is None:
+            raise CallFailed(
+                "provider_error", f"{alias}: no embedding body", request_id=reply.request_id
+            )
         vectors = vectors_of(entry.provider, reply.response)
         if len(vectors) != len(group):
-            raise ValueError(f"{alias}: {len(group)} texts gave {len(vectors)} vectors")
+            message = f"{alias}: {len(group)} texts gave {len(vectors)} vectors"
+            raise CallFailed("provider_error", message, request_id=reply.request_id)
         return vectors
 
-    results = await asyncio.gather(*(one(group) for group in groups))
+    tasks = [asyncio.ensure_future(one(group)) for group in groups]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        # One batch failed: stop the rest, which would only spend budget on a lost result.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return [vector for group in results for vector in group]

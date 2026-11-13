@@ -24,18 +24,15 @@ from taskiq_llm_queue.providers.embeddings import (
     parse_embeddings,
     titan_body,
 )
-from taskiq_llm_queue.providers.hosts import check_url, denied_pattern
 
 __all__ = [
     "COHERE_MAX_BATCH",
     "OPENAI_DEFAULT_CHUNK_SIZE",
     "TITAN_MAX_BATCH",
     "batches",
-    "check_url",
     "classify_bedrock",
     "classify_openai",
     "cohere_body",
-    "denied_pattern",
     "embedding_body",
     "error_family",
     "is_target_error",

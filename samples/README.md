@@ -14,6 +14,7 @@ the environment.
 | `06_jobs.py` | `register_job` / `send_job`: work that runs at least once, LLM calls inside | Ingestion, nightly re-embedding, any batch work that should not block a request |
 | `07_status_and_registry.py` | `status`, `request_status`, live `registry.set`, audit `log`, `health` | Admin pages, runbooks, readiness checks |
 | `08_langchain.py` | `QueuedChatBedrockConverse` (with tools) and `QueuedBedrockEmbeddings` | LangChain / LangGraph chains, agents, RAG: drop-in for `ChatBedrockConverse` / `BedrockEmbeddings` |
+| `09_http_router.py` | `http_router` on FastAPI: health without auth, status / registry behind the app's admin check, audited writes (`actor=`), `/drain` with `pause_receiving()` | Admin API and Kubernetes probes; the preStop hook |
 
 `registry.json` defines the four models the samples use: chat `gpt120b` (falls back to `gpt20b`)
 and `gpt20b`, and embeddings `titan` and `cohere`, all on one AWS account. The quotas are
@@ -34,12 +35,16 @@ python scripts/samples.py                              # all, on fakellm (no rea
 python scripts/samples.py 03_embed 08_langchain        # some
 python scripts/samples.py --live                       # all, on real Bedrock
 python scripts/samples.py --live --env-file ../../.env # AWS keys from another .env
+python scripts/samples.py --live --store env --env-file ../../.env  # and the env file's store
 ```
 
 - **Stored keys:** each run uses its own key prefix on the local Valkey and deletes its keys at the end.
 - **What `--live` reads:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_MODEL_REGION` from the env file. It never prints them.
 - **Region:** every model is placed in that region.
 - **Cost:** a full live run makes about 20 small calls, well under a cent.
+- **`--store env`:** the store is the env file's `LLMQ_STORE_URL`, or `rediss://` built from
+  the app's `valkey_host` / `valkey_port` / `valkey_key`. Only the run's own prefix is touched
+  and deleted, so a shared store (ElastiCache) is safe.
 
 `python scripts/check.py samples` runs the fakellm pass with lint and type checks, as part of
 `check.py all`.
@@ -61,10 +66,14 @@ Start the queue once per process, in the app's startup hook, and stop it on shut
 ```python
 @asynccontextmanager
 async def lifespan(app):
-    await llmq.start()
+    await llmq.start()            # a failure here should fail the pod: queued models need it
     yield
-    await llmq.stop()
+    llmq.pause_receiving()        # not ready; no new queued work (also from a preStop /drain)
+    await llmq.stop(drain_secs=20)  # one budget for running jobs and calls together
 ```
+
+`09_http_router.py` shows the `/drain` endpoint for the preStop hook and the health routes for
+the probes. Outside dev, `LLMQ_STORE_URL` must be `rediss://` and `LLMQ_ID_HASH_SALT` set.
 
 ## Measured on real Bedrock (us-east-1, 2026-11-12)
 
@@ -79,3 +88,7 @@ async def lifespan(app):
 - **Streaming:** a warm stream of gpt-oss-20b took 0.83 s through the queue; the same prompt took 0.7 s called directly. Most of the time is the model's own.
 - **Fallback:** with `gpt120b` off, the call went to `gpt20b` (`meta.fallback == "model"`).
 - **Tool calls:** a LangChain tool call came back as `stock_price({"symbol": "RELIANCE"})`.
+- **ElastiCache (Valkey 8.2, TLS) as the store:** all nine samples pass with `--live --store
+  env` (2026-11-13); the run left no keys behind.
+- **ap-south-1:** gpt-oss-120b, gpt-oss-20b, Titan v2 and Cohere v3 answer there too (one call
+  each, 2026-11-13); the app's own paths ran end to end there through the queue.

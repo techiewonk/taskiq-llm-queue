@@ -53,10 +53,12 @@ jobs:
       - run: >-
           uv pip install "langchain-core>=1,<2" "langchain-aws>=1,<2"
           "langchain-openai>=1,<2" "langgraph>=1" "openai>=2,<4"
-      - run: uv run --no-sync pytest tests/unit/lc -q
+      # The adapters are tested against the stack (test_front.py); there is no unit-only suite.
+      - run: docker compose -f docker/compose.yaml up -d --wait
+      - run: uv run --no-sync pytest tests/integration/engine/test_front.py -q
 
   integration:
-    # Valkey 8.1, ElasticMQ 1.7.1 and fakellm from docker/compose.yaml (same stack as local).
+    # Valkey 8.1, Redis 7.4 and fakellm from docker/compose.yaml (same stack as local).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

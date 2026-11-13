@@ -37,4 +37,5 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
         logging.getLogger(name),
         processors=[_to_stdlib],
         wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
     )

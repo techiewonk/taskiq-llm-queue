@@ -8,14 +8,16 @@ OpenAI-compatible clients for routes and closes them all at `aclose()`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from taskiq_llm_queue.errors import ConfigError, LLMQueueError
-from taskiq_llm_queue.providers.hosts import check_url
+from taskiq_llm_queue.errors import ConfigError, LLMQueueError, MissingExtra
+from taskiq_llm_queue.tuning import BedrockOptions
 
 if TYPE_CHECKING:
     from aiobotocore.session import AioSession
@@ -26,9 +28,6 @@ if TYPE_CHECKING:
 
 # Unverified starting values. The SDK read timeout only guards a dead socket: the library's own
 # first-response and idle timers decide when an attempt is given up.
-DEFAULT_READ_TIMEOUT_SECS = 300.0
-DEFAULT_CONNECT_TIMEOUT_SECS = 10.0
-DEFAULT_MAX_POOL_CONNECTIONS = 100
 
 # Extra `create_client` arguments for an AWS account (None = the pod's own credential chain).
 CredentialSource = Callable[["Account"], Mapping[str, Any] | None]
@@ -61,11 +60,12 @@ def _pod_chain(account: Account) -> Mapping[str, Any] | None:
     return None
 
 
+# AWS RoleSessionName allows only [\w+=,.@-]; a worker id like "pod:1a2b" would fail AssumeRole.
+_SESSION_UNSAFE = re.compile(r"[^\w+=,.@-]")
+
+
 class CredentialsUnavailable(LLMQueueError):
     """An account's credentials could not be obtained (STS refused or unreachable)."""
-
-
-ROLE_SESSION_SECS = 3600  # the role-chaining maximum (plan §3.6)
 
 
 class ClientPool:
@@ -82,10 +82,7 @@ class ClientPool:
         credentials: CredentialSource = _pod_chain,
         secrets: SecretSource = os.environ.get,
         session: AioSession | None = None,
-        denied_hosts: tuple[str, ...] = (),
-        read_timeout_secs: float = DEFAULT_READ_TIMEOUT_SECS,
-        connect_timeout_secs: float = DEFAULT_CONNECT_TIMEOUT_SECS,
-        max_pool_connections: int = DEFAULT_MAX_POOL_CONNECTIONS,
+        options: BedrockOptions | None = None,
         sts_endpoint_url: str | None = None,
         session_name: str = "llmq",
     ) -> None:
@@ -93,21 +90,22 @@ class ClientPool:
 
         `session_name` names assumed-role sessions (`llmq-<env>-<pod>` in CloudTrail).
         """
-        check_url(bedrock_endpoint_url, denied_hosts)
         self._endpoint = bedrock_endpoint_url
         self._credentials = credentials
         self._secrets = secrets
         self._session = session
-        self._denied = denied_hosts
-        self._read = read_timeout_secs
-        self._connect = connect_timeout_secs
-        self._pool_size = max_pool_connections
+        self._options = options or BedrockOptions()  # timeouts, pool size: `Tuning.bedrock`
+        self._read = self._options.read_timeout_secs
+        self._connect = self._options.connect_timeout_secs
+        self._pool_size = self._options.max_pool_connections
         self._bedrock: dict[tuple[str, str], BedrockRuntimeClient] = {}
         self._sts_endpoint = sts_endpoint_url
         self._session_name = session_name
         self._roles: dict[str, AioSession] = {}
         self._openai: dict[str, AsyncOpenAI] = {}
         self._stack = AsyncExitStack()
+        self._closers: dict[tuple[str, str], Callable[[], Awaitable[Any]]] = {}
+        self._retiring: dict[asyncio.Task[None], list[Callable[[], Awaitable[Any]]]] = {}
         self._lock = asyncio.Lock()
 
     async def bedrock(self, route: Route) -> BedrockRuntimeClient:
@@ -134,6 +132,10 @@ class ClientPool:
                 max_pool_connections=self._pool_size,
                 # One attempt per call: throttles reach the library, not botocore's retries.
                 retries={"total_max_attempts": 1, "mode": "standard"},
+                # botocore re-walks every message block before sending: 8.5 ms vs 3.5 ms CPU
+                # per attempt at 218 KB (measured). Bedrock validates anyway; a bad request
+                # comes back as ValidationException, which is classified fatal.
+                parameter_validation=False,
             )
             context = session.create_client(
                 "bedrock-runtime",
@@ -142,7 +144,8 @@ class ClientPool:
                 config=config,
                 **extra,
             )
-            client = await self._stack.enter_async_context(context)
+            client = await context.__aenter__()
+            self._closers[key] = lambda: context.__aexit__(None, None, None)
             self._bedrock[key] = client
             return client
 
@@ -165,8 +168,8 @@ class ClientPool:
         async def assume() -> dict[str, Any]:
             request: dict[str, Any] = {
                 "RoleArn": account.role_arn,
-                "RoleSessionName": self._session_name[:64],
-                "DurationSeconds": ROLE_SESSION_SECS,
+                "RoleSessionName": _SESSION_UNSAFE.sub("-", self._session_name)[:64],
+                "DurationSeconds": self._options.role_session_secs,
             }
             if external_id:
                 request["ExternalId"] = external_id
@@ -176,8 +179,13 @@ class ClientPool:
                 ) as sts:
                     reply = await sts.assume_role(**request)
             except Exception as exc:
+                # The code only: STS text can carry role ARNs and account ids, and this message
+                # reaches replies, status and logs (the cause keeps the detail for debugging).
+                code = (
+                    getattr(exc, "response", {}).get("Error", {}).get("Code") or type(exc).__name__
+                )
                 raise CredentialsUnavailable(
-                    f"account {account.name}: AssumeRole failed: {exc}"
+                    f"account {account.name}: AssumeRole failed ({code})"
                 ) from exc
             creds = reply["Credentials"]
             return {
@@ -201,14 +209,11 @@ class ClientPool:
         account = route.account
         if (client := self._openai.get(account.name)) is not None:
             return client
-        check_url(account.base_url, self._denied)
         try:
             import httpx
             from openai import AsyncOpenAI
         except ImportError as exc:
-            raise ConfigError(
-                "openai accounts need the openai SDK: pip install 'taskiq-llm-queue[openai]'"
-            ) from exc
+            raise MissingExtra("an openai account", "openai") from exc
         key = self._secrets(account.api_key_ref) if account.api_key_ref else None
         if account.api_key_ref and not key:
             raise ConfigError(f"account {account.name}: secret {account.api_key_ref} is not set")
@@ -222,19 +227,45 @@ class ClientPool:
         return client
 
     def forget(self, route: Route) -> None:
-        """Drop an account's cached clients so the next call reads its credentials again."""
+        """Drop an account's cached clients so the next call reads its credentials again.
+
+        The dropped clients are closed after a grace period (calls already using them finish
+        first); before, each auth failure leaked a client and its connection pool.
+        """
+        closers = []
         for key in [k for k in self._bedrock if k[0] == route.account.name]:
             del self._bedrock[key]
+            if (closer := self._closers.pop(key, None)) is not None:
+                closers.append(closer)
         self._roles.pop(route.account.name, None)
-        self._openai.pop(route.account.name, None)
+        if (openai_client := self._openai.pop(route.account.name, None)) is not None:
+            closers.append(openai_client.close)
+        if closers:
+            task = asyncio.get_running_loop().create_task(self._retire(closers))
+            self._retiring[task] = closers
+            task.add_done_callback(lambda done: self._retiring.pop(done, None))
+
+    async def _retire(self, closers: list[Callable[[], Awaitable[Any]]]) -> None:
+        await asyncio.sleep(self._read + self._connect)  # the longest a running call can need
+        for close in closers:
+            with contextlib.suppress(Exception):
+                await close()
 
     async def aclose(self) -> None:
         """Close every client; safe to call more than once."""
+        retired = [close for closers in self._retiring.values() for close in closers]
+        for task in list(self._retiring):  # close retired clients now, not after the grace
+            task.cancel()
+        self._retiring.clear()
         async with self._lock:
             self._bedrock.clear()
+            closers, self._closers = [*self._closers.values(), *retired], {}
             openai_clients = list(self._openai.values())
             self._openai.clear()
             stack, self._stack = self._stack, AsyncExitStack()
             await stack.aclose()
+        for close in closers:
+            with contextlib.suppress(Exception):
+                await close()
         for client in openai_clients:
             await client.close()

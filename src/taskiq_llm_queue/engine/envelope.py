@@ -11,7 +11,7 @@ import hashlib
 from typing import Any, Literal
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from taskiq_llm_queue.errors import UnsupportedEnvelopeError
 
@@ -21,7 +21,7 @@ AllowFallback = Literal["all", "regions", "none"]
 
 
 class Envelope(BaseModel):
-    """One LLM call on the queue. `params` are provider-native; large ones travel by reference."""
+    """One LLM call on the queue. `params` are provider-native and travel inside the message."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
@@ -29,13 +29,11 @@ class Envelope(BaseModel):
     request_id: str
     op: Op
     model: str
-    params: dict[str, Any] | None = None
-    params_ref: str | None = None
+    params: dict[str, Any]
     priority: bool = False
     caller: str
     timeout_secs: float = Field(gt=0)
     max_wait_secs: float | None = Field(default=None, gt=0)
-    est_tokens: int = Field(default=0, ge=0)
     allow_fallback: AllowFallback = "all"
     allowed_regions: tuple[str, ...] | None = None
     allowed_accounts: tuple[str, ...] | None = None
@@ -45,15 +43,9 @@ class Envelope(BaseModel):
     app_request_id: bool = False
     stream: bool = False
 
-    @model_validator(mode="after")
-    def _params_xor_ref(self) -> Envelope:
-        if (self.params is None) == (self.params_ref is None):
-            raise ValueError("exactly one of params / params_ref must be set")
-        return self
-
     def dumps(self) -> bytes:
-        """JSON bytes for the queue."""
-        return orjson.dumps(self.model_dump(exclude_none=True))
+        """JSON bytes for the queue (fields directly: `model_dump` re-walked the params)."""
+        return orjson.dumps({k: v for k, v in self.__dict__.items() if v is not None})
 
 
 def parse(data: bytes | str) -> Envelope:
@@ -104,5 +96,7 @@ class Reply(BaseModel):
     meta: Meta = Field(default_factory=Meta)
 
     def dumps(self) -> bytes:
-        """JSON bytes for the store."""
-        return orjson.dumps(self.model_dump(exclude_none=True))
+        """JSON bytes for the store (fields directly: `model_dump` re-walked the response)."""
+        out = {k: v for k, v in self.__dict__.items() if v is not None}
+        out["meta"] = {k: v for k, v in self.meta.__dict__.items() if v is not None}
+        return orjson.dumps(out)

@@ -14,15 +14,22 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
+from redis.exceptions import ConnectionError as StoreConnectionError
+from redis.exceptions import ReadOnlyError
+from redis.exceptions import TimeoutError as StoreTimeoutError
 
+from taskiq_llm_queue._logging import get_logger
 from taskiq_llm_queue.engine import _admission_lua as lua
 from taskiq_llm_queue.engine.keys import Keys
+from taskiq_llm_queue.tuning import EngineTimings
 
 if TYPE_CHECKING:
     import redis.asyncio
 
 Class = Literal["p", "n"]
 Outcome = Literal["ok", "throttle", "fail", "none"]
+
+logger = get_logger(__name__)
 
 
 def owner_token(request_id: str, worker: str, attempt: int) -> str:
@@ -104,13 +111,28 @@ class Admission:
         lease_secs: float = 60.0,
         waiter_secs: float = 2.0,
         rng: random.Random | None = None,
+        timings: EngineTimings | None = None,
     ) -> None:
-        """Register the scripts; no I/O until the first call."""
+        """Register the scripts; no I/O until the first call.
+
+        `timings` (`Tuning.engine`) carries the scripts' pacing: probe and slot waits, the
+        limiter's cut, budget key lifetime; each script falls back to the same defaults.
+        """
         self._client = client
         self.keys = keys
         self.lease_ms = int(lease_secs * 1000)
         self.waiter_ms = int(waiter_secs * 1000)
         self._rng = rng or random.Random()
+        pace = timings or EngineTimings()
+        self._t = {
+            "probe_wait_ms": pace.admission_probe_wait_ms,
+            "slot_wait_ms": pace.admission_slot_wait_ms,
+            "slot_jitter_ms": pace.admission_slot_jitter_ms,
+            "wait_ms": pace.admission_wait_ms,
+            "limiter_cut_ms": pace.limiter_cut_ms,
+            "limiter_cut_factor": pace.limiter_cut_factor,
+            "budget_key_ms": pace.budget_key_ms,
+        }
         self._pick = client.register_script(lua.PICK_TAKE)
         self._finish = client.register_script(lua.FINISH)
         self._undo = client.register_script(lua.UNDO)
@@ -119,7 +141,7 @@ class Admission:
         self._reregister = client.register_script(lua.REREGISTER)
 
     async def _call(self, script: Any, body: dict[str, Any]) -> Any:
-        return await script([], [self.keys.prefix, orjson.dumps(body)])
+        return await script([], [self.keys.prefix, orjson.dumps({**body, "t": self._t})])
 
     async def pick_take(self, ask: Ask, changes: int) -> Decision:
         """Choose and take, or say how long to wait and why."""
@@ -175,7 +197,9 @@ class Admission:
     ) -> bool:
         """Settle a grant: give back what was not used, release the slot, learn the outcome.
 
-        `refund_t` may be negative (the call used more than it reserved).
+        `refund_t` may be negative (the call used more than it reserved). If the store is
+        unreachable this is skipped (False): the grant's lease expires and SWEEP frees the slot,
+        so a store blip after the provider answered never throws the answer away.
         """
         body = {
             "alias": alias,
@@ -186,7 +210,11 @@ class Admission:
             "outcome": outcome,
             "latency_ms": latency_ms,
         }
-        return bool(await self._call(self._finish, body))
+        try:
+            return bool(await self._call(self._finish, body))
+        except (StoreConnectionError, StoreTimeoutError, ReadOnlyError, OSError) as exc:
+            logger.warning("finish_skipped", model=alias, request_id=request_id, error=str(exc))
+            return False
 
     async def undo(self, alias: str, owner: str, request_id: str) -> bool:
         """Give a grant back entirely, without learning (lost reply, refused claim)."""

@@ -9,6 +9,7 @@ warnings for a stored document (read leniently, so an older pod still starts).
 from __future__ import annotations
 
 import difflib
+import ipaddress
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -16,10 +17,11 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
+from taskiq_llm_queue.errors import ConfigError, UnknownModel
 from taskiq_llm_queue.registry.settings import SETTINGS, A, D, M, R, settings_at
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
-# SQS queue name rule, applied on both backends so one registry works on either.
+# Queue (stream) names: short and plain, so key names and metric labels stay readable.
 QUEUE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,71}$")  # leaves room for "-priority"
 # Account kind -> the provider it serves. `register_account_kind` adds more.
 ACCOUNT_KINDS: dict[str, str] = {"aws": "bedrock", "openai": "openai"}
@@ -40,7 +42,7 @@ _PROFILE_FIELDS = frozenset({"name", "region", "profile_id", "routes_to"})
 def register_account_kind(kind: str, provider: str) -> None:
     """Allow accounts of `kind` to serve models of `provider` (for a custom provider)."""
     if not NAME_RE.match(kind) or not NAME_RE.match(provider):
-        raise ValueError("kind and provider must be lowercase names")
+        raise ConfigError("kind and provider must be lowercase names")
     ACCOUNT_KINDS[kind] = provider
 
 
@@ -125,13 +127,13 @@ class Registry:
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def alias_of(self, model: str) -> str:
-        """The alias for `model`, given as an alias or as a provider model id; KeyError if none."""
+        """The alias for `model`, given as an alias or as a provider model id (`UnknownModel`)."""
         if model in self.models:
             return model
         for entry in self.models.values():
             if entry.model_id == model:
                 return entry.alias
-        raise KeyError(model)
+        raise UnknownModel(model)
 
 
 class _Collector:
@@ -203,6 +205,29 @@ def _settings(
     return kept
 
 
+# Secrets of the process itself: never an account's key (a registry edit must not exfiltrate).
+_PROCESS_SECRETS = frozenset(
+    {
+        "LLMQ_STORE_PASSWORD",
+        "LLMQ_QUEUE_STORE_PASSWORD",
+        "LLMQ_ID_HASH_SALT",
+        "LLMQ_STORE_URL",
+        "LLMQ_QUEUE_STORE_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    }
+)
+
+
+def _is_link_local(host: str) -> bool:
+    """169.254.0.0/16 or fe80::/10: instance metadata endpoints live there."""
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_link_local
+    except ValueError:
+        return False
+
+
 def _is_local(host: str) -> bool:
     return host in _LOCAL_HOSTS or host.endswith(".localhost") or "." not in host
 
@@ -236,6 +261,12 @@ def _account(
                 out.error(f"{path}.{key}", f"only an `aws` account takes `{key}`")
     if texts["external_id_ref"] and not texts["role_arn"]:
         out.error(f"{path}.external_id_ref", "needs `role_arn`")
+    for key in ("external_id_ref", "api_key_ref"):
+        ref = texts[key]
+        if ref and ref in _PROCESS_SECRETS:
+            # A registry author could otherwise send the store password or the pod's AWS
+            # keys as a Bearer token to a base_url they choose.
+            out.error(f"{path}.{key}", f"`{ref}` is a process secret, not an account's")
     if kind == "aws":
         for key in ("base_url", "api_key_ref"):
             if texts[key]:
@@ -249,6 +280,8 @@ def _account(
             host = parsed.hostname or ""
             if parsed.scheme not in ("https", "http") or not host:
                 out.error(f"{path}.base_url", "must be an http(s) URL")
+            elif _is_link_local(host):
+                out.error(f"{path}.base_url", "a link-local host (instance metadata) is refused")
             elif parsed.scheme == "http" and not _is_local(host):
                 out.error(f"{path}.base_url", "must use https unless the host is local")
             elif allowed_hosts and host not in allowed_hosts:

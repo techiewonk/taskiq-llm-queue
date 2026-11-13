@@ -3340,10 +3340,12 @@ name = "taskiq-llm-queue"
 source = { editable = "." }
 dependencies = [
     { name = "aiobotocore" },
+    { name = "hiredis" },
     { name = "orjson" },
     { name = "pydantic" },
     { name = "redis" },
     { name = "structlog" },
+    { name = "uuid-utils" },
 ]
 
 [package.optional-dependencies]
@@ -3365,13 +3367,11 @@ openai = [
     { name = "httpx" },
     { name = "openai" },
 ]
-speedups = [
-    { name = "hiredis" },
-]
 
 [package.dev-dependencies]
 dev = [
     { name = "fakeredis" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain-aws" },
     { name = "langchain-core" },
@@ -3383,14 +3383,14 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-    { name = "types-aiobotocore", extra = ["bedrock-runtime", "s3", "sqs"] },
+    { name = "types-aiobotocore", extra = ["bedrock-runtime", "s3", "sts"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiobotocore", specifier = ">=2.23" },
-    { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.110,<1" },
-    { name = "hiredis", marker = "extra == 'speedups'", specifier = ">=3" },
+    { name = "aiobotocore", specifier = ">=2.23,<4" },
+    { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.115.3,<1" },
+    { name = "hiredis", specifier = ">=3,<4" },
     { name = "httpx", marker = "extra == 'openai'", specifier = ">=0.27,<1" },
     { name = "langchain-aws", marker = "extra == 'langchain-aws'", specifier = ">=0.2.24,<2" },
     { name = "langchain-core", marker = "extra == 'langchain-aws'", specifier = ">=0.3.68,<2" },
@@ -3398,16 +3398,18 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'langchain-openai'", specifier = ">=0.3.26,<2" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40,<4" },
     { name = "orjson", specifier = ">=3.10,<4" },
-    { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20" },
+    { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
-    { name = "redis", specifier = ">=5.0.1" },
-    { name = "structlog", specifier = ">=24.1" },
+    { name = "redis", specifier = ">=5.0.1,<9" },
+    { name = "structlog", specifier = ">=24.1,<27" },
+    { name = "uuid-utils", specifier = ">=0.19,<1" },
 ]
-provides-extras = ["http", "langchain-aws", "langchain-openai", "metrics", "openai", "speedups"]
+provides-extras = ["http", "langchain-aws", "langchain-openai", "metrics", "openai"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "fakeredis", specifier = ">=2.26" },
+    { name = "fastapi", specifier = ">=0.115.3,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "langchain-aws", specifier = ">=0.2.24,<0.3" },
     { name = "langchain-core", specifier = ">=0.3.68,<0.4" },
@@ -3419,7 +3421,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.6" },
-    { name = "types-aiobotocore", extras = ["sqs", "s3", "bedrock-runtime"] },
+    { name = "types-aiobotocore", extras = ["s3", "bedrock-runtime", "sts"] },
 ]
 
 [[package]]
@@ -3533,8 +3535,8 @@ bedrock-runtime = [
 s3 = [
     { name = "types-aiobotocore-s3" },
 ]
-sqs = [
-    { name = "types-aiobotocore-sqs" },
+sts = [
+    { name = "types-aiobotocore-sts" },
 ]
 
 [[package]]
@@ -3562,15 +3564,15 @@ wheels = [
 ]
 
 [[package]]
-name = "types-aiobotocore-sqs"
+name = "types-aiobotocore-sts"
 version = "3.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions", marker = "python_full_version < '3.12'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f5/81/63aec002da98c710a4d7d6e1c5b5f4bc1881e212dcc7ff4116fc4d7ffafd/types_aiobotocore_sqs-3.10.0.tar.gz", hash = "sha256:53c6bfc23d48bf2db5fe3e770cf12ec8d67039f737f48a00d9f253f0902a9b94", size = 23670, upload-time = "2026-10-24T03:52:37.071Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/f5/e45a5bf3c1dc16c952518f245604b177d14dc674a37659a084165f063911/types_aiobotocore_sts-3.10.0.tar.gz", hash = "sha256:609d7dd646559c78f6548f4cc40ae822efe0378d40b207c70985c5bf230092ae", size = 17119, upload-time = "2026-10-24T03:52:54.844Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/cb/5e61fa8f4ba1362c5abd27929638d345830017e2b1cd3c420fba09c1ff67/types_aiobotocore_sqs-3.10.0-py3-none-any.whl", hash = "sha256:fc9a4b57c20fe1e28b7b71826dc8d893ede38f298d2ae781185ffd84db4d24ef", size = 34423, upload-time = "2026-10-24T03:52:35.562Z" },
+    { url = "https://files.pythonhosted.org/packages/43/30/127f2a593361b5d95d9db667b1cd43f551d4391e2a136011a7f70299ac8e/types_aiobotocore_sts-3.10.0-py3-none-any.whl", hash = "sha256:e7cf7662eca8e729d58c646d8c6904342cc08184d21b43472853d7098d7bec69", size = 21537, upload-time = "2026-10-24T03:52:52.732Z" },
 ]
 
 [[package]]

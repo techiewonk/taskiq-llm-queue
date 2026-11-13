@@ -14,6 +14,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from redis.exceptions import NoScriptError
+
 from taskiq_llm_queue.engine.keys import Keys
 
 if TYPE_CHECKING:
@@ -27,7 +29,9 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 # Keys of one queue, in this order for every script.
 _PARTS = ("s", "vis", "gen", "fails", "st", "dlq", "meta")
 
-# ARGV: body, max waiting (0 = no limit), retention ms. Reply: {'ok', id} or {'full', depth}.
+# ARGV: body, max waiting (0 = no limit), retention ms, doorbell key. Reply: {'ok', id} or
+# {'full', depth}. One doorbell token per send wakes exactly one idle worker blocked on it
+# (no receive-poll delay, B34; pub/sub woke every process and cost grew with them, B22).
 SEND = (
     _NOW
     + """
@@ -36,6 +40,9 @@ local depth = redis.call('XLEN', KEYS[1])
 if limit > 0 and depth >= limit then return {'full', depth} end
 local id = redis.call('XADD', KEYS[1], 'MINID', '~', tostring(now - tonumber(ARGV[3])), '*',
   'body', ARGV[1])
+redis.call('RPUSH', ARGV[4], '1')
+redis.call('LTRIM', ARGV[4], -64, -1)
+redis.call('PEXPIRE', ARGV[4], 60000)
 return {'ok', id}
 """
 )
@@ -244,6 +251,10 @@ class QueueFull(Exception):  # the plan's error kind is `queue_full`
         self.depth = depth
 
 
+class NotReplicated(Exception):  # the plan's error kind is `queue_unavailable`
+    """The send reached the primary but not `queue_wait_replicas` replicas in time."""
+
+
 class StreamQueues:
     """Send, receive, return, extend, fail and acknowledge on named queues of one prefix."""
 
@@ -260,16 +271,66 @@ class StreamQueues:
         self._depth = client.register_script(DEPTH)
         self._redrive = client.register_script(REDRIVE)
 
+    async def _send_and_wait(
+        self, queue: str, args: list[bytes | int | str], replicas: int, wait_ms: int
+    ) -> tuple[Any, Any]:
+        """SEND and WAIT on one connection (WAIT counts only that connection's writes)."""
+        async with self._client.pipeline(transaction=False) as pipe:
+            await self._send(self._k(queue), args, client=pipe)
+            pipe.execute_command("WAIT", replicas, wait_ms)
+            reply, acked = await pipe.execute()
+        return reply, acked
+
+    def bell(self, queue: str) -> str:
+        """The queue's doorbell: a list a send pushes one token on (see SEND)."""
+        return f"{self.keys.prefix}:bell:{queue}"
+
+    async def wait_bell(self, queues: Sequence[str], timeout_secs: float) -> bool:
+        """Block until one of the queues' doorbells rings (True) or `timeout_secs` pass."""
+        rung = await self._client.blpop([self.bell(q) for q in queues], timeout=timeout_secs)
+        return rung is not None
+
     def _k(self, queue: str) -> list[str]:
         return [self.keys.queue(queue, part) for part in _PARTS]
 
-    async def send(self, queue: str, body: bytes, settings: QueueSettings) -> str:
-        """Append a message; returns its id. `QueueFull` above `max_waiting`."""
-        reply = await self._send(
-            self._k(queue), [body, settings.max_waiting, settings.retention_secs * 1000]
-        )
+    async def send(
+        self,
+        queue: str,
+        body: bytes,
+        settings: QueueSettings,
+        *,
+        wait_replicas: int = 0,
+        wait_ms: int = 100,
+    ) -> str:
+        """Append a message; returns its id. `QueueFull` above `max_waiting`.
+
+        With `wait_replicas`, the send and a `WAIT` go down one connection (WAIT counts that
+        connection's writes) and too few acknowledgements raise `NotReplicated`.
+        """
+        args: list[bytes | int | str] = [
+            body,
+            settings.max_waiting,
+            settings.retention_secs * 1000,
+            self.bell(queue),
+        ]
+        if not wait_replicas:
+            reply = await self._send(self._k(queue), args)
+            acked = None
+        else:
+            try:
+                reply, acked = await self._send_and_wait(queue, args, wait_replicas, wait_ms)
+            except NoScriptError:
+                # A failover moved the pipeline to a node without the script cached: a pipeline
+                # loads its scripts only when it starts, so run it once more (that reloads).
+                # Exactly once, like redis-py's own reload for plain script calls: a second
+                # NOSCRIPT means the cache was flushed again mid-call, not something to retry.
+                reply, acked = await self._send_and_wait(queue, args, wait_replicas, wait_ms)
         if _text(reply[0]) == "full":
             raise QueueFull(queue, int(reply[1]))
+        if acked is not None and int(acked) < wait_replicas:
+            raise NotReplicated(
+                f"queue {queue}: {acked} of {wait_replicas} replicas in {wait_ms} ms"
+            )
         return _text(reply[1])
 
     async def receive(

@@ -240,10 +240,8 @@ SETTINGS: Mapping[str, Spec] = {
     "shared_tpm": _spec("A", number(1, integer=True)),
     "rate_window": _spec("D,A,M,R", one_of("smooth", "fixed"), "smooth"),
     "rate_burst": _spec("D,A,M,R", number(0, 1), 0.1),
-    "request_status": _spec("D,M", one_of("full", "final", "off"), "full"),
     "stream_flush_ms": _spec("M,R", number(0, 1000, integer=True), 30),
     "max_concurrency": _spec("D,A,M,R", number(1, integer=True)),
-    "limiter_initial": _spec("D,A,M,R", number(1, integer=True), 20),
     "priority_reserve": _spec(
         "D,A,M", number(0, 1), by_type=lambda kind: 0.2 if kind == "chat" else 0.0
     ),
@@ -252,22 +250,22 @@ SETTINGS: Mapping[str, Spec] = {
     "timeout_max_secs": _spec("D,M", _POS, 900),
     "max_wait_secs": _spec("D,M", _POS),
     "attempt_timeout_secs": _spec("D,A,M,R", _POS, 60),
-    "retry_attempts": _spec("D,A,M,R", number(1, 10, integer=True), 3),
     "throttle_retry_attempts": _spec("D,A,M,R", number(1, 20, integer=True), 6),
     "retry_base_secs": _spec("D,A,M,R", number(0), 1.0),
     "retry_multiplier": _spec("D,A,M,R", number(1), 4.0),
     "retry_spread": _spec("D,A,M,R", number(1), 2.5),
     "retry_max_secs": _spec("D,A,M,R", _POS, 30.0),
-    "throttle_retry_max_secs": _spec("D,A,M,R", _POS, 10.0),
     "breaker_threshold": _spec("D,A,M,R", number(1, integer=True), 5),
     "breaker_cooldown_secs": _spec("D,A,M,R", _POS, 15.0),
+    # Failures count toward the threshold only within this window (one after it restarts it).
+    "breaker_window_secs": _spec("D,A,M,R", _POS, 60.0),
+    # A probe call that never reported back stops blocking others after this.
+    "breaker_probe_secs": _spec("D,A,M,R", _POS, 60.0),
     "balance": _spec("D,M", strategy, "ordered"),
     "balance_opts": _spec(
         "D,M", obj({"pick": one_of("percent", "max", "spread")}), {"pick": "percent"}, merge=True
     ),
     "balance_priority": _spec("M", strategy),
-    "output_reserve": _spec("M", one_of("max_tokens", "observed"), "max_tokens"),
-    "hold_max_secs": _spec("D,M", _POS, 5),
     "max_attempts": _spec("D,M", number(1, integer=True), 4),
     "retry_budget_pct": _spec("D,M", _PCT, 20),
     "retry_budget_min": _spec("D,M", number(0, integer=True), 10),

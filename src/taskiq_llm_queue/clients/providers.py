@@ -322,6 +322,8 @@ _FACTORIES: dict[str, ProviderFactory] = {"bedrock": BedrockProvider, "openai": 
 
 def register_provider(name: str, factory: ProviderFactory) -> None:
     """Add a provider kind (pair it with `registry.register_account_kind`)."""
+    if not name or not callable(factory):
+        raise ConfigError("register_provider needs a name and a callable factory")
     _FACTORIES[name] = factory
 
 

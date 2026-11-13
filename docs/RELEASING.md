@@ -18,12 +18,13 @@ publishing** (OIDC). No PyPI token lives in the repo, in CI secrets or in `.pypi
 ## Each release
 
 1. Bump `src/taskiq_llm_queue/_version.py` (PEP 440: `0.1.0a1`, `0.1.0b1`, `0.1.0rc1`, `0.1.0`).
-2. Move the `[Unreleased]` notes in `CHANGELOG.md` under the new version and date.
+2. In `CHANGELOG.md`, replace `unreleased` in the version's heading with the date.
 3. Check locally (Docker stack up):
 
    ```bash
-   make check                       # ruff, format, mypy, unit + integration tests
-   uv build --out-dir /tmp/llmq-dist && uvx twine check --strict /tmp/llmq-dist/*
+   make check-all                   # every step: lint, types, tests, drills, plan gates, samples
+   python scripts/samples.py --live --store env --env-file <app .env>   # real Bedrock, real store
+   uv build --out-dir /tmp/llmq-dist && uvx twine check --strict /tmp/llmq-dist/*  # metadata only
    ```
 
 4. Commit, push, then **Actions → publish → Run workflow** to upload to TestPyPI, and try it:
@@ -39,9 +40,5 @@ publishing** (OIDC). No PyPI token lives in the repo, in CI secrets or in `.pypi
 A version number can be uploaded only once (PyPI never allows re-use, even after deleting it),
 so test on TestPyPI first.
 
-## Manual upload (fallback only)
-
-```bash
-uv build
-UV_PUBLISH_TOKEN=<pypi-token> uv publish          # token from your shell, never a committed file
-```
+Releases go out only through a GitHub release and `publish.yml` (trusted publishing, with
+provenance). There is no manual upload path.

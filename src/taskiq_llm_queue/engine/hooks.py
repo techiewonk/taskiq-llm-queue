@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from taskiq_llm_queue._logging import get_logger
+from taskiq_llm_queue.errors import ConfigError
 
 logger = get_logger(__name__)
 
@@ -62,12 +63,12 @@ _HOOKS: dict[str, dict[str, Callable[..., Any]]] = {
     "sticky_key": {},
     "probe": {},
 }
-_WARNED: set[tuple[str, str]] = set()
+_WARNED: set[tuple[str, str, str]] = set()  # (event, kind, name): each event warns once
 
 
 def _register(kind: str, name: str, fn: Callable[..., Any]) -> None:
     if not name or not callable(fn):
-        raise ValueError(f"{kind} hook needs a name and a callable")
+        raise ConfigError(f"{kind} hook needs a name and a callable")
     _HOOKS[kind][name] = fn
 
 
@@ -101,8 +102,8 @@ def get(kind: str, name: str | None) -> Callable[..., Any] | None:
     if not name:
         return None
     fn = _HOOKS[kind].get(name)
-    if fn is None and (kind, name) not in _WARNED:
-        _WARNED.add((kind, name))
+    if fn is None and ("missing", kind, name) not in _WARNED:
+        _WARNED.add(("missing", kind, name))
         logger.warning("hook_not_registered", kind=kind, name=name)
     return fn
 
@@ -112,7 +113,7 @@ def call_safely(kind: str, name: str, fn: Callable[..., Any], *args: Any, defaul
     try:
         return fn(*args)
     except Exception as exc:  # a hook bug must never fail a call
-        if (kind, name) not in _WARNED:
-            _WARNED.add((kind, name))
+        if ("failed", kind, name) not in _WARNED:
+            _WARNED.add(("failed", kind, name))
             logger.warning("hook_failed", kind=kind, name=name, error=str(exc))
         return default

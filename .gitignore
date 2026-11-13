@@ -33,3 +33,7 @@ reports/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Docs site build (zensical build)
+site/
+.cache/

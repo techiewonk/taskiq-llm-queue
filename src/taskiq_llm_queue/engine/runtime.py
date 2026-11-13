@@ -12,15 +12,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import random
 import time
-import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from redis.exceptions import ConnectionError as StoreConnectionError
-from redis.exceptions import ResponseError
+from redis.exceptions import OutOfMemoryError, ResponseError
+from redis.exceptions import ReadOnlyError as StoreReadOnlyError
 from redis.exceptions import TimeoutError as StoreTimeoutError
 
 from taskiq_llm_queue._logging import get_logger
@@ -42,12 +43,20 @@ from taskiq_llm_queue.engine.health import Health
 from taskiq_llm_queue.engine.keys import Keys
 from taskiq_llm_queue.engine.metrics import Metrics, NullSink
 from taskiq_llm_queue.engine.offload import ResultOffload
-from taskiq_llm_queue.engine.queue import Message, QueueFull, QueueSettings, StreamQueues
+from taskiq_llm_queue.engine.queue import (
+    Message,
+    NotReplicated,
+    QueueFull,
+    QueueSettings,
+    StreamQueues,
+)
 from taskiq_llm_queue.engine.requests import RequestStore
 from taskiq_llm_queue.engine.status import AlertEvaluator, StatusReader
 from taskiq_llm_queue.engine.streaming import ChunkReader, ChunkWriter, StreamTooLarge
 from taskiq_llm_queue.errors import ErrorKind, UnsupportedEnvelopeError
+from taskiq_llm_queue.ids import new_id
 from taskiq_llm_queue.providers.classify import is_target_error
+from taskiq_llm_queue.tuning import EngineTimings
 
 if TYPE_CHECKING:
     import redis.asyncio
@@ -92,18 +101,51 @@ class EngineSettings:
     lease_secs: float = 60.0
     waiter_secs: float = 2.0
     result_ttl_secs: int = 300
-    result_dedupe_secs: int = 30
+    result_dedupe_secs: int = 0
     status_ttl_secs: int = 1800
     caller_ttl_secs: int = 30
-    poll_secs: float = 1.0
+    poll_secs: float = 5.0  # safety-net result check (the wake-up is published with the result)
     sweep_secs: float = 10.0
     receive_batch: int = 10
     caller_margin_secs: float = 5.0
     local_limit_cap: int = 10
     drain_secs: float = 45.0
+    id_hash_salt: str = ""  # LLMQ_ID_HASH_SALT: the key of every user / session id hash
+    cfg_reload_secs: float = 30.0  # LLMQ_CFG_RELOAD_SECS: how often the registry is re-read
+    queue_failover_secs: float = 5.0  # queue-store errors this long before calls run direct
+    queue_wait_replicas: int = 0  # a send waits for this many replicas (0: off)
+    queue_wait_ms: int = 100  # how long it waits for them
+    debug_capture_allowed: bool = False  # LLMQ_DEBUG_CAPTURE_FROM_CONFIG (never in prod)
+    timings: EngineTimings = field(default_factory=EngineTimings)  # `Tuning.engine`
 
 
-STORE_ERRORS = (StoreConnectionError, StoreTimeoutError, ConnectionError, OSError)
+# ARGV: key prefix, request ids... Reply: the 0-based indexes of the ids with a stored result.
+_RESULTS_EXIST = """
+local out = {}
+for i = 2, #ARGV do
+  if redis.call('EXISTS', ARGV[1] .. ':{r:' .. ARGV[i] .. '}:res') == 1 then
+    table.insert(out, i - 2)
+  end
+end
+return out
+"""
+
+
+def _refusal(exc: BaseException) -> str:
+    """A caller-facing message for a store that answered with a refusal."""
+    if isinstance(exc, OutOfMemoryError) or "OOM" in str(exc):
+        return "the state store is out of memory"  # redis-py strips the "OOM" prefix
+    return f"the state store refused the call: {exc}"
+
+
+# READONLY: a failover left this connection on the old primary (now a replica).
+STORE_ERRORS = (
+    StoreConnectionError,
+    StoreTimeoutError,
+    StoreReadOnlyError,
+    ConnectionError,
+    OSError,
+)
 
 
 @dataclass(slots=True)
@@ -125,6 +167,9 @@ class _Held:
     cancelled: bool = False
     target_failed: list[tuple[str, str]] = field(default_factory=list)
     run: asyncio.Task[None] | None = None
+    # Model-level request and estimate, built once per registry view (a deep copy of the
+    # prompt each time: ~0.7 ms for 200 KB, and it was rebuilt in _ask, _decide and _attempt).
+    charged: tuple[Any, str, tokens.Estimate] | None = None
 
     @property
     def position(self) -> float:
@@ -136,6 +181,10 @@ class _Held:
 
 class _QueueDown(Exception):
     """The queue store refused a send while the state store works: run the call direct."""
+
+
+class _SendNotReplicated(Exception):  # internal signal, never raised to callers
+    """The send reached the primary but no replica in time: the caller runs it direct."""
 
 
 class StoreClock:
@@ -195,8 +244,9 @@ class Engine:
             self.keys,
             lease_secs=self.settings.lease_secs,
             waiter_secs=self.settings.waiter_secs,
+            timings=self.settings.timings,
         )
-        self.worker_id = worker_id or f"{uuid.uuid4().hex[:8]}:{uuid.uuid4().hex[:6]}"
+        self.worker_id = worker_id or new_id()[-14:]  # the random tail: the head is time
         self.clock = StoreClock()
         self._tasks: list[asyncio.Task[None]] = []
         self._running: set[asyncio.Task[None]] = set()
@@ -207,18 +257,27 @@ class Engine:
         self._pubsub: Any = None
         self._cancels: Any = None
         self._stopping = False
+        self._paused = False
+        self._local_callers: dict[str, int] = {}  # request id -> coroutines waiting on it here
+        self._wake: dict[str, asyncio.Event] = {}  # model -> wakes its receive loop
+        self._beat_ok_at = time.monotonic()  # last heartbeat that reached the store
+        self._store_trouble_at = -1e9  # monotonic time this process last saw the store fail
+        self._results_exist = state.register_script(_RESULTS_EXIST)
         self.ready = False
         self._direct_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.health = Health(state, self.keys)
         self.metrics: Metrics = metrics or NullSink()
         self.status_reader = StatusReader(state, self.keys, self.queues, self.settings.queue_prefix)
         self.alerts = AlertEvaluator(state, self.keys)
-        # Accounts whose credentials failed in this process: account -> (until, backoff).
-        self._bad_accounts: dict[str, tuple[float, float]] = {}
+        # Credentials that failed in this process, per account and region: (account, region)
+        # -> (until, backoff). Per region: a token can be refused in one region only (an
+        # opt-in region such as ap-south-2 refuses v1 STS tokens), and keying by account took
+        # every region of it down (scenario P5).
+        self._bad_accounts: dict[tuple[str, str], tuple[float, float]] = {}
         self._idle = asyncio.Event()
         self._static: dict[str, asyncio.Semaphore] = {}
         self._rng = random.Random()
-        self.chunks = ChunkReader(state)
+        self.chunks = ChunkReader(state, block_ms=self.settings.timings.stream_read_block_ms)
 
     # ================================================================ lifecycle
 
@@ -235,6 +294,7 @@ class Engine:
         if caller:
             self._pubsub = self.state.pubsub()
             self._tasks.append(asyncio.create_task(self._result_reader()))
+            self._tasks.append(asyncio.create_task(self._result_sweep()))
         if worker:
             for alias in self.registry.current.registry.models:
                 slots = int(self.registry.current.value(alias, "worker_slots"))
@@ -245,9 +305,19 @@ class Engine:
             self._tasks.append(asyncio.create_task(self._alert_loop()))
             self._cancels = self.state.pubsub()
             self._tasks.append(asyncio.create_task(self._cancel_reader()))
+            self._tasks.append(asyncio.create_task(self._warm_clients()))
         self._tasks.append(asyncio.create_task(self._heartbeat()))
-        self._tasks.append(asyncio.create_task(self.registry.run(30)))
+        self._tasks.append(asyncio.create_task(self.registry.run(self.settings.cfg_reload_secs)))
         self.ready = True
+
+    def pause_receiving(self) -> None:
+        """Not ready, and take no new calls from the queues; running and held calls go on.
+
+        The first step of a shutdown, for a preStop hook: the load balancer stops sending
+        requests while this pod finishes its work. `stop()` follows.
+        """
+        self.ready = False
+        self._paused = True
 
     async def stop(self, drain_secs: float | None = None) -> None:
         """Shut down in order (plan §3.18): not ready, stop receiving, finish running calls.
@@ -261,9 +331,10 @@ class Engine:
         self.ready = False
         self._stopping = True
         for held in list(self._held.values()):
-            if not held.grants and held.message is not None:
+            if not held.grants and held.run is None and held.message is not None:
                 with contextlib.suppress(*STORE_ERRORS):
                     await self.queues.return_(held.message)
+                self._drop(held)  # else the heartbeat hides it again for the whole drain
         if self._running:
             await asyncio.wait(set(self._running), timeout=max(0.0, until - loop.time()))
         if self._waiters:
@@ -280,6 +351,13 @@ class Engine:
             if pubsub is not None:
                 with contextlib.suppress(Exception):
                     await pubsub.aclose()
+
+    async def aclose(self) -> None:
+        """Close the provider clients and both store clients (after `stop()`)."""
+        await self.providers.aclose()
+        if self._queue_store is not None:
+            await self._queue_store.aclose()
+        await self.state.aclose()
 
     # ================================================================ caller
 
@@ -323,7 +401,7 @@ class Engine:
         op = OPS.get((entry.provider, entry.type), "chat" if entry.type == "chat" else "embeddings")
         timeout = float(timeout_secs or view.value(alias, "timeout_secs"))
         timeout = min(timeout, float(view.value(alias, "timeout_max_secs")))
-        rid = request_id or stream_id or uuid.uuid4().hex
+        rid = request_id or stream_id or new_id()
         envelope = Envelope(
             request_id=rid,
             op=op,
@@ -350,25 +428,48 @@ class Engine:
             if isinstance(verdict, hooks.Reject):
                 raise CallFailed("rejected", verdict.reason, request_id=rid)
         direct = force_direct or self._direct_route(view, alias, rid, user_id)
+        self._local_callers[rid] = self._local_callers.get(rid, 0) + 1
+        # One deadline for the whole call, whatever path it takes: a store outage sent calls
+        # down the store_down path with a fresh timeout, and the soak saw 135 answers come
+        # after their deadline (20 s store block, 30 s calls).
+        deadline = asyncio.get_running_loop().time() + timeout + self.settings.caller_margin_secs
         try:
-            return await self._call_once(
-                view, alias, envelope, params, priority, timeout, request_id, direct
-            )
-        except _QueueDown:
-            return await self._call_once(
-                view, alias, envelope, params, priority, timeout, request_id, True
-            )
+            async with asyncio.timeout_at(deadline):
+                try:
+                    return await self._call_once(
+                        view, alias, envelope, params, priority, timeout, request_id, direct
+                    )
+                except _QueueDown:
+                    return await self._call_once(
+                        view, alias, envelope, params, priority, timeout, request_id, True
+                    )
+                except STORE_ERRORS as exc:
+                    if stream:  # chunks travel through the state store
+                        message = "the state store is unreachable"
+                        raise CallFailed("queue_unavailable", message) from exc
+                    return await self._store_down(view, alias, envelope, exc, deadline)
+                except ResponseError as exc:
+                    # The store answered but refused (out of memory, a script error): still one
+                    # error family for callers. A refused registration raised redis-py's
+                    # OutOfMemoryError straight to the app (scenario S9).
+                    raise CallFailed("queue_unavailable", _refusal(exc), request_id=rid) from exc
+        except TimeoutError as exc:
+            raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid) from exc
         except asyncio.CancelledError:
-            # The awaiting task was cancelled: cancel the call unless others wait on its id.
+            # The awaiting task was cancelled: cancel the call unless others wait on its id,
+            # in other processes or in this one (they share this process's caller entry).
             with contextlib.suppress(Exception):
                 callers = await asyncio.shield(self.requests.callers(rid))
-                if set(callers) <= {self.worker_id}:
+                alone_here = self._local_callers.get(rid, 0) <= 1
+                if alone_here and set(callers) <= {self.worker_id}:
                     await asyncio.shield(self.cancel(rid))
             raise
-        except STORE_ERRORS as exc:
-            if stream:  # chunks travel through the state store
-                raise CallFailed("queue_unavailable", "the state store is unreachable") from exc
-            return await self._store_down(view, alias, envelope, exc)
+        finally:
+            left = self._local_callers.get(rid, 1) - 1
+            if left:
+                self._local_callers[rid] = left
+            else:
+                self._local_callers.pop(rid, None)
 
     async def stream(
         self, model: str, params: Mapping[str, Any], **call: Any
@@ -382,7 +483,7 @@ class Engine:
         view = self.registry.current
         alias = view.registry.alias_of(model)
         idle = float(view.value(alias, "stream_idle_secs"))
-        rid = call.pop("request_id", None) or uuid.uuid4().hex
+        rid = call.pop("request_id", None) or new_id()
         key = self.keys.request(rid, "chunks")
         queue = self.chunks.open(key)
         task = asyncio.create_task(self.call(model, params, stream=True, stream_id=rid, **call))
@@ -441,15 +542,22 @@ class Engine:
             with contextlib.suppress(BaseException):
                 await task
 
+    def hash_id(self, value: str) -> str:
+        """Keyed hash (HMAC-SHA256, `LLMQ_ID_HASH_SALT`) of a user or session id, 16 hex chars.
+
+        Every id outside the message itself is stored and logged only as this (plan §3.17):
+        status records, sticky keys, logs and `routing.allow_users`. Unkeyed, a low-entropy id
+        (a client code, a phone number) is brute-forced back from the hash.
+        """
+        key = self.settings.id_hash_salt.encode()
+        return hmac.new(key, value.encode(), hashlib.sha256).hexdigest()[:16]
+
     def _direct_route(
         self, view: ResolvedRegistry, alias: str, rid: str, user_id: str | None
     ) -> bool:
         """True when this call runs direct: kill switch, or outside `queue_pct` (canary)."""
         routing = view.registry.routing
-        if user_id and (
-            user_id in routing.allow_users
-            or hashlib.sha256(user_id.encode()).hexdigest()[:16] in routing.allow_users
-        ):
+        if user_id and self.hash_id(user_id) in routing.allow_users:
             return False
         if routing.kill_switch:
             return True
@@ -469,7 +577,7 @@ class Engine:
     ) -> Reply:
         rid = envelope.request_id
         user_id, session_id = envelope.user_id, envelope.session_id
-        user_hash = hashlib.sha256((user_id or session_id or "").encode()).hexdigest()[:16]
+        user_hash = self.hash_id(user_id or session_id or "")
         found = await self.requests.register(
             rid,
             caller=self.worker_id,
@@ -498,7 +606,13 @@ class Engine:
                         self._running.add(task)
                         task.add_done_callback(self._running.discard)
                     else:
-                        await self._send(rid, envelope, view, alias, priority, call_secs)
+                        try:
+                            await self._send(rid, envelope, view, alias, priority, call_secs)
+                        except _SendNotReplicated:
+                            await self.requests.confirm(rid, keep_secs=call_secs)
+                            task = asyncio.create_task(self._direct(envelope))
+                            self._running.add(task)
+                            task.add_done_callback(self._running.discard)
                 reply = await self._wait_result(
                     rid, waiter, until - loop.time(), recheck=outcome == "attached"
                 )
@@ -518,7 +632,10 @@ class Engine:
                 if outcome == "conflict":
                     raise CallFailed("request_id_conflict", "the id was used with other params")
         finally:
-            self._waiters.pop(rid, None)
+            # Other coroutines here may wait on the same id and share its wake-up: removing
+            # it left them asleep until their deadline's last read (one waiter cancelled).
+            if self._local_callers.get(rid, 1) <= 1:
+                self._waiters.pop(rid, None)
             if not self._waiters:
                 self._idle.set()
 
@@ -554,29 +671,56 @@ class Engine:
         priority: bool,
         keep_secs: float,
     ) -> None:
-        """Put the message on its queue and confirm the record; undo the record on failure."""
+        """Put the message on its queue and confirm the record; undo the record on failure.
+
+        A separate queue store that keeps failing for `queue_failover_secs` sends the call
+        down the direct path; shorter blips are retried. With `queue_wait_replicas`, a send
+        that no replica acknowledged in time is a failed send (plan B23) and the call runs
+        direct.
+        """
         settings = QueueSettings(max_waiting=int(view.value(alias, "max_waiting")))
-        try:
-            await self.queues.send(
-                self._queue_name(view, alias, priority), envelope.dumps(), settings
-            )
-        except QueueFull as exc:
-            await self.requests.abandon(rid, caller=self.worker_id)
-            raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
-        except ResponseError as exc:
-            await self.requests.abandon(rid, caller=self.worker_id)
-            if "OOM" in str(exc):
-                raise CallFailed("queue_unavailable", "the queue store is out of memory") from exc
-            raise
-        except STORE_ERRORS as exc:
-            await self.requests.abandon(rid, caller=self.worker_id)
-            if self.queues_shared:
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + self.settings.queue_failover_secs
+        body = envelope.dumps()
+        while True:
+            try:
+                await self.queues.send(
+                    self._queue_name(view, alias, priority),
+                    body,
+                    settings,
+                    wait_replicas=self.settings.queue_wait_replicas,
+                    wait_ms=self.settings.queue_wait_ms,
+                )
+                break
+            except QueueFull as exc:
+                await self.requests.abandon(rid, caller=self.worker_id)
+                raise CallFailed("queue_full", str(exc), retry_after_secs=5) from exc
+            except NotReplicated as exc:
+                # A failed send (plan B23): the call runs direct now, under this same record
+                # (re-registering raced the unreplicated copy's claim into a conflict). Not
+                # re-sent: each try would add a copy; the copy meets a claimed job and stops.
+                logger.warning("send_not_replicated", request_id=rid, error=str(exc))
+                raise _SendNotReplicated from exc
+            except ResponseError as exc:
+                await self.requests.abandon(rid, caller=self.worker_id)
+                if isinstance(exc, OutOfMemoryError) or "OOM" in str(exc):
+                    raise CallFailed("queue_unavailable", _refusal(exc)) from exc
                 raise
-            raise _QueueDown from exc
-        except BaseException:
-            await self.requests.abandon(rid, caller=self.worker_id)
-            raise
-        await self.requests.confirm(rid, keep_secs=keep_secs)
+            except STORE_ERRORS as exc:
+                if not self.queues_shared and loop.time() < give_up:
+                    await asyncio.sleep(0.25)
+                    continue
+                await self.requests.abandon(rid, caller=self.worker_id)
+                if self.queues_shared:
+                    raise
+                raise _QueueDown from exc
+            except BaseException:
+                await self.requests.abandon(rid, caller=self.worker_id)
+                raise
+        try:
+            await self.requests.confirm(rid, keep_secs=keep_secs)
+        except STORE_ERRORS as exc:  # the message is on the queue: never run it a second time
+            logger.warning("confirm_failed", request_id=rid, error=str(exc))
 
     @property
     def queues_shared(self) -> bool:
@@ -618,16 +762,25 @@ class Engine:
                 held.run.cancel()
 
     async def _store_down(
-        self, view: ResolvedRegistry, alias: str, envelope: Envelope, exc: BaseException
+        self,
+        view: ResolvedRegistry,
+        alias: str,
+        envelope: Envelope,
+        exc: BaseException,
+        deadline: float,
     ) -> Reply:
-        """The state store is unreachable: the model's `store_down` rule (plan §3.11)."""
+        """The state store is unreachable: the model's `store_down` rule (plan §3.11).
+
+        `deadline` is the call's own (loop time, margin included): `pause` waits only until
+        then, never a fresh timeout from the moment the store failed.
+        """
         mode = view.value(alias, "store_down")
         logger.warning("store_down", model=alias, mode=mode, error=str(exc))
         if mode == "static_cap":
             return await self._static_cap(view, alias, envelope)
         if mode == "pause":
             loop = asyncio.get_running_loop()
-            until = loop.time() + envelope.timeout_secs
+            until = deadline - self.settings.caller_margin_secs
             while loop.time() < until:
                 await asyncio.sleep(1.0)
                 try:
@@ -683,7 +836,7 @@ class Engine:
             envelope=env,
             first_seen=self.clock.now(),
             position_ms=int(self.clock.now() * 1000),
-            tag=f"d{uuid.uuid4().hex[:10]}",
+            tag=f"d{new_id()[-10:]}",  # random tail (a v7 id starts with the time)
         )
         self._held[env.request_id] = held
         alias = env.model
@@ -696,7 +849,7 @@ class Engine:
                 await self._run(held, decision, 1, alias)
         finally:
             if not held.grants:
-                self._held.pop(env.request_id, None)
+                self._drop(held)
 
     async def _direct_wait(self, held: _Held) -> Decision | None:
         """Admission for a direct call until granted (the decision) or settled (None)."""
@@ -725,15 +878,45 @@ class Engine:
                 return None
             await asyncio.sleep(min(max(decision.wait_secs, 0.01), 1.0))
 
+    def _rearm(self, rid: str, done: asyncio.Future[None]) -> asyncio.Future[None]:
+        """The id's next wake-up after `done` fired: made by the first waiter to see it, shared.
+
+        Each waiter making its own replaced the others', so all but the last slept until a
+        recheck (two coroutines waiting on one id in one process).
+        """
+        current = self._waiters.get(rid)
+        if current is None or current is done:
+            current = asyncio.get_running_loop().create_future()
+            self._waiters[rid] = current
+        return current
+
     async def _wait_result(
         self, rid: str, waiter: asyncio.Future[None], secs: float, *, recheck: bool = False
     ) -> Reply | None:
         """The reply; None (only with `recheck`) when the call's record disappeared."""
         loop = asyncio.get_running_loop()
         until = loop.time() + secs
+        if not recheck:
+            # Just sent: the reply cannot be there yet. Wait for the wake-up (or one poll)
+            # before the first read; reading at once cost a round trip on every call.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(waiter), min(secs, self.settings.poll_secs))
+            if waiter.done():
+                waiter = self._rearm(rid, waiter)
         while True:
-            reply = await self.requests.take_result(rid)
-            if reply is None and recheck and not await self.requests.job(rid):
+            try:
+                reply = await self.requests.take_result(rid)
+                gone = reply is None and recheck and not await self.requests.job(rid)
+            except STORE_ERRORS as exc:
+                # The call is already sent or running: wait for the store, never re-run it
+                # on the store_down path (that ran it twice, once outside the budget).
+                if until - loop.time() <= 0:
+                    raise CallFailed(
+                        "deadline_exceeded", "the store did not answer in time", request_id=rid
+                    ) from exc
+                await asyncio.sleep(min(0.5, max(0.0, until - loop.time())))
+                continue
+            if gone:
                 return None
             if reply is not None:
                 if reply.ok:
@@ -748,11 +931,51 @@ class Engine:
             left = until - loop.time()
             if left <= 0:
                 raise CallFailed("deadline_exceeded", "no reply in time", request_id=rid)
+            # The wake-up comes by pub/sub (published with the result), or from this process's
+            # one result sweep (`_result_sweep`); a read per waiting caller made store load
+            # grow with the backlog (B56). The timeout is only a last-resort recheck.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(waiter), min(left, self.settings.poll_secs))
+                await asyncio.wait_for(
+                    asyncio.shield(waiter), min(left, self.settings.timings.result_recheck_secs)
+                )
             if waiter.done():
-                waiter = loop.create_future()
-                self._waiters[rid] = waiter
+                waiter = self._rearm(rid, waiter)
+
+    async def _warm_clients(self) -> None:
+        """Create every Bedrock deployment's client now, not on its first call.
+
+        A client takes about a second to build (measured: the first call of a fresh worker took
+        1,032 ms against ~140 ms after; B92 asks for <= 500 ms of first-call overhead).
+        Failures are ignored here: a call meets them again, and handles them.
+        """
+        view = self.registry.current
+        for alias, entry in view.registry.models.items():
+            if entry.provider != "bedrock":
+                continue
+            for deployment in view.deployments(alias):
+                with contextlib.suppress(Exception):
+                    await self.providers.pool.bedrock(route_for(view, deployment))
+
+    async def _result_sweep(self) -> None:
+        """Every `poll_secs`, one store call finds results of this process's waiting callers.
+
+        The safety net behind the pub/sub wake-up: one script per process per period, however
+        many calls wait (a read per waiting caller grew with the backlog, plan B56).
+        """
+        while True:
+            await asyncio.sleep(self.settings.poll_secs)
+            waiting = [rid for rid, w in self._waiters.items() if not w.done()]
+            for start in range(0, len(waiting), 500):
+                chunk = waiting[start : start + 500]
+                try:
+                    found = await self._results_exist([], [self.keys.prefix, *chunk])
+                except Exception as exc:  # the sweep must survive store hiccups
+                    logger.warning("result_sweep_failed", error=str(exc))
+                    break
+                for index in found or ():
+                    waiter = self._waiters.get(chunk[int(index)])
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(None)
 
     async def _result_reader(self) -> None:
         """Wake waiting callers when their result is published (re-subscribes after errors)."""
@@ -762,6 +985,10 @@ class Engine:
                 if not subscribed:
                     await self._pubsub.subscribe(self.keys.done_channel(self.worker_id))
                     subscribed = True
+                    # Results published while unsubscribed were missed: every waiter re-reads.
+                    for pending in list(self._waiters.values()):
+                        if not pending.done():
+                            pending.set_result(None)
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=1.0
                 )
@@ -786,16 +1013,47 @@ class Engine:
     # ================================================================ worker: receiving
 
     async def _model_loop(self, alias: str) -> None:
-        """Receive this model's calls (priority first) and admit them in order."""
+        """Receive this model's calls (priority first) and admit them in order.
+
+        Idle, it blocks on its queues' doorbell (a send wakes one worker at once) for 50 ms at a
+        time, then 1 s after a second with nothing: polling idle loops made ~96 receive
+        scripts/s per pod with 4 models (measured); a busy loop never waits.
+        """
+        empty = 0
+        wake = self._wake.setdefault(alias, asyncio.Event())
         while not self._stopping:
+            if self._paused:
+                await asyncio.sleep(0.2)
+                continue
             try:
                 got = await self._receive_once(alias)
             except Exception as exc:  # a store blip must not end the loop
                 logger.warning("receive_failed", model=alias, error=str(exc))
+                if isinstance(exc, STORE_ERRORS):
+                    # Not only the heartbeat (every lease/3): a block between two beats went
+                    # unseen, and callers whose keys lapsed in it were dropped as gone (soak).
+                    self._store_trouble_at = time.monotonic()
                 await asyncio.sleep(1)
                 continue
+            held = (alias, "p") in self._held_class or (alias, "n") in self._held_class
+            # Idle only when the queues were empty, not when a class waits on its held call.
+            empty = 0 if got or held else empty + 1
             if not got:
-                await asyncio.sleep(0.05)
+                pace = self.settings.timings
+                pause = (
+                    pace.idle_poll_secs if empty < pace.idle_after_empty else pace.idle_slow_secs
+                )
+                if held:  # a held call ending (granted or settled) wakes it at once
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(wake.wait(), pause)
+                else:  # a send rings the doorbell: one idle worker wakes per call
+                    view = self.registry.current
+                    names = [self._queue_name(view, alias, p) for p in (True, False)]
+                    try:
+                        await self.queues.wait_bell(names, pause)
+                    except STORE_ERRORS:
+                        self._store_trouble_at = time.monotonic()  # (was swallowed unseen)
+                wake.clear()
 
     async def _receive_once(self, alias: str) -> bool:
         view = self.registry.current
@@ -823,7 +1081,13 @@ class Engine:
                 continue
             got_any = True
             for index, message in enumerate(messages):
-                held = await self._admit_new(alias, message)
+                try:
+                    held = await self._admit_new(alias, message)
+                except Exception:
+                    for rest in messages[index + 1 :]:  # not seen: back to the queue now
+                        with contextlib.suppress(Exception):
+                            await self.queues.return_(rest)
+                    raise
                 if held:
                     for rest in messages[index + 1 :]:
                         await self.queues.return_(rest)
@@ -868,18 +1132,42 @@ class Engine:
             tag=message.id,
         )
         self._held[env.request_id] = held
-        if not await self._caller_alive(env):
-            await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
-            return False
-        return await self._try(held, attempt=1)
+        try:
+            if not await self._caller_alive(env):
+                # A warning: a dropped call is worth seeing (the soak and scenario S5 found
+                # calls dropped wrongly, and INFO logs alone did not show it).
+                logger.warning("caller_gone", request_id=env.request_id, model=env.model)
+                await self._finish_call(held, "cancelled", "caller_gone", final="cancelled")
+                return False
+            return await self._try(held, attempt=1)
+        except Exception:
+            await self._release(held)
+            raise
 
     async def _caller_alive(self, env: Envelope) -> bool:
-        """False when every caller of this call is gone (plan §3.18 R24)."""
+        """False when every caller of this call is gone (plan §3.18 R24).
+
+        After a store outage the callers' liveness keys may have expired only because nobody
+        could renew them: for a caller TTL and a heartbeat after this process last saw the
+        store fail, callers count as alive (B95: a 45 s block dropped 429 of 500 calls).
+
+        Judged from this process's own heartbeat too: a half-open store hung every command for
+        the read timeout, the doorbell wait swallowed its error, and calls were dropped the
+        moment the store came back (scenario S5). A heartbeat that is late or just recovered
+        from a gap means the store was out of reach here as well, so a lapsed key proves
+        nothing.
+        """
+        beat = self.settings.lease_secs / 3
+        grace = self.settings.caller_ttl_secs + beat + 5
+        now = time.monotonic()
+        if now - self._store_trouble_at < grace or now - self._beat_ok_at > 2 * beat + 1:
+            return True
         try:
             return await self.requests.callers_alive(
                 env.request_id, prefix=self.keys.prefix, caller_ttl=self.settings.caller_ttl_secs
             )
         except STORE_ERRORS:
+            self._store_trouble_at = time.monotonic()
             return True
 
     # ================================================================ worker: admission
@@ -903,7 +1191,9 @@ class Engine:
             deps = [d for d in deps if d.account in env.allowed_accounts]
         fallback_ok = self._may_spill(view, alias, env, age, cause, "fallback")
         now = time.monotonic()
-        deps = [d for d in deps if self._bad_accounts.get(d.account, (0.0, 0.0))[0] <= now]
+        deps = [
+            d for d in deps if self._bad_accounts.get((d.account, d.region), (0.0, 0.0))[0] <= now
+        ]
         out = []
         for dep in deps:
             if dep.group == "fallback" and not fallback_ok:
@@ -963,8 +1253,7 @@ class Engine:
         if not candidates:
             return None
         entry = view.registry.models[alias]
-        params = self._params(view, alias, env, None)
-        estimate = self._estimate(view, alias, env, params)
+        estimate = self._charged(view, alias, held)
         strategy = view.value(alias, "balance")
         if env.priority and view.value(alias, "balance_priority"):
             strategy = view.value(alias, "balance_priority")
@@ -981,7 +1270,7 @@ class Engine:
                 ctx = self._ctx(alias, held, age)
                 key = hooks.call_safely("sticky_key", name, fn, ctx, default=None) if fn else None
             if key:
-                sticky_hash = hashlib.sha256(str(key).encode()).hexdigest()[:16]
+                sticky_hash = self.hash_id(str(key))
         return Ask(
             alias=alias,
             request_id=env.request_id,
@@ -1057,6 +1346,16 @@ class Engine:
         extra = view.value(alias, "params", dep) if dep else None
         return inference.merge_params(request, extra or {})
 
+    def _charged(self, view: ResolvedRegistry, alias: str, held: _Held) -> tokens.Estimate:
+        """The token estimate admission charges: from model-level params, cached per view."""
+        cached = held.charged
+        if cached is not None and cached[0] is view and cached[1] == alias:
+            return cached[2]
+        params = self._params(view, alias, held.envelope, None)
+        estimate = self._estimate(view, alias, held.envelope, params)
+        held.charged = (view, alias, estimate)
+        return estimate
+
     def _estimate(
         self, view: ResolvedRegistry, alias: str, env: Envelope, params: Mapping[str, Any]
     ) -> tokens.Estimate:
@@ -1080,6 +1379,14 @@ class Engine:
         if now >= deadline:
             await self._finish_call(
                 held, "rate_limited", "no budget before the deadline", final="expired"
+            )
+            return False
+        max_wait = env.max_wait_secs
+        if max_wait is not None and attempt == 1 and now - held.position_ms / 1000.0 >= max_wait:
+            # It already waited its limit in the queue, unreceived: refuse it now rather than
+            # start it with no time left (it ran past its deadline and the caller gave up).
+            await self._finish_call(
+                held, "rate_limited", "max_wait_secs passed", final="expired", retry_after=1.0
             )
             return False
         decision = await self._decide(view, alias, held, attempt, failed)
@@ -1123,11 +1430,10 @@ class Engine:
         failed: frozenset[str],
     ) -> Decision | None:
         """One admission call and the terminal outcomes; None when the call was settled."""
-        env = held.envelope
         ask = self._ask(view, alias, held, attempt, failed)
         if ask is None:
             if self._bad_accounts and any(
-                d.account in self._bad_accounts for d in view.deployments(alias)
+                (d.account, d.region) in self._bad_accounts for d in view.deployments(alias)
             ):
                 await self._finish_call(
                     held,
@@ -1140,8 +1446,7 @@ class Engine:
                     held, "no_deployment", "the call's filter leaves no deployment"
                 )
             return None
-        params = self._params(view, alias, env, None)
-        estimate = self._estimate(view, alias, env, params)
+        estimate = self._charged(view, alias, held)
         tpm = [view.value(alias, "tpm", c.key) for c in ask.candidates]
         if all(isinstance(v, int) for v in tpm) and tpm and estimate.input > max(tpm):
             await self._finish_call(held, "request_too_large", "input above the token budget")
@@ -1152,6 +1457,17 @@ class Engine:
         if decision.kind == "stale_config":
             await self.registry.load()
             decision = await self.admission.pick_take(ask, self.registry.changes)
+        if decision.kind == "no_config":  # the store lost the numbers: restore, then once more
+            await self.registry.refresh()
+            decision = await self.admission.pick_take(ask, self.registry.changes)
+        if decision.kind in ("no_config", "stale_config"):
+            # Still no usable numbers. Before, the call stayed held and hidden for good.
+            logger.error("admission_config_missing", model=alias, kind=decision.kind)
+            if held.message is None:
+                await self._release(held)
+                raise CallFailed("queue_unavailable", f"{alias}: admission numbers are missing")
+            await self._release(held, delay_secs=5.0)
+            return None
         if decision.kind in ("done", "cancelled"):
             if decision.kind == "cancelled":
                 await self._finish_call(held, "cancelled", "cancelled", final="cancelled")
@@ -1159,7 +1475,7 @@ class Engine:
                 await self._ack(held)
             return None
         if decision.kind == "duplicate":
-            self._held.pop(env.request_id, None)
+            self._drop(held)
             if held.message is not None:
                 await self.queues.return_(held.message, delay_secs=self.settings.lease_secs / 2)
             return None
@@ -1225,8 +1541,15 @@ class Engine:
                     self._start_run(held, decision, 1)
                     return
                 wait = decision.wait_secs
+        except Exception as exc:  # never leave the call held with nobody working on it
+            if isinstance(exc, STORE_ERRORS):
+                self._store_trouble_at = time.monotonic()
+            logger.warning("hold_failed", request_id=held.envelope.request_id, error=str(exc))
+            await self._release(held)
         finally:
             self._held_class.discard((alias, cls))
+            if (event := self._wake.get(alias)) is not None:
+                event.set()  # the class is free: receive its next call now
 
     async def _model_fallback(
         self,
@@ -1285,18 +1608,28 @@ class Engine:
             if not held.cancelled:
                 raise
             # Cancelled by a caller: give the grant back as a cut attempt, reply `cancelled`.
-            for served, owner in list(held.grants):
-                with contextlib.suppress(Exception):
-                    await self.admission.finish(
-                        served,
-                        owner,
-                        held.envelope.request_id,
-                        refund_r=0,
-                        refund_t=0,
-                        outcome="none",
-                    )
-            held.grants.clear()
-            await self._finish_call(held, "cancelled", "cancelled", final="cancelled")
+            try:
+                await self._give_back(held)
+                await self._finish_call(held, "cancelled", "cancelled", final="cancelled")
+            except Exception as exc:
+                logger.warning("cancel_failed", request_id=held.envelope.request_id, error=str(exc))
+                await self._release(held)
+        except Exception as exc:
+            # A store outage, a store refusal (OOM) or a bug mid-call. Never leave the call held
+            # with nobody working on it (the heartbeat would hide its message for good): give
+            # the grants back and return the message, so it runs again (at least once; a stored
+            # result is reused). A direct call has no message: its caller gets the error.
+            if isinstance(exc, STORE_ERRORS):
+                self._store_trouble_at = time.monotonic()
+            logger.warning(
+                "run_failed",
+                request_id=held.envelope.request_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            await self._release(held)
+            if held.message is None:
+                raise
 
     async def _attempts(self, held: _Held, decision: Decision, attempt: int, alias: str) -> None:
         throttles = 0
@@ -1320,6 +1653,7 @@ class Engine:
                 return
             entry = view.registry.models[alias]
             if outcome == "throttle":
+                retry_secs = 0.0  # a throttle moves on at once (a 5xx's backoff is not reused)
                 throttles += 1
                 limit = int(view.value(alias, "throttle_retry_attempts", dep_key))
                 if throttles > limit:
@@ -1332,14 +1666,25 @@ class Engine:
                 if outcome == "fatal" or tries >= int(view.value(alias, "max_attempts")):
                     await self._finish_call(held, "provider_error", str(exc))
                     return
-                if not await self._retry_allowed(alias, view):
+                # A move to a deployment this call has not tried is free: it is failover, not
+                # a retry storm (bounded by the deployments and max_attempts). Counting it
+                # failed calls as retry_budget_exhausted while another region was healthy
+                # (scenario P3: 20 of 60 calls with one region hanging).
+                tried = frozenset(failed | {dep_key})
+                age = self.clock.now() - held.position_ms / 1000.0
+                untried = any(
+                    not c.last
+                    for c in self._candidates(view, alias, held.envelope, age, tried, "error")
+                )
+                if not untried and not await self._retry_allowed(alias, view):
                     await self._finish_call(held, "retry_budget_exhausted", str(exc))
                     return
                 retry_secs = self._backoff(view, alias, dep_key, tries)
             failed.add(dep_key)
             attempt += 1
-            if retry_secs:
-                await asyncio.sleep(retry_secs)
+            if retry_secs:  # never past the deadline: the caller is told in time
+                left = self._deadline(held) - self.clock.now()
+                await asyncio.sleep(max(0.0, min(retry_secs, left)))
             while True:
                 if self.clock.now() >= self._deadline(held):
                     await self._finish_call(held, "deadline_exceeded", f"last error: {kind}")
@@ -1396,11 +1741,15 @@ class Engine:
         deployment = next(d for d in view.deployments(alias) if d.key == dep_key)
         route = route_for(view, deployment)
         params = self._params(view, alias, env, dep_key)
-        estimate = self._estimate(view, alias, env, params)
+        # Refunds settle what admission charged: `_ask`'s estimate from model-level params. One
+        # from this deployment's params (e.g. a larger account max_tokens) refunded more than
+        # was taken, and TPM stopped holding (found in the 0.3.0 review).
+        estimate = self._charged(view, alias, held)
         remaining = max(0.1, self._deadline(held) - self.clock.now())
+        attempt_budget = float(view.value(alias, "attempt_timeout_secs", dep_key))
         timing = Timing(
             first_response_secs=min(
-                float(view.value(alias, "attempt_timeout_secs", dep_key)),
+                attempt_budget,
                 remaining / 2 if attempt == 1 else remaining,
             ),
             idle_secs=float(view.value(alias, "stream_idle_secs")),
@@ -1478,6 +1827,25 @@ class Engine:
                     await writer.error(kind, message)
                 return "stream_failed", (kind, writer.partial_text, exc)
             cut = isinstance(exc, AttemptTimeout) and "chunk" in str(exc)
+            # The caller's own deadline cut this attempt (the outer timer, or a first-response
+            # timer shortened below `attempt_timeout_secs`): not the provider's fault. Counted
+            # as a failure, late grants under a rate limit opened the breaker and turned the
+            # rest into model_unavailable (found by scripts/load.py).
+            deadline_cut = isinstance(exc, TimeoutError) and (
+                not isinstance(exc, AttemptTimeout)
+                or ("first response" in str(exc) and timing.first_response_secs < attempt_budget)
+            )
+            if deadline_cut:
+                await self.admission.finish(
+                    alias,
+                    owner,
+                    env.request_id,
+                    refund_r=0,
+                    refund_t=0,
+                    outcome="none",
+                    latency_ms=-1,
+                )
+                return "retry", ("retryable", None, exc)
             if info.kind is ErrorKind.THROTTLE:
                 refund = tokens.refund(estimate, "throttle")
                 await self.admission.finish(
@@ -1516,10 +1884,15 @@ class Engine:
                 return await self._target_error(view, alias, held, dep_key, exc)
             if isinstance(exc, CredentialsUnavailable) or _auth_error(info.code):
                 self.providers.pool.forget(route)
-                _, backoff = self._bad_accounts.get(deployment.account, (0.0, 2.5))
+                where = (deployment.account, deployment.region)
+                _, backoff = self._bad_accounts.get(where, (0.0, 2.5))
                 backoff = min(backoff * 2, 60.0)
-                self._bad_accounts[deployment.account] = (time.monotonic() + backoff, backoff)
-                logger.error("account_credentials_failed", account=deployment.account)
+                self._bad_accounts[where] = (time.monotonic() + backoff, backoff)
+                logger.error(
+                    "account_credentials_failed",
+                    account=deployment.account,
+                    region=deployment.region,
+                )
                 return "retry", ("auth", None, exc)
             return "fatal", ("fatal", None, exc)
         latency = (time.monotonic() - started) * 1000
@@ -1555,7 +1928,7 @@ class Engine:
         await self.requests.put_result(reply, final_state="done")
         await self._count_target_errors(held, succeeded=True)
         self._record(held, alias, deployment.account, deployment.region, "ok", meta)
-        if view.value(alias, "debug_capture"):
+        if self.settings.debug_capture_allowed and view.value(alias, "debug_capture"):
             await self._debug(env.request_id, params, result.response)
         await self.requests.set_status(
             env.request_id,
@@ -1714,7 +2087,7 @@ class Engine:
             self.metrics.count("llmq_tokens_output_total", float(meta.tokens_out or 0), **labels)
             if meta.fallback:
                 self.metrics.count("llmq_fallback_total", kind=meta.fallback, model=env.model)
-        user = hashlib.sha256(env.user_id.encode()).hexdigest()[:16] if env.user_id else None
+        user = self.hash_id(env.user_id) if env.user_id else None
         logger.info(
             "llmq_call_finished",
             request_id=env.request_id,
@@ -1760,15 +2133,28 @@ class Engine:
     async def health_check(self) -> dict[str, Any]:
         """Liveness and readiness (plan E124): ready = registry loaded and not draining.
 
-        The stores' state is reported but never makes the process unready.
+        The stores' state is reported but never makes the process unready. It is checked with a
+        short-lived write, not PING: a replica answers PING but refuses writes (`read_only`).
         """
-        stores = {}
-        for name, client in (("state", self.state), ("queue", self._queue_store or self.state)):
+        probe = f"{self.keys.prefix}:health:{self.worker_id}"
+
+        async def check(client: Any) -> str:
+            # Bounded: a blackholed store took 41 s (connect timeout x retries), past any probe.
             try:
-                await client.ping()
-                stores[name] = "ok"
-            except STORE_ERRORS:
-                stores[name] = "down"
+                await asyncio.wait_for(
+                    client.set(probe, b"1", px=5000), self.settings.timings.health_probe_secs
+                )
+            except StoreReadOnlyError:
+                return "read_only"
+            except (*STORE_ERRORS, TimeoutError):
+                return "down"
+            return "ok"
+
+        if self._queue_store is None:
+            state = queue = await check(self.state)  # one store: probe it once
+        else:
+            state, queue = await asyncio.gather(check(self.state), check(self._queue_store))
+        stores = {"state": state, "queue": queue}
         loaded = self.registry._current is not None
         return {"live": True, "ready": bool(self.ready and loaded), "stores": stores}
 
@@ -1796,14 +2182,71 @@ class Engine:
     async def _ack(self, held: _Held) -> None:
         if held.message is not None:
             await self.queues.ack(held.message)
-        self._held.pop(held.envelope.request_id, None)
+        self._drop(held)
+
+    def _drop(self, held: _Held) -> None:
+        """Forget a call, but only this one: a newer delivery may hold the same request id."""
+        if self._held.get(held.envelope.request_id) is held:
+            del self._held[held.envelope.request_id]
+
+    async def _give_back(self, held: _Held) -> None:
+        """Settle every grant of a call as a cut attempt (nothing learned, unused budget back)."""
+        for served, owner in list(held.grants):
+            with contextlib.suppress(Exception):
+                await self.admission.finish(
+                    served, owner, held.envelope.request_id, refund_r=0, refund_t=0, outcome="none"
+                )
+        held.grants.clear()
+
+    async def _release(self, held: _Held, delay_secs: float = 0.0) -> None:
+        """Let go of a call after an unexpected error: grants back, not held, message returned."""
+        await self._give_back(held)
+        self._drop(held)
+        if held.message is not None:
+            with contextlib.suppress(Exception):
+                await self.queues.return_(held.message, delay_secs=delay_secs)
 
     # ================================================================ background
 
+    def _free_stuck(self) -> None:
+        """Let go of calls held a lease past their deadline; nothing should still hold them.
+
+        Every path settles a call by its deadline, so one still held a lease later is a bug or
+        a hung store call. The heartbeat renewed its grants for good (one-hour soak: two calls
+        in progress for 50 minutes after a store block). Now it is logged, its task cancelled,
+        its grants given back and its message returned (the next worker finds it expired).
+        """
+        late = self.clock.now() - self.settings.lease_secs - self.settings.caller_margin_secs
+        for held in list(self._held.values()):
+            if self._deadline(held) >= late:
+                continue
+            running = held.run is not None and not held.run.done()
+            logger.error(
+                "held_call_stuck",
+                request_id=held.envelope.request_id,
+                model=held.envelope.model,
+                grants=sorted(held.grants),
+                running=running,
+                past_deadline_secs=round(self.clock.now() - self._deadline(held), 1),
+            )
+            self._drop(held)  # never renewed again, even if the release below fails
+            if running:
+                assert held.run is not None
+                held.run.cancel()
+            task = asyncio.create_task(self._release(held))
+            self._running.add(task)
+            task.add_done_callback(self._running.discard)
+
     async def _heartbeat(self) -> None:
-        """Renew leases and holds; keep the caller liveness key; resync the clock."""
-        beat = max(0.2, self.settings.lease_secs / 3)
+        """Renew leases and holds; keep the caller liveness key; resync the clock.
+
+        It beats at least three times per lease and per held message's visibility timeout, so
+        a short `visibility_secs` never lets a running call's message reappear. Each step fails
+        on its own: one bad message (e.g. of a model removed by a reload) skips only itself.
+        """
         while True:
+            beat = self.settings.lease_secs / 3
+            self._free_stuck()
             try:
                 await self.state.set(
                     self.keys.caller(self.worker_id), "1", ex=self.settings.caller_ttl_secs
@@ -1814,17 +2257,35 @@ class Engine:
                     for alias, owner in list(held.grants)
                 ]
                 await self.admission.renew(items)
-                view = self.registry.current
-                for held in list(self._held.values()):
-                    if held.message is None:
-                        continue
-                    queue = view.value(held.envelope.model, "queue")
-                    await self.queues.extend(held.message, float(queue["visibility_secs"]))
+                now = time.monotonic()
+                if now - self._beat_ok_at > 2 * beat + 1:  # a gap: the store was out of reach
+                    self._store_trouble_at = now
+                self._beat_ok_at = now
+            except Exception as exc:  # the heartbeat must survive store hiccups
+                logger.warning("heartbeat_failed", step="renew", error=str(exc))
+                self._store_trouble_at = time.monotonic()
+                beat = 1.0  # renew the caller key as soon as the store is back
+            view = self.registry.current
+            for held in list(self._held.values()):
+                if held.message is None:
+                    continue
+                try:
+                    visibility = float(view.value(held.envelope.model, "queue")["visibility_secs"])
+                    beat = min(beat, visibility / 3)
+                    await self.queues.extend(held.message, visibility)
+                except Exception as exc:
+                    logger.warning(
+                        "heartbeat_failed",
+                        step="extend",
+                        request_id=held.envelope.request_id,
+                        error=str(exc),
+                    )
+            try:
                 await self.clock.sync(self.state)
                 await self._check_epoch()
-            except Exception as exc:  # the heartbeat must survive store hiccups
-                logger.warning("heartbeat_failed", error=str(exc))
-            await asyncio.sleep(beat)
+            except Exception as exc:
+                logger.warning("heartbeat_failed", step="clock", error=str(exc))
+            await asyncio.sleep(max(0.2, beat))
 
     async def _check_epoch(self) -> None:
         """The store lost its data (restart, failover): re-register running calls (T10)."""

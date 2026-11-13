@@ -8,10 +8,15 @@ and `samples/registry.json` with its region set.
     python scripts/samples.py 03_embed           # one sample
     python scripts/samples.py --live             # real Bedrock: AWS keys from --env-file
     python scripts/samples.py --live --env-file ../../.env
+    python scripts/samples.py --live --store env  # the store of the env file (TLS)
 
 `--live` reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and
 `AWS_MODEL_REGION` from the env file (default `.env`) and never prints them. Live runs make a
 few small calls per sample (well under a cent in total).
+
+`--store env` uses the env file's store instead of the local Valkey: `LLMQ_STORE_URL`, or
+`rediss://` built from the app's `valkey_host`, `valkey_port` and `valkey_key`. The run touches
+only its own key prefix and deletes it at the end, so a shared store is safe.
 """
 
 from __future__ import annotations
@@ -25,11 +30,12 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLES = ROOT / "samples"
 PY = str(ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python")
-STORE_URL = "redis://:localdev@127.0.0.1:6379/0"
+LOCAL_STORE_URL = "redis://:localdev@127.0.0.1:6379/0"
 FAKELLM_URL = "http://127.0.0.1:8080"
 AWS_KEYS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
@@ -44,7 +50,24 @@ def registry(region: str) -> str:
     return json.dumps(doc)
 
 
-def environment(live: bool, env_file: Path, prefix: str) -> dict[str, str]:
+def store_url(store: str, env_file: Path) -> str:
+    """The local Valkey, or the env file's store (never printed: it holds the password)."""
+    if store == "local":
+        return LOCAL_STORE_URL
+    from dotenv import dotenv_values
+
+    values = dotenv_values(env_file)
+    if values.get("LLMQ_STORE_URL"):
+        return str(values["LLMQ_STORE_URL"])
+    host = values.get("valkey_host")
+    if not host:
+        raise SystemExit(f"{env_file}: neither LLMQ_STORE_URL nor valkey_host is set")
+    password = quote(str(values.get("valkey_key") or ""), safe="")
+    auth = f":{password}@" if password else ""
+    return f"rediss://{auth}{host}:{values.get('valkey_port') or 6379}/0"
+
+
+def environment(live: bool, env_file: Path, prefix: str, store: str) -> dict[str, str]:
     """The process environment of one run (no AWS keys from the shell leak into fake runs)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "LLMQ_"))}
     if live:
@@ -62,7 +85,7 @@ def environment(live: bool, env_file: Path, prefix: str) -> dict[str, str]:
         region = "us-east-1"
     env.update(
         {
-            "LLMQ_STORE_URL": STORE_URL,
+            "LLMQ_STORE_URL": store,
             "LLMQ_KEY_PREFIX": prefix,
             "LLMQ_QUEUE_PREFIX": prefix.replace(":", "-") + "-",
             "LLMQ_REGISTRY": registry(region),
@@ -70,15 +93,21 @@ def environment(live: bool, env_file: Path, prefix: str) -> dict[str, str]:
             "PYTHONIOENCODING": "utf-8",
         }
     )
-    print(f"target: {'real Bedrock' if live else 'fakellm'} in {region}; key prefix {prefix}")
+    where = "local Valkey" if store == LOCAL_STORE_URL else "the env file's store (TLS)"
+    if store.startswith("redis://") and store != LOCAL_STORE_URL:
+        where = "the env file's store (no TLS)"
+    print(
+        f"target: {'real Bedrock' if live else 'fakellm'} in {region}; store: {where}; "
+        f"key prefix {prefix}"
+    )
     return env
 
 
-def cleanup(prefix: str) -> None:
-    """Delete every key and queue the run made."""
+def cleanup(prefix: str, store: str) -> None:
+    """Delete every key and queue the run made (only under its own prefix)."""
     import redis
 
-    client = redis.Redis.from_url(STORE_URL)
+    client = redis.Redis.from_url(store)
     queue_prefix = prefix.replace(":", "-") + "-"
     for pattern in (f"{prefix}:*", f"{queue_prefix}*", f"*{{{queue_prefix}*"):
         keys = list(client.scan_iter(match=pattern, count=500))
@@ -94,6 +123,9 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="call real Bedrock")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument(
+        "--store", choices=("local", "env"), default="local", help="local Valkey or the env file's"
+    )
     args = parser.parse_args()
     found = sorted(p.stem for p in SAMPLES.glob("[0-9]*.py"))
     names = args.names or found
@@ -102,7 +134,8 @@ def main() -> int:
         print(f"unknown sample(s): {', '.join(unknown)}; have {', '.join(found)}")
         return 2
     prefix = f"llmqsample:{uuid.uuid4().hex[:8]}"
-    env = environment(args.live, args.env_file, prefix)
+    store = store_url(args.store, args.env_file)
+    env = environment(args.live, args.env_file, prefix, store)
     failed = []
     try:
         for name in names:
@@ -126,7 +159,7 @@ def main() -> int:
             if not ok:
                 failed.append(name)
     finally:
-        cleanup(prefix)
+        cleanup(prefix, store)
     print("ALL PASS" if not failed else f"FAILED: {', '.join(failed)}")
     return 1 if failed else 0
 

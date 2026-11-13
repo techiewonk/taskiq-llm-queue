@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-READ_BLOCK_MS = 100  # an opened stream joins the shared read within this time
-
 
 class StreamTooLarge(Exception):
     """The chunk stream went above `stream_max_bytes` (plan §3.13: fail, never trim)."""
@@ -68,7 +66,7 @@ class ChunkWriter:
         self._last = 0.0
         self._lock = asyncio.Lock()
         self._timer: asyncio.Task[None] | None = None
-        self._failed: StreamTooLarge | None = None
+        self._failed: Exception | None = None
         self.partial: list[str] = []
 
     @property
@@ -102,20 +100,20 @@ class ChunkWriter:
         await asyncio.sleep(self._flush_secs)
         try:
             await self._flush()
-        except StreamTooLarge as exc:
-            self._failed = exc  # raised by the next add() or end()
+        except Exception as exc:  # StreamTooLarge or a store error: raised by the next add()/end()
+            self._failed = exc
 
     async def _write(self, kind: str, data: Any) -> None:
         payload = orjson.dumps(data, default=str)
         self._bytes += len(payload)
         if self._bytes > self._max_bytes:
             raise StreamTooLarge(f"the stream is above {self._max_bytes} bytes")
-        self._seq += 1
+        seq = self._seq + 1  # counted only once written: a failed write leaves no gap
         async with self._client.pipeline(transaction=False) as pipe:
-            pipe.xadd(self.key, {"seq": self._seq, "att": self.attempt_id, "t": kind, "d": payload})
-            if self._seq == 1:
-                pipe.expire(self.key, self._ttl)
+            pipe.xadd(self.key, {"seq": seq, "att": self.attempt_id, "t": kind, "d": payload})
+            pipe.expire(self.key, self._ttl)  # every write: the first one may have failed
             await pipe.execute()
+        self._seq = seq
         self._last = time.monotonic()
 
     async def _flush(self) -> None:
@@ -152,9 +150,14 @@ class ChunkWriter:
 class ChunkReader:
     """One per caller process: one blocking read over every open chunk stream."""
 
-    def __init__(self, client: redis.asyncio.Redis) -> None:
-        """Keep the client; the read task starts with the first open stream."""
+    def __init__(self, client: redis.asyncio.Redis, *, block_ms: int = 100) -> None:
+        """Keep the client; the read task starts with the first open stream.
+
+        `block_ms`: an opened stream joins the shared read within this time
+        (`Tuning.engine.stream_read_block_ms`).
+        """
         self._client = client
+        self._block_ms = block_ms
         self._open: dict[str, tuple[asyncio.Queue[dict[str, Any]], list[str]]] = {}
         self._task: asyncio.Task[None] | None = None
 
@@ -182,7 +185,7 @@ class ChunkReader:
         while self._open:
             streams: dict[Any, Any] = {key: last[0] for key, (_, last) in self._open.items()}
             try:
-                found: Any = await self._client.xread(streams, block=READ_BLOCK_MS)
+                found: Any = await self._client.xread(streams, block=self._block_ms)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

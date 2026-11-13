@@ -1,4 +1,4 @@
-"""Start, rebuild, check or stop the local Docker test stack (Valkey, Redis, SQS, fakellm).
+"""Start, rebuild, check or stop the local Docker test stack (Valkey, Redis, fakellm).
 
 The stack is what every stack-backed check of `scripts/check.py` runs against; nothing in it
 calls a real LLM.
@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker" / "compose.yaml")]
-SERVICES = {"valkey": 6379, "redis": 6380, "sqs": 9324, "fakellm": 8080}
+SERVICES = {"valkey": 6379, "redis": 6380, "fakellm": 8080}
 
 
 def answers(port: int) -> bool:
@@ -50,10 +50,10 @@ def main() -> int:
         return status()
     if command == "down":
         return subprocess.run([*COMPOSE, "down"], check=False).returncode
-    args = [*COMPOSE, "up", "-d", "--wait"]
+    args = [*COMPOSE, "up", "-d", "--wait", "--remove-orphans"]
     if command == "rebuild":
         args.insert(-2, "--build")
-        args += ["--force-recreate", "fakellm", "valkey", "redis", "sqs"]
+        args += ["--force-recreate", "fakellm", "valkey", "redis"]
     code = subprocess.run(args, check=False).returncode
     return code or status()
 

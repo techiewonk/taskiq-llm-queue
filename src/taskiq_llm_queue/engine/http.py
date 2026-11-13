@@ -8,10 +8,10 @@ unless the app passes `allow_writes=True`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from taskiq_llm_queue.errors import ConfigError
+from taskiq_llm_queue.errors import ConfigError, MissingExtra
 from taskiq_llm_queue.registry.store import LiveEditRefused, audit_diff
 from taskiq_llm_queue.registry.validate import RegistryError
 
@@ -88,9 +88,12 @@ class Handlers:
         """Block or unblock a region or account (only with `allow_writes`)."""
         if not self.allow_writes:
             return 403, {"error": "writes are off"}
-        await self.engine.registry.block(
-            region=region, account=account, on=on, actor=f"http:{actor}"
-        )
+        try:
+            await self.engine.registry.block(
+                region=region, account=account, on=on, actor=f"http:{actor}"
+            )
+        except ConfigError as exc:
+            return 400, {"error": str(exc)}
         routing = self.engine.registry.current.registry.routing
         return 200, {
             "blocked_regions": list(routing.blocked_regions),
@@ -99,21 +102,35 @@ class Handlers:
 
 
 def status_router(
-    engine: Engine, *, dependencies: Sequence[Any] = (), allow_writes: bool = False
+    engine: Engine,
+    *,
+    dependencies: Sequence[Any] = (),
+    allow_writes: bool = False,
+    actor: Callable[[Any], str] | None = None,
 ) -> Any:
     """A FastAPI `APIRouter` with the handlers (`pip install 'taskiq-llm-queue[http]'`).
 
     `dependencies` (the app's admin check) guard every route except `/health/live` and
-    `/health/ready`.
+    `/health/ready`. Writes need `actor`: it gets the request and returns the authenticated
+    name the audit records (never a client-supplied value, which anyone could spoof).
     """
     try:
-        from fastapi import APIRouter, Body, Depends
+        from fastapi import APIRouter, Body, Depends, Request
         from fastapi.responses import JSONResponse
     except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        hint = "status_router needs FastAPI: pip install 'taskiq-llm-queue[http]'"
-        raise ConfigError(hint) from exc
+        raise MissingExtra("http_router", "http") from exc
+    # Annotations are strings here (`from __future__ import annotations`); FastAPI resolves them
+    # in this module's globals, where the optional import is not, so a `Request` parameter
+    # would be read as a query field. Publish the name once it is imported.
+    globals()["Request"] = Request
+    if allow_writes and actor is None:
+        raise ConfigError("allow_writes=True needs actor= (who made the edit, for the audit)")
 
     handlers = Handlers(engine, allow_writes=allow_writes)
+
+    def who(request: Request) -> str:
+        return actor(request) if actor is not None else "unknown"
+
     router = APIRouter()
     guarded = [Depends(d) if callable(d) else d for d in dependencies]
 
@@ -143,10 +160,21 @@ def status_router(
 
     @router.post("/registry", dependencies=guarded)
     async def set_values(
+        request: Request,
         values: dict[str, Any] = Body(...),  # noqa: B008  # FastAPI's dependency style
-        actor: str = "unknown",
         model: str | None = None,
     ) -> Any:
-        return reply(await handlers.set(values, actor=actor, model=model))
+        return reply(await handlers.set(values, actor=who(request), model=model))
+
+    @router.post("/registry/block", dependencies=guarded)
+    async def block(
+        request: Request,
+        region: str | None = None,
+        account: str | None = None,
+        on: bool = True,
+    ) -> Any:
+        return reply(
+            await handlers.block(actor=who(request), region=region, account=account, on=on)
+        )
 
     return router

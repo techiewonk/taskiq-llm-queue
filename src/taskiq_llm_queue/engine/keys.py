@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 3
-
 
 @dataclass(frozen=True, slots=True)
 class Keys:
@@ -31,17 +29,9 @@ class Keys:
         """Adaptive concurrency limit of one deployment (hash)."""
         return self.model(alias, f"ac:{deployment}")
 
-    def leases(self, alias: str, deployment: str) -> str:
-        """Slots in use on one deployment: owner token -> lease expiry (sorted set)."""
-        return self.model(alias, f"lease:{deployment}")
-
     def breaker(self, alias: str, deployment: str) -> str:
         """Circuit breaker of one deployment (hash)."""
         return self.model(alias, f"cb:{deployment}")
-
-    def account_rate(self, account: str) -> str:
-        """Account-wide budget (`shared_rpm` / `shared_tpm`)."""
-        return f"{self.prefix}:{{a:{account}}}:rate"
 
     # ---------------------------------------------------------------- per request
 
@@ -73,13 +63,8 @@ class Keys:
         """Set once per store life; missing means the store restarted or lost its data."""
         return f"{self.prefix}:epoch"
 
-    @property
-    def schema(self) -> str:
-        """State schema version marker (3)."""
-        return f"{self.prefix}:schema"
-
     # ---------------------------------------------------------------- queues
 
     def queue(self, name: str, part: str) -> str:
-        """A key of one queue: `s` (stream), `vis`, `gen`, `fails`, `dlq`, `meta`."""
+        """A key of one queue: `s` (stream), `vis`, `gen`, `fails`, `st`, `dlq`, `meta`."""
         return f"{self.prefix}:{{q:{name}}}:{part}"
